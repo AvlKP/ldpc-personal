@@ -1,0 +1,6 @@
+*.jou
+*.log
+*.str
+.Xil
+.bender/
+.slang/
