@@ -16,7 +16,7 @@ module asym_rgw_sdp_bram #(
   input logic [ADDRA_WIDTH-1:0] addra_i,
   input logic [ADDRB_WIDTH-1:0] addrb_i,
   input logic [WORDA_WIDTH-1:0] dia_i,
-  output logic [WORDB_WIDTH-1:0] dob_i
+  output logic [WORDB_WIDTH-1:0] dob_o
 );
 
 logic [WORDA_WIDTH-1:0] ram [0:SIZEA-1];
@@ -40,11 +40,11 @@ always_ff @(posedge clk_i) begin
     end
   end
 end
-assign dob_i = readb;
+assign dob_o = readb;
 
 // asymmetric BRAM only supports x * 2^n word size on the wider side
 initial begin
-  assert (RATIO_RW == 1) 
+  assert (RATIO_RW != 1) 
   else   $fatal(1, "RAM is symmetric.");
 
   assert (RATIO_RW > 0 && (RATIO_RW & (RATIO_RW - 1)) == 0) 
