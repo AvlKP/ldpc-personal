@@ -12,6 +12,8 @@ import ldpc_pkg::*;
 // multiple vector output contain the same data
 // output vectors might contain extra data that is not part of the Zc-bit info group
 
+// TODO: formalize FSMs, restructure module for better synth
+
 module input_buffer #(
   parameter int unsigned DATA_WIDTH = 32'd32
 ) (
@@ -69,10 +71,15 @@ assign axis_handshake = s_axis_tready & s_axis_tvalid;
 
 // Write signals
 logic [POINTER_WIDTH-1:0] write_threshold;
-logic write_idle;
+logic write_idle, write_idle_past;
 // let there be 1 clock delay between ram transition, meh
 // assign s_axis_tready = (write_counter >= write_threshold)? 1 : 0;
 assign s_axis_tready = (ramw_pointer >= write_threshold)? 0 : 1;
+
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) write_idle_past <= '0;
+  else write_idle_past <= write_idle;
+end
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : write_init
   if (!arst_ni) begin
@@ -92,7 +99,7 @@ end
 always_ff @(posedge clk_i or negedge arst_ni) begin : ram_control
   if (!arst_ni) begin
     int unsigned j;
-    for (j=0;j<2;j++) begin
+    for (j = 0; j < 2; j++) begin
       ram_full[j] <= '0;
       ram_zc[j] <= '0;
     end
@@ -103,16 +110,20 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : ram_control
   end else begin
     // TODO: Check this for writing to the same signal
     // might change to per-ram basis
-    if (write_idle & axis_handshake) ram_zc[ramw_swap] <= lifting_size_i;
-    if (axis_handshake) ramw_pointer <= ramw_pointer + 1;
-    if (~write_idle & ~s_axis_tready) ram_full[ramw_swap] <= 1;
-    if (ram_full[ramw_swap] & ~ram_full[~ramw_swap]) ramw_swap <= ~ramw_swap;
-
-    if (ldpc_done_i) begin
-      ramw_pointer <= '0;
-      ram_zc[ramr_swap] <= '0;
-      ram_full[ramr_swap] <= 0;
-      ramr_swap <= ~ramr_swap;
+    int unsigned j;
+    for (j = 0; j < 2; j++) begin
+      if (ramr_swap == j & ldpc_done_i) begin
+        ramw_pointer <= '0;
+        ram_zc[j] <= '0;
+        ram_full[j] <= 0;
+        ramr_swap <= ~ramr_swap;          
+      end else if (ramw_swap == j) begin
+        if (write_idle & axis_handshake) ram_zc[j] <= lifting_size_i;
+        if (write_idle & ~write_idle_past) ramw_pointer <= '0;
+        else if (axis_handshake) ramw_pointer <= ramw_pointer + 1;
+        if (~write_idle & ~s_axis_tready) ram_full[j] <= 1;
+        if (ram_full[j] & ~ram_full[~j]) ramw_swap <= ~ramw_swap;
+      end
     end
   end
 end
@@ -152,7 +163,8 @@ endgenerate
 // 2 <= Zc <= 96 -> 1*128
 // 96 < Zc <= 192 -> 2*128
 // 192 < Zc <= 384 -> 4*128
-logic [1:0] read_counter;
+// read delay counter is lagging by 1 clk
+logic [2:0] read_counter, read_delay_counter;
 logic read_idle;
 logic [(1 << ZC_WIDTH)-1:0] read_buffer;
 
@@ -160,19 +172,18 @@ logic read_handshake;
 assign read_handshake = ldpc_ready_i & ldpc_valid_o;
 
 logic [1:0] out_sel; // select data_batch size according to zc
-assign out_sel[0] = (ram_zc[ramr_swap] <= ZC_MAX >> 1)? 0 : 1; // zc <= 192
-assign out_sel[1] = (ram_zc[ramr_swap] <= ZC_MAX >> 2)? 0 : 1; // zc <= 96
+assign out_sel[1] = (ram_zc[ramr_swap] <= ZC_MAX >> 1)? 0 : 1; // zc <= 192
+assign out_sel[0] = (ram_zc[ramr_swap] <= ZC_MAX >> 2)? 0 : 1; // zc <= 96
 
-// NOTE: can be made read_thres = out_sel
-// logic [1:0] read_thres;
-// always_comb begin
-//   case (out_sel)
-//     2'b00: read_thres = 2'b00; // 2 <= zc <= 96 (let driver handle zc minimum)
-//     2'b01: read_thres = 2'b01; // 96 < zc <= 192
-//     2'b10: read_thres = 2'b00; // err
-//     2'b11: read_thres = 2'b11; // 192 < zc <= 384
-//   endcase
-// end
+logic [1:0] read_thres;
+always_comb begin
+  case (out_sel)
+    2'b00: read_thres = 2'b01; // 2 <= zc <= 96 (let driver handle zc minimum)
+    2'b01: read_thres = 2'b10; // 96 < zc <= 192
+    2'b11: read_thres = 2'b11; // 192 < zc <= 384
+    default: read_thres = 2'b00;
+  endcase
+end
 
 // goofy paramsss
 localparam int unsigned ZC_KB_WIDTH = ZC_WIDTH + KB_WIDTH;
@@ -185,7 +196,8 @@ assign base_pointer = zc_kb_prod[ZC_KB_WIDTH-1:CHUNK_WIDTH] + BASEP_WIDTH'(read_
 assign offset_shift = zc_kb_prod[CHUNK_WIDTH-1:0];
 
 // configure the bram read
-assign ramr_pointer = base_pointer; // check combi path length
+// TODO: check combi path length
+assign ramr_pointer = base_pointer; 
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : read_init
   if (!arst_ni) begin
@@ -194,7 +206,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : read_init
   end else begin
     if (read_idle & ldpc_ready_i) begin
       read_idle <= 0;
-      zc_kb_prod <= info_group_i * ram_zc[ramr_swap];
+      zc_kb_prod <= (info_group_i - 1) * ram_zc[ramr_swap];
     end else if (~read_idle & read_handshake) begin
       read_idle <= 1;
       zc_kb_prod <= '0;
@@ -202,77 +214,87 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : read_init
   end
 end
 
-logic read_fetch_done;
-assign read_fetch_done = read_counter >= out_sel;
+logic read_fetch_done, read_shift_done;
+assign read_fetch_comp = read_counter > read_thres;
 always_ff @(posedge clk_i or negedge arst_ni) begin : read_count
   if (!arst_ni) begin
+    read_fetch_done <= 0;
     read_counter <= '0;
+    read_delay_counter <= '0;
   end else begin
-    // if (read_idle) begin
-    //   read_counter <= '0;
-    // end else begin
-    //   if (read_handshake) read_counter <= '0;
-    //   else if (~read_fetch_done) read_counter <= read_counter + 1;
-    // end
-
     if (~read_idle) begin
-      if (read_handshake) read_counter <= '0;
-      else if (~read_fetch_done) read_counter <= read_counter + 1;
+      if (read_handshake) begin
+        read_counter <= '0;
+        read_delay_counter <= '0;
+        read_fetch_done <= 0;
+      end 
+      else if (~read_fetch_comp) begin
+        read_counter <= read_counter + 1;
+        read_delay_counter <= read_counter;
+      end 
+      else begin
+        read_fetch_done <= 1;
+        read_delay_counter <= read_counter;
+      end 
     end
 
   end
 end
 
 // NOTE: might need to pipeline shifting to 2 stages if combi too long
+// TODO: check combi path length
 always_ff @(posedge clk_i or negedge arst_ni) begin : read_buff
   if (!arst_ni) begin
     read_buffer <= '0;
-    ldpc_valid_o <= 0;
+    read_shift_done <= 0;
   end else begin
     if (~read_idle) begin
-      // when 2 <= Zc <= 94, this can fail
-      // due to read_fetch_done always being 1
-      read_buffer[ZC_WIDTH'(read_counter) << CHUNK_WIDTH +: CHUNK_BITS] <= ramr_data;
-
+      if (read_handshake) begin
+        read_shift_done <= 0;
+        read_buffer <= '0;
+      end
       // shifting for actual data
-      if (read_fetch_done) begin
-        read_buffer <= read_buffer << offset_shift;
-        ldpc_valid_o <= 1;
-      end else if (read_handshake) begin
-        ldpc_valid_o <= 0;
+      else if (~read_fetch_done) read_buffer[ZC_WIDTH'(read_delay_counter) << CHUNK_WIDTH +: CHUNK_BITS] <= ramr_data;
+      else if (read_fetch_done & ~ldpc_valid_o) begin
+        read_buffer <= read_buffer >> offset_shift;
+        read_shift_done <= 1;
       end
     end
   end
 end
 
-// TODO: map read_buffer to data_batch_o according to out_sel
 always_ff @(posedge clk_i or negedge arst_ni) begin : read_out
   if (!arst_ni) begin
     data_batch_o <= '0;
+    ldpc_valid_o <= 0;
   end else begin
-    
-  end
-  case (out_sel)
-    2'b00 : begin
-      int unsigned j;
-      for (j = 0; j < 4; j++) begin
-        data_batch_o[(ZC_MAX >> 2)*j +: (ZC_MAX >> 2)] <= read_buffer[0 +: (ZC_MAX >> 2)];
-      end
-    end 
-    2'b01 : begin
-      int unsigned j;
-      for (j = 0; j < 2; j++) begin
-        data_batch_o[(ZC_MAX >> 1)*j +: (ZC_MAX >> 1)] <= read_buffer[0 +: (ZC_MAX >> 1)];
-      end
-    end
-    2'b11 : begin
-      data_batch_o <= read_buffer[ZC_MAX-1:0];
-    end
-    default: begin
-      data_batch_o <= '1;
-    end
-  endcase
-end
-// assign data_batch_o = read_buffer[ZC_MAX-1:0];
+    if (read_handshake) begin
+      data_batch_o <= '0;
+      ldpc_valid_o <= 0;
+    end else if (read_shift_done & ~ldpc_valid_o) begin
+      case (out_sel)
+        2'b00 : begin
+          int unsigned j;
+          for (j = 0; j < 4; j++) begin
+            data_batch_o[(ZC_MAX >> 2)*j +: (ZC_MAX >> 2)] <= read_buffer[0 +: (ZC_MAX >> 2)];
+          end
+        end 
+        2'b01 : begin
+          int unsigned j;
+          for (j = 0; j < 2; j++) begin
+            data_batch_o[(ZC_MAX >> 1)*j +: (ZC_MAX >> 1)] <= read_buffer[0 +: (ZC_MAX >> 1)];
+          end
+        end
+        2'b11 : begin
+          data_batch_o <= read_buffer[ZC_MAX-1:0];
+        end
+        default: begin
+          data_batch_o <= '1;
+        end
+      endcase
 
+      ldpc_valid_o <= 1;
+    end
+  end
+end
 endmodule
