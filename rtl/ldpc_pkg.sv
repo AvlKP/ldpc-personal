@@ -8,6 +8,13 @@ package ldpc_pkg;
   parameter int unsigned REG_NUM_BYTES = REG_WIDTH * REG_COUNT / 8;
   parameter int unsigned ADDR_WIDTH = $clog2(REG_NUM_BYTES);
 
+  parameter int unsigned BG1_ROW_N = 46;
+  parameter int unsigned BG2_ROW_N = 42;
+  parameter int unsigned BG1_COL_N = 68;
+  parameter int unsigned BG2_COL_N = 52;
+  parameter int unsigned BG1_CSR_COL_N = 316;
+  parameter int unsigned BG2_CSR_COL_N = 197;
+
   parameter int unsigned ZC_MAX = 384;
   parameter int unsigned ZC_WIDTH = $clog2(ZC_MAX + 1);
   parameter int unsigned INPUT_BITS_MAX = 8448; // BG1 maximum

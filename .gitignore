@@ -10,3 +10,7 @@ sim/results.xml
 sim/*.vcd
 sim/*.fst
 5G _ ShareTechnote*
+venv/
+notebooks/*.txt
+notebooks/*.mem
+**/vivado/
