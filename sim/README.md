@@ -1,127 +1,82 @@
 # Verilator Cocotb Flow Guide
 
-This directory provides a cocotb-based verification flow for the `input_buffer` DUT using Verilator.
+This directory provides a cocotb-based verification flow for the LDPC IP cores using Verilator.
 
 ## Directory Overview
 
-- `Makefile`: main simulation entry point and test targets.
-- `input_buffer_tb.py`: cocotb testbench module.
-- `sim_build/`: Verilator build outputs.
-- `results.xml`: cocotb regression results file.
-- `dump.vcd`: waveform dump file (when tracing is enabled).
+- `Makefile`: Main simulation entry point and core testbench engine.
+- `Makefiles/`: Directory containing modular target definitions (e.g., `input_buffer.mk`, `csr_decoder.mk`).
+- `*_tb.py`: Cocotb Python testbench modules.
+- `sim_build/<target>/`: Sandboxed directories keeping build outputs and run artifacts isolated per test.
+- `results*.xml`: JUnit-style regression results.
 
 ## Prerequisites
 
 1. Verilator available on PATH.
 2. Python with cocotb installed.
 3. `cocotb-config` available on PATH.
-4. Optional waveform viewer: GTKWave.
+4. Optional waveform viewer: Surfer or GTKWave (with FST support).
 
 ## Quick Start
 
-From repository root:
+From the `sim` directory, you can run all tests across all modules:
 
 ```bash
-cd /foss/designs/ldpc_personal/sim
-make test_all
+make all
 ```
 
-This runs all cocotb tests defined in `input_buffer_tb.py`.
+To run test suites for specific modules:
+
+```bash
+make group_input_buffer
+make group_csr_decoder
+```
 
 ## Run Individual Tests
 
-From the `sim` directory:
+You can launch specific test variants by invoking their targets. 
+These targets automatically sandbox themselves into unique `sim_build/<target>` folders.
 
-- Progressive continuous scenario test:
-
-```bash
-make test_progressive
-```
-
-- Zc boundary/edge scenarios:
-
-```bash
-make test_zc_edges
-```
-
-- Mid-stream reset edge scenarios:
-
-```bash
-make test_reset_edges
-```
-
-- Payload size edge scenarios:
-
-```bash
-make test_payload_edges
-```
-
-## Waveform Generation and Viewing
-
-For Verilator, tracing must be enabled at build/run time.
-
-1. Clean any previous non-trace build:
-
-```bash
-make clean
-```
-
-2. Rebuild and run with tracing enabled:
-
-```bash
-make test_all VERILATOR_TRACE=1
-```
-
-3. Open waveform:
-
-```bash
-gtkwave /foss/designs/ldpc_personal/sim/dump.vcd
-```
-
-Notes:
-
-- If you see `--trace requires the design to be built with trace support`, run `make clean` and rerun with `VERILATOR_TRACE=1`.
-- The waveform file is produced as `dump.vcd` in this `sim` directory.
-
-## Common Targets
-
-- `make test_all`
+**Input Buffer:**
+- `make test_input_buffer`
 - `make test_progressive`
 - `make test_zc_edges`
 - `make test_reset_edges`
 - `make test_payload_edges`
-- `make clean`
+- `make test_bg1_info_sweep`
+
+**CSR Decoder:**
+- `make test_csr_decoder`
+- `make test_csr_bg1`
+- `make test_csr_bg2`
+- `make test_csr_arbitrary`
+- `make test_csr_backpressure`
+
+## Waveform Generation and Viewing
+
+Tracing is enabled by default in the new unified `Makefile` via `WAVES ?= 1` and tracing arguments output in FST format (`--trace-fst`). 
+
+When a test completes, any dumped `.fst` files will be placed either natively in the test's `sim_build/<target>/` directory or in the root `sim/` folder.
+
+To view them, you can use Surfer:
+```bash
+surfer dump.fst
+```
+*(Or GTKWave if preferred)*
 
 ## Useful Outputs
 
-- Regression summary: printed in terminal by cocotb.
-- JUnit-style report: `results.xml`.
-- Build artifacts: `sim_build/`.
-- Waveform dump (trace-enabled runs): `dump.vcd`.
+- Regression summary: Printed in the terminal by cocotb.
+- JUnit-style reports: Found at `sim_build/<target>/results.xml`.
+- Build artifacts: `sim_build/<target>/`.
 
 ## Troubleshooting
 
-1. `cocotb-config` not found:
+1. Test selection not working:
+- Confirm test function names match the `COCOTB_TEST_FILTER` in the respective `Makefiles/*.mk` definitions.
 
-- Ensure cocotb is installed in the active Python environment.
-- Verify PATH includes the environment scripts/bin directory.
-
-2. Verilator not found:
-
-- Install Verilator and ensure it is on PATH.
-
-3. No waveform file after run:
-
-- Use `VERILATOR_TRACE=1`.
-- Run `make clean` before rerunning.
-
-4. Test selection not working:
-
-- Use the provided Make targets.
-- Confirm test names in `input_buffer_tb.py` when adding new tests.
-
-## Extending the Flow
-
-- Add new cocotb tests in `input_buffer_tb.py`.
-- Add corresponding convenience targets in `Makefile` using `COCOTB_TEST_FILTER`.
-- Keep the clean target updated for any new generated artifacts.
+2. Adding new modules:
+- Create a new `.mk` in the `Makefiles/` folder (it will be auto-included).
+- Define your new targets using the `run_test` macro.
+- Add your new group summary to the `all` dependency list in the top-level `Makefile`.
+- Run `make clean` before kicking off tests after a structural change.

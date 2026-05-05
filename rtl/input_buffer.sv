@@ -214,7 +214,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : read_init
   end
 end
 
-logic read_fetch_done, read_shift_done;
+logic read_fetch_done, read_shift_done, read_fetch_comp;
 assign read_fetch_comp = read_counter > read_thres;
 always_ff @(posedge clk_i or negedge arst_ni) begin : read_count
   if (!arst_ni) begin
