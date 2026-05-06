@@ -76,7 +76,7 @@ logic [($clog2(RP_SIZE/4))-1:0] row_group;
 always_comb begin : rp_addressing
   case (base_graph_i)
     1'b0 : row_group = 5'(row_i >> 2);
-    1'b1 : row_group = 5'((row_i + 6'(BG1_ROW_N)) >> 2);
+    1'b1 : row_group = 5'(1 + ((row_i + 6'(BG1_ROW_N)) >> 2));
   endcase
 end
 
@@ -95,12 +95,14 @@ localparam int unsigned CSR_WIDTH = $clog2(CSR_SIZE);
 logic [CSR_WIDTH-1:0] colval_addr_q [0:3]; 
 logic [CSR_WIDTH-1:0] colval_addr [0:3]; 
 logic [COL_WIDTH-1:0] col_idx [0:3];
+logic [COL_WIDTH-1:0] col_idx_ctl [0:3];
 logic [COL_WIDTH-1:0] col_curr;
 
 logic [3:0] col_en;
 always_comb begin
   for (int unsigned i = 0; i < 4; i++) begin
-    col_en[i] = col_curr == col_idx[i];
+    // enable when it is current col or a core parity bit
+    col_en[i] = (col_curr == col_idx[i] | col_idx[i] > 7'(KB_MAX-1));
   end
 end
 
@@ -113,6 +115,7 @@ for (int unsigned i = 0; i < 4; i++) begin
     if (state_q == VALID & ~ldpc_handshake) colval_addr_q[i] <= colval_addr_q[i]; // backpressure
     else if (state_q == INIT) begin
       // take data from bypass to increment correctly after init
+      // TODO: change this, integrate to col_en
       if (col_en[i]) colval_addr_q[i] <= colval_addr[i] + 1;
       else colval_addr_q[i] <= colval_addr[i];
     end
@@ -145,13 +148,16 @@ rom_lutram #(
   .dout_o(col_idx)
 );
 
+// handle non-zero col_idx during INIT
+assign col_idx_ctl = (state_q == INIT & ~start_i)? {'0, '0, '0, '0} : col_idx;
+
 csr_col_ctl #(
   .COL_WIDTH(COL_WIDTH)
  ) csr_col_ctl (
   .clk_i       (clk_i),
   .arst_ni     (arst_ni),
-  .col_idx_i   (col_idx),
-  .col_curr    (col_curr),
+  .col_idx_i   (col_idx_ctl),
+  .col_curr_o  (col_curr),
   .row_change_o(row_change)
 );
 
@@ -187,19 +193,28 @@ endgenerate
 // output registers
 always_ff @(posedge clk_i or negedge arst_ni) begin : output_ff
   if (!arst_ni) begin
-    row_change_o <= 0;
     col_curr_o <= '0;
     gf2_en_o <= '0; 
   end else begin
     if (state_q == VALID & ~ldpc_handshake) begin
       // backpressure
-      row_change_o <= row_change_o;
       col_curr_o <= col_curr_o;
       gf2_en_o <= gf2_en_o;
     end else begin
-      row_change_o <= row_change;
       col_curr_o <= col_curr;
       gf2_en_o <= col_en;
+    end
+  end
+end
+
+always_ff @(posedge clk_i or negedge arst_ni) begin : row_change_ff
+  if (!arst_ni) begin
+    row_change_o <= 0;
+  end else begin
+    if (state_q == INIT & ~start_i) begin
+      row_change_o <= row_change_o;
+    end else begin
+      row_change_o <= row_change;
     end
   end
 end

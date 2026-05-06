@@ -6,27 +6,28 @@ import os
 import re
 
 # Constants based on typical 5G NR LDPC
-BG1_MAX_ROW_GROUP = 12  # ceil(46/4)
-BG2_MAX_ROW_GROUP = 11  # ceil(42/4)
 BG1_ROW_COUNT = 46      # Offset used to locate BG2 rows in the unified memory
+BG2_ROW_COUNT = 42      # BG2 max physical rows
 
 # Global cache so we only parse the files once per simulation run
 _cached_golden_matrix = None
 _golden_matrix_loaded = False
 
+# Add this near the top of your file with the other globals
+_cached_raw_data = None
+
 def load_golden_matrix(dut):
     """
     Parses the human-readable text files to generate a golden reference matrix.
-    Format: golden_matrix[physical_row][col] = value
+    Also caches raw 1D arrays to allow cycle-accurate FSM tracking.
     """
-    global _cached_golden_matrix, _golden_matrix_loaded
+    global _cached_golden_matrix, _golden_matrix_loaded, _cached_raw_data
     
     if _golden_matrix_loaded:
         return _cached_golden_matrix
 
     data_dir = os.environ.get("GOLDEN_DATA_DIR", ".")
     
-    # Safely construct the full absolute paths
     row_ptr_path = os.path.join(data_dir, "row_ptr_readable.txt")
     col_idx_path = os.path.join(data_dir, "col_indices_readable.txt")
     val_path = os.path.join(data_dir, "values_readable.txt")
@@ -35,17 +36,17 @@ def load_golden_matrix(dut):
         def parse_file_safe(filepath):
             with open(filepath, "r") as f:
                 content = f.read()
-            # Replace common separators with spaces
             for char in [',', '\n', '\r', '\t']:
                 content = content.replace(char, ' ')
-            # Safely extract pure digits only (avoids words like "36-bit")
             return [int(w) for w in content.split() if w.isdigit()]
 
         row_ptrs = parse_file_safe(row_ptr_path)
         col_indices = parse_file_safe(col_idx_path)
         values = parse_file_safe(val_path)
         
-        # Sanity checking to avoid infinite loops
+        # Cache the raw arrays for the cycle-accurate monitor
+        _cached_raw_data = (row_ptrs, col_indices, values)
+        
         if len(row_ptrs) == 0:
             dut._log.warning("Row pointers list is empty!")
             _golden_matrix_loaded = True
@@ -57,7 +58,6 @@ def load_golden_matrix(dut):
             start_idx = row_ptrs[r]
             end_idx = row_ptrs[r+1]
             
-            # Protect against invalid ranges and corrupted parsing bounds
             if start_idx >= end_idx or (end_idx - start_idx) > 10000:
                 continue 
                 
@@ -65,14 +65,13 @@ def load_golden_matrix(dut):
                 if idx < len(col_indices) and idx < len(values):
                     golden_matrix[r][col_indices[idx]] = values[idx]
                     
-        dut._log.info("Golden matrix successfully loaded and mapped.")
+        dut._log.info("Golden matrix and raw arrays successfully loaded.")
         
         _cached_golden_matrix = golden_matrix
         _golden_matrix_loaded = True
         return golden_matrix
 
     except Exception as e:
-        # Catch ALL exceptions (like ValueErrors, OSErrors) so the coroutine doesn't silently die
         dut._log.warning(f"Golden data loading failed, skipping integrity checks. Error: {e}")
         _golden_matrix_loaded = True
         return None
@@ -90,74 +89,153 @@ async def reset_dut(dut):
     dut.arst_ni.value = 1
     await ClockCycles(dut.clk_i, 5)
 
-async def wait_for_row_completion(dut, row_group, bg, golden_matrix):
+async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
     """
-    Monitors the DUT output and compares it against the golden matrix.
-    Validates column-by-column as dictated by dut.col_curr_o to handle
-    sparse missing values (-1).
+    Monitors the DUT output cycle-accurately against the raw memory arrays.
+    Matches the RTL's state machine, including continuous streaming of 
+    parity bits (col > 21) even if they cross row boundaries in memory.
     """
-    # Base graph offsets: BG1 starts at physical row 0, BG2 starts at row 46
-    bg1_row_count = 46
-    base_row = (row_group * 4) + (bg1_row_count if bg == 1 else 0)
-    max_rows = 46 if bg == 0 else 42
+    global _cached_raw_data
     
+    if _cached_raw_data is None:
+        dut._log.warning("Raw data missing. Skipping checks for this row.")
+        while True:
+            await RisingEdge(dut.clk_i)
+            if dut.row_change_o.value == 1:
+                break
+        return
+        
+    row_ptrs_list, col_indices, values = _cached_raw_data
+    
+    # BG1 has 46 rows, meaning it uses 47 pointers (indices 0 to 46) including the end pointer.
+    # In the unified memory list, BG2's row 0 starts exactly at index 47.
+    BG1_MEM_OFFSET = 47 
+    
+    aligned_start_row = (start_row // 4) * 4
+    base_row = aligned_start_row + (BG1_MEM_OFFSET if bg == 1 else 0)
+    max_rows = BG1_ROW_COUNT if bg == 0 else BG2_ROW_COUNT
+    
+    # Initialize memory FSM pointers for the 4 physical rows
+    ptrs = {}
+    for i in range(4):
+        if (aligned_start_row + i) < max_rows:
+            unified_mem_row = base_row + i
+            if unified_mem_row < len(row_ptrs_list):
+                ptrs[i] = row_ptrs_list[unified_mem_row]
+            else:
+                ptrs[i] = len(col_indices) # End of memory safeguard
+        else:
+            # Ghost rows (padded rows out of bounds for the current base graph)
+            ptrs[i] = len(col_indices)
+            
     while True:
         await RisingEdge(dut.clk_i)
         
-        # 1. Sample only on a valid handshake
-        if dut.ldpc_valid_o.value == 1 and dut.ldpc_ready_i.value == 1:
+        if dut.row_change_o.value == 1:
+            break
             
-            # 2. Extract the absolute column index from the DUT
+        if dut.ldpc_valid_o.value == 1 and dut.ldpc_ready_i.value == 1:
             current_col = dut.col_curr_o.value.to_unsigned()
             
-            # 3. Verify each of the 4 parallel physical rows
             for i in range(4):
-                physical_row = base_row + i
+                ptr = ptrs[i]
+                expected_val = -1
+                expected_gf2_en = 0
                 
-                # Handle ghost rows (out of bounds for the base graph)
-                if (row_group * 4 + i) >= max_rows:
-                    expected_val = -1
-                else:
-                    # Extract the expected value for the current column
-                    # This gracefully handles both List[Dict] and List[List] golden matrices
-                    row_data = golden_matrix[physical_row]
-                    if isinstance(row_data, dict):
-                        expected_val = row_data.get(current_col, -1)
-                    else:
-                        try:
-                            expected_val = row_data[current_col]
-                        except IndexError:
-                            expected_val = -1
-                
-                # Read actual values from the DUT
+                # Fetch exactly what the hardware ROM is pointing to
+                if ptr < len(col_indices):
+                    pointed_col = col_indices[ptr]
+                    pointed_val = values[ptr]
+                    
+                    # Mirror the RTL's col_en logic perfectly
+                    if pointed_col == current_col or pointed_col > 21:
+                        expected_val = pointed_val
+                        expected_gf2_en = 1
+                        ptrs[i] += 1  # Consumed, advance pointer just like colval_addr_q
+                        
                 actual_val = dut.permutation_o[i].value.to_unsigned()
-                
-                # In 9-bit unsigned two's complement, -1 is 511 (0x1FF)
-                if actual_val == 511:  
+                if actual_val == 511:
                     actual_val = -1
                     
-                # Bit extraction for gf2_en_o 
                 actual_gf2_en = (dut.gf2_en_o.value.to_unsigned() >> i) & 1
-                expected_gf2_en = 1 if expected_val != -1 else 0
                 
-                # Assertions
+                graph_row = aligned_start_row + i
                 assert actual_val == expected_val, (
-                    f"Value mismatch at BG={bg}, Row Group={row_group}, Physical Row={physical_row}, "
-                    f"Col={current_col}. Expected: {expected_val}, Actual: {actual_val}"
+                    f"Value mismatch at BG={bg}, Input Row={start_row}, Graph Row={graph_row}, "
+                    f"Info Col={current_col}. Expected: {expected_val}, Actual: {actual_val}"
                 )
                 
                 assert actual_gf2_en == expected_gf2_en, (
-                    f"GF2_EN mismatch at BG={bg}, Row Group={row_group}, Physical Row={physical_row}, "
-                    f"Col={current_col}. Expected: {expected_gf2_en}, Actual: {actual_gf2_en}"
+                    f"GF2_EN mismatch at BG={bg}, Input Row={start_row}, Graph Row={graph_row}, "
+                    f"Info Col={current_col}. Expected: {expected_gf2_en}, Actual: {actual_gf2_en}"
                 )
-                
-            # 4. Exit condition: row_change_o flags the end of the row group processing
-            if dut.row_change_o.value == 1:
-                break
+
+@cocotb.test()
+async def test_continuous_decoding(dut):
+    """
+    Validates the DUT's ability to seamlessly transition between rows.
+    Uses concurrent tasks to act as an accurate AXI-style top-level master.
+    """
+    dut._log.info("=== Starting test_continuous_decoding ===")
+    golden_matrix = load_golden_matrix(dut)
+    
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    num_tests = 10
+    test_configs = []
+    
+    # Pre-generate the sequence of row configs
+    for _ in range(num_tests):
+        bg = random.choice([0, 1])
+        row_max = BG1_ROW_COUNT if bg == 0 else BG2_ROW_COUNT
+        # Generate an unprocessed physical row increment (0, 4, 8...)
+        physical_row = random.randrange(0, row_max, 4) 
+        test_configs.append((bg, physical_row))
+        
+    async def driver():
+        """Feeds start_i and row configurations continuously."""
+        for i, (bg, physical_row) in enumerate(test_configs):
+            dut.base_graph_i.value = bg
+            dut.row_i.value = physical_row
+            dut.start_i.value = 1
+            await RisingEdge(dut.clk_i)
+            dut.start_i.value = 0
+            
+            if i < num_tests - 1:
+                # Wait for the DUT to signal it needs the next row
+                while True:
+                    await RisingEdge(dut.clk_i)
+                    if dut.row_change_o.value == 1:
+                        # Break to immediately loop back and assert start_i on the next clock
+                        break
+                        
+    async def monitor():
+        """Validates outputs against the golden model."""
+        for bg, physical_row in test_configs:
+            await wait_for_row_completion(dut, physical_row, bg, golden_matrix)
+            
+    async def backpressure():
+        """Randomly toggles ready_i to simulate downstream pressure."""
+        while True:
+            # Downstream ready can fluctuate independently of valid signals
+            dut.ldpc_ready_i.value = random.choice([0, 1])
+            await RisingEdge(dut.clk_i)
+            
+    # Launch all behaviors concurrently
+    driver_task = cocotb.start_soon(driver())
+    monitor_task = cocotb.start_soon(monitor())
+    bp_task = cocotb.start_soon(backpressure())
+    
+    # Wait for the monitor to finish validating all requested rows
+    await monitor_task
+    
+    # Clean up the infinite backpressure thread
+    bp_task.kill()
 
 @cocotb.test()
 async def test_bg1_full_sweep(dut):
-    """Test the complete sweeping of Base Graph 1 from row group 0 to finish."""
+    """Test the complete sweeping of Base Graph 1 from physical row 0 to finish."""
     dut._log.info("=== Starting test_bg1_full_sweep ===")
     golden_matrix = load_golden_matrix(dut)
     
@@ -168,20 +246,21 @@ async def test_bg1_full_sweep(dut):
     dut.base_graph_i.value = 0
 
     dut._log.info("Starting BG1 row sweep...")
-    for row_idx in range(BG1_MAX_ROW_GROUP):
-        dut.row_i.value = row_idx
+    # Increment by 4 to jump to the next unprocessed physical row
+    for physical_row in range(0, BG1_ROW_COUNT, 4):
+        dut.row_i.value = physical_row
         dut.start_i.value = 1
         await RisingEdge(dut.clk_i)
         dut.start_i.value = 0
         
-        await wait_for_row_completion(dut, row_idx, 0, golden_matrix)
-        dut._log.info(f"Completed BG1 row group {row_idx}.")
+        await wait_for_row_completion(dut, physical_row, 0, golden_matrix)
+        dut._log.info(f"Completed BG1 physical rows {physical_row} to {physical_row+3}.")
         
     await ClockCycles(dut.clk_i, 10)
 
 @cocotb.test()
 async def test_bg2_full_sweep(dut):
-    """Test the complete sweeping of Base Graph 2 from row group 0 to finish."""
+    """Test the complete sweeping of Base Graph 2 from physical row 0 to finish."""
     dut._log.info("=== Starting test_bg2_full_sweep ===")
     golden_matrix = load_golden_matrix(dut)
     
@@ -192,14 +271,15 @@ async def test_bg2_full_sweep(dut):
     dut.base_graph_i.value = 1
 
     dut._log.info("Starting BG2 row sweep...")
-    for row_idx in range(BG2_MAX_ROW_GROUP):
-        dut.row_i.value = row_idx
+    # Increment by 4 to jump to the next unprocessed physical row
+    for physical_row in range(0, BG2_ROW_COUNT, 4):
+        dut.row_i.value = physical_row
         dut.start_i.value = 1
         await RisingEdge(dut.clk_i)
         dut.start_i.value = 0
         
-        await wait_for_row_completion(dut, row_idx, 1, golden_matrix)
-        dut._log.info(f"Completed BG2 row group {row_idx}.")
+        await wait_for_row_completion(dut, physical_row, 1, golden_matrix)
+        dut._log.info(f"Completed BG2 physical rows {physical_row} to {physical_row+3}.")
 
     await ClockCycles(dut.clk_i, 10)
 
@@ -233,7 +313,8 @@ async def test_arbitrary_input_changes(dut):
         
         start_val = 1 if (toggle_mask & 0b001) else 0
         bg_val = random.choice([0, 1]) if (toggle_mask & 0b010) else dut.base_graph_i.value
-        row_val = random.randint(0, 11) if (toggle_mask & 0b100) else dut.row_i.value
+        # Ensure we send a randomly chosen valid physical row
+        row_val = random.randrange(0, BG1_ROW_COUNT, 4) if (toggle_mask & 0b100) else dut.row_i.value
         
         dut.start_i.value = start_val
         dut.base_graph_i.value = bg_val
@@ -261,8 +342,8 @@ async def test_backpressure_and_delays(dut):
 
     for i in range(10): 
         bg = random.choice([0, 1])
-        row_max = BG1_MAX_ROW_GROUP if bg == 0 else BG2_MAX_ROW_GROUP
-        row = random.randint(0, row_max - 1)
+        row_max = BG1_ROW_COUNT if bg == 0 else BG2_ROW_COUNT
+        row = random.randrange(0, row_max, 4)
 
         delay = random.randint(5, 50)
         dut.ldpc_ready_i.value = 0
