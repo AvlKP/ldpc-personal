@@ -6,7 +6,7 @@
 export SIM ?= verilator
 export TOPLEVEL_LANG ?= verilog
 export COMPILE_ARGS ?= --timing -Wall -Wno-fatal
-export EXTRA_ARGS ?= --trace --trace-fst --trace-structs
+export EXTRA_ARGS ?= --trace --trace-fst --trace-structs -f $(SIM_DIR)/../verilator.f
 export WAVES ?= 1
 
 # Base directories

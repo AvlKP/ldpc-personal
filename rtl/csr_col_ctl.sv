@@ -1,5 +1,3 @@
-import ldpc_pkg::*;
-
 module csr_col_ctl #(
   parameter int unsigned COL_WIDTH = 9
 ) (
@@ -45,9 +43,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
   for (int unsigned i = 0; i < 4; i++) begin
     if (!arst_ni) col_idx_prev[i] <= '0;
     else if (row_change_o) col_idx_prev[i] <= '0;
-    else if (col_idx_i[i] <= (KB_MAX-1))
-      col_idx_prev[i] <= col_idx_i[i];
-    else col_idx_prev[i] <= col_idx_prev[i];
+    else col_idx_prev[i] <= col_idx_i[i];
   end
 
   // compare previous value with current one

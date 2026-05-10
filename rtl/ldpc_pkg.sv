@@ -18,6 +18,9 @@ package ldpc_pkg;
   parameter int unsigned ZC_WIDTH = $clog2(ZC_MAX + 1);
   parameter int unsigned INPUT_BITS_MAX = 8448;  // BG1 maximum
   parameter int unsigned OUTPUT_BITS_MAX = 26112;
-  parameter int unsigned KB_MAX = 22;
-  parameter int unsigned KB_WIDTH = $clog2(KB_MAX + 1);
+  parameter int unsigned KB_BG1 = 22;
+  parameter int unsigned KB_BG2 = 10;
+  parameter int unsigned KB_WIDTH = $clog2(KB_BG1 + 1);
+  parameter int unsigned RG_BG1 = 12;
+  parameter int unsigned RG_BG2 = 11;
 endpackage

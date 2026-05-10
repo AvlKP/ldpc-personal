@@ -58,7 +58,7 @@ logic ramw_swap;
 
 logic ramr_swap;
 // logic [CHUNK_WIDTH-1:0] ramr_pointer_inner [0:1];
-logic [CHUNK_BITS-1:0] ramr_data_inner [0:1];
+logic [1:0][CHUNK_BITS-1:0] ramr_data_inner;
 logic [CHUNK_WIDTH-1:0] ramr_pointer;
 logic [CHUNK_BITS-1:0] ramr_data;
 

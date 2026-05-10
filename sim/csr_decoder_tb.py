@@ -3,17 +3,15 @@ from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, ClockCycles
 import random
 import os
-import re
 
 # Constants based on typical 5G NR LDPC
 BG1_ROW_COUNT = 46      # Offset used to locate BG2 rows in the unified memory
 BG2_ROW_COUNT = 42      # BG2 max physical rows
+ZC_WIDTH = 9            # Bit-width of the payload slices (deduced from 511 mask)
 
 # Global cache so we only parse the files once per simulation run
 _cached_golden_matrix = None
 _golden_matrix_loaded = False
-
-# Add this near the top of your file with the other globals
 _cached_raw_data = None
 
 def load_golden_matrix(dut):
@@ -101,7 +99,7 @@ async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
         dut._log.warning("Raw data missing. Skipping checks for this row.")
         while True:
             await RisingEdge(dut.clk_i)
-            if dut.row_change_o.value == 1:
+            if dut.rg_changed_o.value == 1:
                 break
         return
         
@@ -115,49 +113,63 @@ async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
     base_row = aligned_start_row + (BG1_MEM_OFFSET if bg == 1 else 0)
     max_rows = BG1_ROW_COUNT if bg == 0 else BG2_ROW_COUNT
     
-    # Initialize memory FSM pointers for the 4 physical rows
+    # Parity columns start after the 'kb' info columns. 
+    # BG1 kb=22 (indices 0-21). BG2 kb=10 (indices 0-9).
+    parity_threshold = 21 if bg == 0 else 9
+
+    # Initialize memory FSM pointers for the 4 physical rows and their limits
     ptrs = {}
+    limits = {}
     for i in range(4):
         if (aligned_start_row + i) < max_rows:
             unified_mem_row = base_row + i
-            if unified_mem_row < len(row_ptrs_list):
+            if unified_mem_row < len(row_ptrs_list) - 1:
                 ptrs[i] = row_ptrs_list[unified_mem_row]
+                limits[i] = row_ptrs_list[unified_mem_row + 1]
             else:
                 ptrs[i] = len(col_indices) # End of memory safeguard
+                limits[i] = len(col_indices)
         else:
             # Ghost rows (padded rows out of bounds for the current base graph)
             ptrs[i] = len(col_indices)
+            limits[i] = len(col_indices)
             
     while True:
         await RisingEdge(dut.clk_i)
         
-        if dut.row_change_o.value == 1:
+        if dut.rg_changed_o.value == 1:
             break
             
         if dut.ldpc_valid_o.value == 1 and dut.ldpc_ready_i.value == 1:
             current_col = dut.col_curr_o.value.to_unsigned()
             
+            # Fetch entire packed arrays as single bit vectors
+            permutation_vector = dut.permutation_o.value.to_unsigned()
+            gf2_en_vector = dut.gf2_en_o.value.to_unsigned()
+            
             for i in range(4):
                 ptr = ptrs[i]
+                limit = limits[i]
                 expected_val = -1
                 expected_gf2_en = 0
                 
-                # Fetch exactly what the hardware ROM is pointing to
-                if ptr < len(col_indices):
+                # Fetch exactly what the hardware ROM is pointing to within limits bounds
+                if ptr < limit:
                     pointed_col = col_indices[ptr]
                     pointed_val = values[ptr]
                     
                     # Mirror the RTL's col_en logic perfectly
-                    if pointed_col == current_col or pointed_col > 21:
+                    if pointed_col == current_col or pointed_col > parity_threshold:
                         expected_val = pointed_val
                         expected_gf2_en = 1
                         ptrs[i] += 1  # Consumed, advance pointer just like colval_addr_q
-                        
-                actual_val = dut.permutation_o[i].value.to_unsigned()
+                
+                # Mask and shift to extract the i-th slice of the packed arrays
+                actual_val = (permutation_vector >> (i * ZC_WIDTH)) & 0x1FF
                 if actual_val == 511:
                     actual_val = -1
                     
-                actual_gf2_en = (dut.gf2_en_o.value.to_unsigned() >> i) & 1
+                actual_gf2_en = (gf2_en_vector >> i) & 1
                 
                 graph_row = aligned_start_row + i
                 assert actual_val == expected_val, (
@@ -206,7 +218,7 @@ async def test_continuous_decoding(dut):
                 # Wait for the DUT to signal it needs the next row
                 while True:
                     await RisingEdge(dut.clk_i)
-                    if dut.row_change_o.value == 1:
+                    if dut.rg_changed_o.value == 1:
                         # Break to immediately loop back and assert start_i on the next clock
                         break
                         
@@ -366,7 +378,7 @@ async def test_backpressure_and_delays(dut):
             
             timeout_ctr += 1
             if timeout_ctr > 5000:
-                dut._log.error(f"Timeout! valid_o={dut.ldpc_valid_o.value}, ready_i={dut.ldpc_ready_i.value}, row_change_o={dut.row_change_o.value}")
+                dut._log.error(f"Timeout! valid_o={dut.ldpc_valid_o.value}, ready_i={dut.ldpc_ready_i.value}, rg_changed_o={dut.rg_changed_o.value}")
                 assert False, "Timeout waiting for row completion. RTL might be dropping signals when not ready, or ignoring start_i!"
 
         await monitor_task # Catch any exception thrown by the monitor

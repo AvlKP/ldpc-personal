@@ -5,8 +5,8 @@ module rom_lutram #(
     parameter string MEM_INIT = "mem/example.mem",
     localparam int unsigned ADDR_WIDTH = $clog2(SIZE)
 ) (
-    input  logic [ADDR_WIDTH-1:0] addr_i [0:NUM_PORTS-1],
-    output logic [WORD_WIDTH-1:0] dout_o [0:NUM_PORTS-1]
+    input  logic [NUM_PORTS-1:0][ADDR_WIDTH-1:0] addr_i,
+    output logic [NUM_PORTS-1:0][WORD_WIDTH-1:0] dout_o
 );
 
   (* rom_style = "distributed" *) logic [WORD_WIDTH-1:0] rom[0:SIZE-1];
