@@ -23,3 +23,6 @@ test_csr_arbitrary:
 
 test_csr_backpressure:
 	$(call run_test,csr_decoder_backpressure,csr_decoder,csr_decoder_tb,$(CSR_DECODER_SRCS),test_backpressure_and_delays)
+
+test_csr_row_increment:
+	$(call run_test,csr_decoder_row_increment,csr_decoder,csr_decoder_tb,$(CSR_DECODER_SRCS),test_variable_row_increments)

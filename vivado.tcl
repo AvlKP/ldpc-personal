@@ -1,5 +1,5 @@
 # This script was generated automatically by bender.
-set ROOT "/foss/designs/ldpc_personal"
+set ROOT "C:/Users/avila/eda/designs/ldpc_personal"
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/fpga/pad_functional_xilinx.sv \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/fpga/tc_clk_xilinx.sv \

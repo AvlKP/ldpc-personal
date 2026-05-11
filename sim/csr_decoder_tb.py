@@ -137,8 +137,8 @@ async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
     while True:
         await RisingEdge(dut.clk_i)
         
-        if dut.rg_changed_o.value == 1:
-            break
+        # if dut.rg_changed_o.value == 1:
+        #     break
             
         if dut.ldpc_valid_o.value == 1 and dut.ldpc_ready_i.value == 1:
             current_col = dut.col_curr_o.value.to_unsigned()
@@ -181,6 +181,15 @@ async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
                     f"GF2_EN mismatch at BG={bg}, Input Row={start_row}, Graph Row={graph_row}, "
                     f"Info Col={current_col}. Expected: {expected_gf2_en}, Actual: {actual_gf2_en}"
                 )
+        
+        all_done = True
+        for i in range(4):
+            if ptrs[i] < limits[i]:
+                all_done = False
+                break
+                
+        if all_done:
+            break
 
 @cocotb.test()
 async def test_continuous_decoding(dut):
@@ -215,11 +224,11 @@ async def test_continuous_decoding(dut):
             dut.start_i.value = 0
             
             if i < num_tests - 1:
-                # Wait for the DUT to signal it needs the next row
+                # Wait for the internal ROMs to finish AND the skid buffer to empty
                 while True:
                     await RisingEdge(dut.clk_i)
-                    if dut.rg_changed_o.value == 1:
-                        # Break to immediately loop back and assert start_i on the next clock
+                    # ldpc_valid_o == 0 ensures no inflight data is destroyed by the next start_i
+                    if dut.rg_changed_o.value == 1 and dut.ldpc_valid_o.value == 0:
                         break
                         
     async def monitor():
@@ -311,12 +320,12 @@ async def test_arbitrary_input_changes(dut):
     await RisingEdge(dut.clk_i)
     dut.start_i.value = 0
 
+    # Spawn an asynchronous thread to independently monitor correctness
+    monitor_task = cocotb.start_soon(wait_for_row_completion(dut, 0, 0, golden_matrix))
+
     # Wait until FSM enters VALID state to start interference
     while dut.ldpc_valid_o.value != 1:
         await RisingEdge(dut.clk_i)
-
-    # Spawn an asynchronous thread to independently monitor correctness
-    monitor_task = cocotb.start_soon(wait_for_row_completion(dut, 0, 0, golden_matrix))
 
     # Throw chaotic permutations onto inputs while the row is being processed
     timeout_ctr = 0
@@ -383,3 +392,67 @@ async def test_backpressure_and_delays(dut):
 
         await monitor_task # Catch any exception thrown by the monitor
         dut._log.info(f"Iter {i}: Done.")
+
+@cocotb.test()
+async def test_variable_row_increments(dut):
+    """
+    Test fetching rows continuously with variable physical row increments of {1, 2, 4}.
+    Verifies the FSM can handle unaligned and repeated access to the same row groups.
+    """
+    dut._log.info("=== Starting test_variable_row_increments ===")
+    golden_matrix = load_golden_matrix(dut)
+    
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    test_configs = []
+    
+    # Generate a sequence covering both Base Graphs
+    for bg in [0, 1]:
+        row_max = BG1_ROW_COUNT if bg == 0 else BG2_ROW_COUNT
+        physical_row = 0
+        
+        while physical_row < row_max:
+            test_configs.append((bg, physical_row))
+            # Dynamically select the next increment
+            increment = random.choice([1, 2, 4])
+            physical_row += increment
+            
+    async def driver():
+        """Feeds start_i and row configurations with fixed safe-start logic."""
+        for i, (bg, physical_row) in enumerate(test_configs):
+            dut.base_graph_i.value = bg
+            dut.row_i.value = physical_row
+            dut.start_i.value = 1
+            await RisingEdge(dut.clk_i)
+            dut.start_i.value = 0
+            
+            if i < len(test_configs) - 1:
+                # Wait for the DUT to finish and flush before pushing the next start
+                while True:
+                    await RisingEdge(dut.clk_i)
+                    if dut.rg_changed_o.value == 1 and dut.ldpc_valid_o.value == 0:
+                        break
+                        
+    async def monitor():
+        """Validates outputs against the golden model."""
+        for bg, physical_row in test_configs:
+            await wait_for_row_completion(dut, physical_row, bg, golden_matrix)
+            
+    async def backpressure():
+        """Randomly toggles ready_i to simulate downstream pressure."""
+        while True:
+            dut.ldpc_ready_i.value = random.choice([0, 1])
+            await RisingEdge(dut.clk_i)
+            
+    # Launch all behaviors concurrently
+    driver_task = cocotb.start_soon(driver())
+    monitor_task = cocotb.start_soon(monitor())
+    bp_task = cocotb.start_soon(backpressure())
+    
+    # Wait for the monitor to finish validating all requested rows
+    await monitor_task
+    
+    # Clean up the infinite backpressure thread
+    bp_task.kill()
+    await ClockCycles(dut.clk_i, 10)

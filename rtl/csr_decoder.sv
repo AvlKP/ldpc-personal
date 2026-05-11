@@ -41,14 +41,14 @@ logic inner_ready, inner_valid;
 logic bg_q, bg_n;
 logic [ROW_WIDTH-1:0] row_q, row_n;
 
-assign bg_n = start_i? base_graph_i : bg_q;
-assign row_n = start_i? row_i : row_q;
+assign bg_n = (start_i & state_q == INIT)? base_graph_i : bg_q;
+assign row_n = (start_i & state_q == INIT)? row_i : row_q;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : input_lock
   if (!arst_ni) begin
     bg_q <= 0;
     row_q <= '0;
-  end else if (start_i) begin
+  end else if (start_i & state_q == INIT) begin
     bg_q <= base_graph_i;
     row_q <= row_i;
   end
@@ -71,7 +71,7 @@ fall_through_register #(
 ) ldpc_io_reg (
   .clk_i     (clk_i),
   .rst_ni    (arst_ni),
-  .clr_i     (start_i),
+  .clr_i     (1'b0),
   .testmode_i(),
   .valid_i   (inner_valid),
   .ready_o   (inner_ready),
@@ -91,7 +91,7 @@ assign rg_changed_o = rg_changed_q;
 logic ldpc_handshake;
 
 // mainly for readability
-assign inner_valid = ((state_q == VALID) & !start_i)? 1 : 0;
+assign inner_valid = (state_q == VALID)? 1 : 0;
 assign ldpc_handshake = inner_ready & inner_valid;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : state_ff
@@ -134,7 +134,7 @@ logic [3:0][BASEP_WIDTH-1:0] rp_wire, rp_limit_q;
 logic [RPW_WIDTH-1:0] rg, rg_base;
 
 assign rg_base = 
-  (bg_n)? RPW_WIDTH'(1 + ((row_n + ROW_WIDTH'(BG1_ROW_N)) >> 2)) 
+  (bg_n)? RPW_WIDTH'(RG_BG1) + RPW_WIDTH'(row_n >> 2)
         : RPW_WIDTH'(row_n >> 2);
 assign rg = rg_base + RPW_WIDTH'(state_q);
 
@@ -183,8 +183,7 @@ for (int unsigned i = 0; i < 4; i++) begin
   if (!arst_ni) begin
     colval_addr_q[i] <= '0;
   end else begin
-    // special skid buffer ready_o bypass because ROM's 1 clock delay
-    if (state_q == VALID & ~(ldpc_ready_i & inner_valid)) colval_addr_q[i] <= colval_addr_q[i]; // backpressure
+    if (state_q == VALID & ~ldpc_handshake) colval_addr_q[i] <= colval_addr_q[i]; // backpressure
     else if (state_q == INIT) begin
       // take data from bypass to increment correctly after init
       if (row_en[i]) colval_addr_q[i] <= colval_addr_n[i] + 1;
@@ -255,7 +254,9 @@ generate
   genvar rom_i;
   for (rom_i = 0; rom_i < 2; rom_i++) begin : val_rom_gen
     logic [1:0][CSR_WIDTH-1:0] val_addr;
-    logic [1:0][ZC_WIDTH-1:0] val;
+    logic [1:0][ZC_WIDTH-1:0] val, val_held_q, val_muxed;
+    logic val_is_held;
+
     assign val_addr = colval_addr_n[rom_i*2 +: 2];
 
     rom_dp #(
@@ -272,10 +273,35 @@ generate
       .doutb_o(val[1])
     );
 
+    // skid buffer ready delay handling
+    // NOTE: due to 1 clock delay, even if address changed
+    // output will still be same for a clock, so this works
+    always_ff @(posedge clk_i or negedge arst_ni) begin
+      if (!arst_ni) begin
+        val_is_held <= 0;
+        val_held_q <= '0;
+      end else begin
+        if (state_q == VALID) begin
+          if (~ldpc_handshake & ~val_is_held) begin
+            val_held_q <= val;
+            val_is_held <= 1;
+          end else if (ldpc_handshake) begin
+            val_is_held <= 0;
+          end
+        end else begin
+          val_is_held <= 0;
+        end
+      end
+    end
+
+    // mux BRAM last output and current output
+    assign val_muxed[0] = val_is_held ? val_held_q[0] : val[0];
+    assign val_muxed[1] = val_is_held ? val_held_q[1] : val[1];
+
     // assign -1 if (row, col) is invalid (!= col_curr)
     // can also use gf2_en to handle this like Dawam's idea
-    assign permutation[rom_i*2] = (gf2_en_q[rom_i*2])? val[0] : '1;
-    assign permutation[rom_i*2+1] = (gf2_en_q[rom_i*2+1])? val[1] : '1;
+    assign permutation[rom_i*2] = (gf2_en_q[rom_i*2])? val_muxed[0] : '1;
+    assign permutation[rom_i*2+1] = (gf2_en_q[rom_i*2+1])? val_muxed[1] : '1;
   end
 endgenerate
 
@@ -302,8 +328,10 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : row_change_ff
   end else begin
     if (state_q == INIT & ~start_i) begin
       rg_changed_q <= rg_changed_q;
+    end else if (state_q == VALID) begin
+      rg_changed_q <= rg_changed_n & ldpc_handshake;
     end else begin
-      rg_changed_q <= rg_changed_n;
+      rg_changed_q <= 0; 
     end
   end
 end
