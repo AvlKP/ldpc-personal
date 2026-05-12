@@ -154,7 +154,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : rp_ff
   end
 end
 
-rom_lutram #(
+lutrom #(
   .WORD_WIDTH(4*BASEP_WIDTH),
   .SIZE      (RPW_SIZE+1),
   .NUM_PORTS (1),
@@ -208,7 +208,7 @@ always_comb begin
   end
 end
 
-rom_lutram #(
+lutrom #(
   .WORD_WIDTH(COL_WIDTH),
   .SIZE      (CSR_SIZE),
   .NUM_PORTS (4),

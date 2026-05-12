@@ -1,5 +1,6 @@
 // a for write
 // b for read
+// {9, 18, 36, 72}-bit native ports for xc7z020
 
 module sdp_bram #(
   parameter int unsigned WORD_WIDTH = 32,

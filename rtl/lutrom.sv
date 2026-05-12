@@ -1,4 +1,4 @@
-module rom_lutram #(
+module lutrom #(
     parameter int unsigned WORD_WIDTH = 9,
     parameter int unsigned SIZE = 16,
     parameter int unsigned NUM_PORTS = 4,
@@ -9,7 +9,7 @@ module rom_lutram #(
     output logic [NUM_PORTS-1:0][WORD_WIDTH-1:0] dout_o
 );
 
-  (* rom_style = "distributed" *) logic [WORD_WIDTH-1:0] rom[0:SIZE-1];
+  (* rom_style = "distributed" *) logic [WORD_WIDTH-1:0] rom [0:SIZE-1];
 
   initial begin
     $readmemh(MEM_INIT, rom);

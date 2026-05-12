@@ -19,10 +19,11 @@ sources:
   # Level 0
   - "rtl/ldpc_pkg.sv"
   
-  - "rtl/rom_lutram.sv"
+  - "rtl/lutrom.sv"
   - "rtl/rom_dp.sv"
 
-  - "rtl/asym_rgw_sdp_bram.sv"
+  - "rtl/lutram.sv"
+  - "rtl/input_buffer_bank.sv"
   # level 1
   - "rtl/csr_decoder.sv"
   - "rtl/input_buffer.sv"

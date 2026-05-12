@@ -197,9 +197,10 @@
 +incdir+/foss/designs/ldpc_personal/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/include
 +incdir+/foss/designs/ldpc_personal/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/include
 /foss/designs/ldpc_personal/rtl/ldpc_pkg.sv
-/foss/designs/ldpc_personal/rtl/rom_lutram.sv
+/foss/designs/ldpc_personal/rtl/lutrom.sv
 /foss/designs/ldpc_personal/rtl/rom_dp.sv
-/foss/designs/ldpc_personal/rtl/asym_rgw_sdp_bram.sv
+/foss/designs/ldpc_personal/rtl/lutram.sv
+/foss/designs/ldpc_personal/rtl/input_buffer_bank.sv
 /foss/designs/ldpc_personal/rtl/csr_decoder.sv
 /foss/designs/ldpc_personal/rtl/input_buffer.sv
 /foss/designs/ldpc_personal/rtl/ldpc_encoder.sv
