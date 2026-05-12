@@ -14,9 +14,7 @@ import ldpc_pkg::*;
 
 module input_buffer #(
   // recalculate as needed
-  localparam int unsigned DATA_WIDTH = 32,
-  localparam int unsigned BANK_SIZE = 32,
-  localparam int unsigned BANK_NUM = 12
+  localparam int unsigned DATA_WIDTH = 32
 ) (
   input logic clk_i,
   input logic arst_ni,
@@ -26,11 +24,10 @@ module input_buffer #(
   input  logic s_axis_tvalid,
   output logic s_axis_tready,
 
-  output logic ldpc_valid_o, // data batch output is valid
-  input logic ldpc_ready_i, // the ldpc core is ready to accept a data batch
-  // the input vector has been processed
-  // change to the other RAM after asserted
-  input logic ldpc_done_i,
+  // use positive edge of transition when done processing to clear read buffer
+  input logic ldpc_clear_i,
+  // a valid input is available for read
+  output logic ldpc_valid_o,
 
   // store in inner register local to each RAM
   // change upon first AXIS handshake after counter >= input_bits_i
@@ -45,159 +42,202 @@ module input_buffer #(
   output logic [ZC_MAX-1:0] data_batch_o
 );
 
-// RAM signals
-localparam int unsigned ADDR_WIDTH = $clog2(BANK_SIZE);
-localparam int unsigned BANK_WIDTH = $clog2(BANK_NUM);
+localparam int unsigned ACCUM_SIZE = ZC_MAX + DATA_WIDTH;
+localparam int unsigned ACCUM_WIDTH = $clog2(ACCUM_SIZE);
+localparam int unsigned COUNTER_WIDTH = $clog2(INPUT_BITS_MAX/DATA_WIDTH);
+
+logic [ACCUM_SIZE-1:0] accum_data_q;
+logic [ACCUM_WIDTH-1:0] accum_count_q;
 
 logic [1:0] ram_full_q;
 logic [ZC_WIDTH-1:0] ram_zc_q [0:1];
 
-logic ramw_swap_q;
-logic [ADDR_WIDTH-1:0] ramw_addr_q;
-logic [BANK_WIDTH-1:0] ramw_bank_q;
-logic [DATA_WIDTH-1:0] ramw_data;
-assign ramw_data = s_axis_tdata;
-
-logic ramr_swap_q;
-logic [ADDR_WIDTH-1:0] ramr_addr_q, ramr_addr_n;
-logic [BANK_NUM-1:0][DATA_WIDTH-1:0] ramr_data_n [0:1];
-
-// R/W signals
-localparam int unsigned COUNTER_WIDTH = $clog2(INPUT_BITS_MAX/DATA_WIDTH);
-
+logic w_swap_q;
+logic [ZC_MAX-1:0] w_mask, w_data;
+logic [KB_WIDTH-1:0] w_addr_q;
 logic [COUNTER_WIDTH-1:0] w_limit_q, w_cnt_q;
-logic w_idle_q, w_idle_qdly;
 
-// AXI Stream signals
+logic r_swap_q;
+logic [KB_WIDTH-1:0] r_addr;
+logic [ZC_MAX-1:0] r_data [0:1];
+
+typedef enum  { 
+  W_IDLE,
+  W_PACK,
+  W_UNPACK,
+  W_STALL
+} w_state_t;
+w_state_t w_state_n, w_state_q;
+
 logic axis_handshake;
 assign axis_handshake = s_axis_tready & s_axis_tvalid;
-assign s_axis_tready = (w_cnt_q < w_limit_q);
 
-// RAM R/W logic
-always_ff @(posedge clk_i or negedge arst_ni) begin : write_init
+// FSM
+logic tran_en, accum_to_ram_en, stall_en; 
+logic tran_init, tran_done;
+
+assign tran_en = (w_state_n == W_PACK);
+assign accum_to_ram_en = (w_state_n == W_UNPACK);
+
+assign tran_init = (w_state_n == W_PACK & w_state_q == W_IDLE);
+assign tran_done = (((w_state_q == W_UNPACK) | (w_state_q == W_PACK))
+                  & w_state_n == W_IDLE);
+
+assign stall_en = (ram_full_q == 2'b11);
+// cannot use w_state_n because some of their paths depend on axis_handshake
+// resulting in combinational loop
+assign s_axis_tready = (w_cnt_q < w_limit_q)
+                      & (accum_count_q < ram_zc_q[w_swap_q])
+                      & ~stall_en;
+
+always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
-    w_limit_q <= '1;
-    w_idle_q <= 1;
-    w_idle_qdly <= 1;
+    w_state_q <= W_IDLE;
   end else begin
-    if (w_idle_q & axis_handshake) begin
-      w_limit_q <= COUNTER_WIDTH'(input_bits_i >> $clog2(DATA_WIDTH));
-      w_idle_q <= 0;
-    end else if (~w_idle_q & ~s_axis_tready) begin
-      w_limit_q <= '1;
-      w_idle_q <= 1;
-    end
-
-    w_idle_qdly <= w_idle_q;
+    w_state_q <= w_state_n;
   end
 end
 
+always_comb begin
+  case (w_state_q)
+    W_IDLE:
+      if (axis_handshake) w_state_n = W_PACK;
+      else w_state_n = W_IDLE;
+    W_PACK: 
+      if (accum_count_q >= ram_zc_q[w_swap_q]) w_state_n = W_UNPACK;
+      else if (w_cnt_q >= w_limit_q) w_state_n = W_IDLE;
+      else if (axis_handshake) w_state_n = W_PACK;
+      else w_state_n = W_STALL;
+    W_UNPACK:
+      if (accum_count_q >= ram_zc_q[w_swap_q]) w_state_n = W_UNPACK;
+      else if (w_cnt_q >= w_limit_q) w_state_n = W_IDLE;
+      else if (axis_handshake) w_state_n = W_PACK;
+      else w_state_n = W_STALL;
+    W_STALL:
+      if (axis_handshake) w_state_n = W_PACK;
+      else w_state_n = W_STALL;
+    default: w_state_n = W_STALL;
+  endcase
+end
+
+// RAM Control
 always_ff @(posedge clk_i or negedge arst_ni) begin : ram_control
   if (!arst_ni) begin
-    ram_full_q <= 2'b00;
-    ram_zc_q[0] <= '0;
-    ram_zc_q[1] <= '0;
+    w_limit_q <= '1;
 
-    ramw_swap_q <= 0;
-    ramr_swap_q <= 0;
+    ram_full_q <= 2'b00;
+    ram_zc_q[0] <= '1;
+    ram_zc_q[1] <= '1;
+
+    w_swap_q <= 0;
+    r_swap_q <= 0;
   end else begin
     for (int unsigned i = 0; i < 2; i++) begin
-      if (ramr_swap_q == i) begin
-        // TODO: assume done is idle core, do edge check instead of level
-        if (ldpc_done_i) ram_zc_q[i] <= '0;
-        else if (w_idle_q & axis_handshake) ram_zc_q[i] <= lifting_size_i;
+      if (ldpc_clear_i & (r_swap_q == i)) ram_zc_q[i] <= '1;
+      else if (tran_init & (w_swap_q == i)) ram_zc_q[i] <= lifting_size_i;
 
-        if (ldpc_done_i) ram_full_q[i] <= 0;
-        else if (~w_idle_q & ~s_axis_tready) ram_full_q[i] <= 1; 
-      end
+      if (ldpc_clear_i & (r_swap_q == i)) ram_full_q[i] <= 0;
+      else if (tran_done & (w_swap_q == i)) ram_full_q[i] <= 1; 
     end
 
-    if (ldpc_done_i) ramr_swap_q <= ~ramr_swap_q;
-    if (^ram_full_q) ramw_swap_q <= ~ramw_swap_q;
+    if (tran_init) 
+      w_limit_q <= COUNTER_WIDTH'((input_bits_i + 16'(DATA_WIDTH - 1))
+                                  >> $clog2(DATA_WIDTH));
+    else if (tran_done) w_limit_q <= '1;
+  
+    if (ldpc_clear_i) r_swap_q <= ~r_swap_q;
+    if (tran_done) w_swap_q <= ~w_swap_q;
   end
 end
 
-logic bank_full;
-assign bank_full = (ramw_bank_q + (1 << 2)) >= (1 << 4);
-always_ff @(posedge clk_i or negedge arst_ni) begin : ram_counter
+// Write logic
+always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
-    ramw_addr_q <= '0;
-    ramw_bank_q <= '0;
-    w_cnt_q <= '0;
-  end else begin
-    if (w_idle_q & ~w_idle_qdly) begin
-      ramw_addr_q <= '0;
-      ramw_bank_q <= '0;
-      w_cnt_q <= '0;
-    end
-    else if (axis_handshake) begin
-      w_cnt_q <= w_cnt_q + 1;
+    accum_data_q <= '0;
+    accum_count_q <= '0;
+    w_addr_q <= '0;
 
-      if (bank_full) begin
-        ramw_bank_q <= '0;
-        ramw_addr_q <= ramw_addr_q + 1;
-      end else
-        ramw_bank_q <= ramw_bank_q + 1;
+    w_cnt_q <= '0;
+  end else if (tran_done) begin
+    accum_data_q <= '0;
+    accum_count_q <= '0;
+    w_addr_q <= '0;
+
+    w_cnt_q <= '0;    
+  end else begin
+    if (accum_to_ram_en) begin
+      accum_count_q <= accum_count_q - ram_zc_q[w_swap_q];
+      accum_data_q <= accum_data_q >> ram_zc_q[w_swap_q];
+      w_addr_q <= w_addr_q + 1;
+    end
+    else if (tran_en) begin
+      accum_data_q <= accum_data_q 
+                    | (ACCUM_SIZE'(s_axis_tdata) << accum_count_q);
+      accum_count_q <= accum_count_q + ACCUM_WIDTH'(DATA_WIDTH);
+    end
+
+    if (tran_en) begin
+      w_cnt_q <= w_cnt_q + 1;    
     end
   end
 end
 
-// LDPC Core interface
-// TODO: latch during transaction
-assign ramr_addr_n = info_group_i;
+assign w_mask = (ZC_MAX'(1'b1) << ram_zc_q[w_swap_q]) - 1'b1;
+assign w_data = accum_data_q[ZC_MAX-1:0] & w_mask;
 
 // RAM instances
 generate
   genvar i;
   for (i = 0; i < 2; i++) begin : ram_gen
     logic we;
-    assign we = i == ramw_swap_q;
+    assign we = accum_to_ram_en & (w_swap_q == i);
 
-    input_buffer_bank #(
-      .DATA_WIDTH(DATA_WIDTH),
-      .BANK_SIZE (BANK_SIZE),
-      .BANK_NUM  (BANK_NUM)
-     ) input_buffer_bank (
+    lutram #(
+      .WORD_WIDTH(ZC_MAX),
+      .SIZE      (KB_BG1),
+      .NUM_RPORTS(1),
+      .MEM_INIT  (),
+      .MERGE_ADDR(0)
+     ) lutram (
       .clk_i  (clk_i),
-      .din_i  (ramw_data),
-      .waddr_i(ramw_addr_q),
-      .bank_i (ramw_bank_q),
-      .we_i   (we),
-      .raddr_i(ramr_addr_n),
-      .dout_o (ramr_data_n[i])
+      .we     (we),
+      .waddr_i(w_addr_q),
+      .din_i  (w_data),
+      .raddr_i(r_addr),
+      .dout_o (r_data[i])
     );
   end
 endgenerate
 
+// Read logic
 logic [1:0] out_sel; // select data_batch size according to zc
-assign out_sel[1] = (ram_zc_q[ramr_swap_q] <= ZC_MAX >> 1)? 0 : 1; // zc <= 192
-assign out_sel[0] = (ram_zc_q[ramr_swap_q] <= ZC_MAX >> 2)? 0 : 1; // zc <= 96
+assign out_sel[1] = (ram_zc_q[r_swap_q] > ZC_MAX >> 1); // zc > 192
+assign out_sel[0] = (ram_zc_q[r_swap_q] > ZC_MAX >> 2); // zc > 96
 
-always_ff @(posedge clk_i or negedge arst_ni) begin : out_reg
-  if (!arst_ni) begin 
-    ldpc_valid_o <= 0;
+assign r_addr = info_group_i;
+assign ldpc_valid_o = ram_full_q[r_swap_q];
+
+always_ff @(posedge clk_i) begin : out_selector
+  if (!arst_ni) begin
     data_batch_o <= '0;
-  end 
-  else if (ldpc_ready_i) begin
-    ldpc_valid_o <= 1;
-
+  end else begin
     case (out_sel)
       2'b00: begin
         for (int unsigned j = 0; j < 4; j++) begin
           data_batch_o[(ZC_MAX >> 2)*j +: (ZC_MAX >> 2)] 
-            <= {ramr_data_n[ramr_swap_q]}[0 +: (ZC_MAX >> 2)];
+            <= {r_data[r_swap_q]}[0 +: (ZC_MAX >> 2)];
         end
       end
       2'b01: begin
         for (int unsigned j = 0; j < 2; j++) begin
           data_batch_o[(ZC_MAX >> 1)*j +: (ZC_MAX >> 1)] 
-            <= {ramr_data_n[ramr_swap_q]}[0 +: (ZC_MAX >> 1)];
+            <= {r_data[r_swap_q]}[0 +: (ZC_MAX >> 1)];
         end
       end
-      2'b11: data_batch_o <= {ramr_data_n[ramr_swap_q]};
-      default: data_batch_o <= '1;
+      2'b11: data_batch_o <= r_data[r_swap_q];
+      default: data_batch_o <= '0;
     endcase
-  end 
-  // else if (transaction done and no further transaction) invalidate
+  end
 end
+
 endmodule

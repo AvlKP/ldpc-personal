@@ -23,7 +23,6 @@ sources:
   - "rtl/rom_dp.sv"
 
   - "rtl/lutram.sv"
-  - "rtl/input_buffer_bank.sv"
   # level 1
   - "rtl/csr_decoder.sv"
   - "rtl/input_buffer.sv"

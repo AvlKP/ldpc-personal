@@ -2,7 +2,7 @@ module lutram #(
   parameter int unsigned WORD_WIDTH = 8,
   parameter int unsigned SIZE = 32,
   parameter int unsigned NUM_RPORTS = 1,
-  parameter string MEM_INIT = "mem/example.mem",
+  parameter string MEM_INIT = "",
   parameter logic MERGE_ADDR = 0, // use write address as read too
   
   localparam int unsigned INUM_RPORTS = (MERGE_ADDR)? NUM_RPORTS-1 : NUM_RPORTS,
@@ -23,7 +23,12 @@ module lutram #(
 (* ram_style = "distributed" *) logic [WORD_WIDTH-1:0] ram [0:SIZE-1];
 
 initial begin
-  $readmemh(MEM_INIT, ram);
+  if (MEM_INIT != "") $readmemh(MEM_INIT, ram);
+  else begin
+    for (integer unsigned i = 0; i < SIZE; i++) begin
+      ram[i] = '0;
+    end
+  end
 end
 
 always_ff @(posedge clk_i) begin

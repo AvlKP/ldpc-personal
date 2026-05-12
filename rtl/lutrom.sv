@@ -2,7 +2,7 @@ module lutrom #(
     parameter int unsigned WORD_WIDTH = 9,
     parameter int unsigned SIZE = 16,
     parameter int unsigned NUM_PORTS = 4,
-    parameter string MEM_INIT = "mem/example.mem",
+    parameter string MEM_INIT = "",
     localparam int unsigned ADDR_WIDTH = $clog2(SIZE)
 ) (
     input  logic [NUM_PORTS-1:0][ADDR_WIDTH-1:0] addr_i,
@@ -12,7 +12,12 @@ module lutrom #(
   (* rom_style = "distributed" *) logic [WORD_WIDTH-1:0] rom [0:SIZE-1];
 
   initial begin
-    $readmemh(MEM_INIT, rom);
+    if (MEM_INIT != "") $readmemh(MEM_INIT, rom);
+    else begin
+      for (integer unsigned i = 0; i < SIZE; i++) begin
+        rom[i] = '0;
+      end
+    end
   end
 
   always_comb begin

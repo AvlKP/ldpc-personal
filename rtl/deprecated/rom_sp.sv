@@ -13,7 +13,12 @@ module rom_sp #(
 (* rom_style = "block" *) logic [WORD_WIDTH-1:0] rom [0:SIZE-1];
 
 initial begin
-  $readmemh(MEM_INIT, rom);
+  if (MEM_INIT != "") $readmemh(MEM_INIT, rom);
+  else begin
+    for (integer unsigned i = 0; i < SIZE; i++) begin
+      rom[i] = '0;
+    end
+  end
 end
 
 always @(posedge clk_i) begin

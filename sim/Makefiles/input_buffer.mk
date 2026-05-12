@@ -2,24 +2,33 @@
 # Input Buffer Test Targets
 # ==========================================
 
-INPUT_BUFFER_SRCS := $(PKG_SRC) $(RTL_DIR)/asym_rgw_sdp_bram.sv $(RTL_DIR)/input_buffer.sv
+INPUT_BUFFER_SRCS := $(PKG_SRC) $(RTL_DIR)/lutram.sv $(RTL_DIR)/input_buffer.sv
 
-.PHONY: test_input_buffer test_progressive test_zc_edges test_reset_edges test_payload_edges test_bg1_info_sweep
+.PHONY: test_input_buffer test_basic_transfer test_lifting_size_duplication test_ping_pong_backpressure test_randomized_zc_5gnr test_config_change_during_transaction test_buggy_ldpc_clear test_bg1_bg2_sweep test_ping_pong_stall_and_resume
 
 test_input_buffer:
 	$(call run_test,input_buffer,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),)
 
-test_progressive:
-	$(call run_test,input_buffer_progressive,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),input_buffer_continuous_progressive_test)
+test_basic_transfer:
+	$(call run_test,input_buffer_basic_transfer,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_basic_transfer)
 
-test_zc_edges:
-	$(call run_test,input_buffer_zc_edges,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),input_buffer_zc_boundary_edge_cases_test)
+test_lifting_size_duplication:
+	$(call run_test,input_buffer_lifting_size,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_lifting_size_duplication)
 
-test_reset_edges:
-	$(call run_test,input_buffer_reset_edges,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),input_buffer_midstream_reset_edge_cases_test)
+test_ping_pong_backpressure:
+	$(call run_test,input_buffer_ping_pong,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_ping_pong_backpressure)
 
-test_payload_edges:
-	$(call run_test,input_buffer_payload_edges,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),input_buffer_payload_size_edge_cases_test)
+test_randomized_zc_5gnr:
+	$(call run_test,input_buffer_random_zc,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_randomized_zc_5gnr)
 
-test_bg1_info_sweep:
-	$(call run_test,input_buffer_bg1_info,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),input_buffer_bg1_full_info_group_sweep)
+test_config_change_during_transaction:
+	$(call run_test,input_buffer_config_change,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_config_change_during_transaction)
+
+test_buggy_ldpc_clear:
+	$(call run_test,input_buffer_buggy_clear,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_buggy_ldpc_clear)
+
+test_bg1_bg2_sweep:
+	$(call run_test,input_buffer_bg1_bg2_sweep,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_bg1_bg2_sweep)
+
+test_ping_pong_stall_and_resume:
+	$(call run_test,input_buffer_stall_resume,input_buffer,input_buffer_tb,$(INPUT_BUFFER_SRCS),test_ping_pong_stall_and_resume)

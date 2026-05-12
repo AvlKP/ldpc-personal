@@ -1,918 +1,469 @@
-import logging
-import random
-from dataclasses import dataclass
-from typing import List, Optional
-
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
+import random
 
-LOG = logging.getLogger("input_buffer_tb")
-
-DATA_WIDTH = 32
-INPUT_BITS_MAX = 8448
+# Typical 5G NR LDPC parameters (Should match ldpc_pkg)
 ZC_MAX = 384
-KB_MAX = 22
-BG2_INFO_GROUP_MAX = 10
-
-
-@dataclass
-class LdpcScenario:
-	name: str
-	base_graph: str
-	zc: int
-	info_group: int
-	input_bits: int
-	ready_drop_chance: float
-	read_start_gap: int
-	done_delay_cycles: int
-
-
-def _out_sel(zc: int) -> int:
-	out_sel_0 = 0 if zc <= (ZC_MAX >> 1) else 1
-	out_sel_1 = 0 if zc <= (ZC_MAX >> 2) else 1
-	return (out_sel_1 << 1) | out_sel_0
-
-
-def _required_input_bits(zc: int, info_group: int) -> int:
-	fetch_size = _fetch_size_bits(zc)
-	start_bit = zc * (info_group - 1)
-	return start_bit + fetch_size
-
-
-def _fetch_size_bits(zc: int) -> int:
-	if zc <= (ZC_MAX >> 2):
-		return ZC_MAX >> 2
-	if zc <= (ZC_MAX >> 1):
-		return ZC_MAX >> 1
-	if zc <= ZC_MAX:
-		return ZC_MAX
-	raise AssertionError(f"Unsupported lifting size zc={zc}")
-
-
-def _compute_expected_data_batch(payload: List[int], zc: int, info_group: int) -> int:
-	"""
-	Non-cycle-accurate reference model:
-	- choose fetch size from zc: {96, 192, 384}
-	- start bit = zc * (info_group - 1)
-	- slice fetch-size bits from input code block vector
-	- duplicate 96/192 slices up to 384 bits
-	"""
-	code_block = 0
-	for idx, word in enumerate(payload):
-		code_block |= (word & 0xFFFF_FFFF) << (idx * DATA_WIDTH)
-
-	start_bit = zc * (info_group - 1)
-	fetch_size = _fetch_size_bits(zc)
-	unit_mask = (1 << fetch_size) - 1
-	unit = (code_block >> start_bit) & unit_mask
-
-	if fetch_size == (ZC_MAX >> 2):
-		expected = 0
-		for j in range(4):
-			expected |= unit << (j * fetch_size)
-	elif fetch_size == (ZC_MAX >> 1):
-		expected = unit | (unit << fetch_size)
-	else:
-		expected = unit
-
-	return expected & ((1 << ZC_MAX) - 1)
-
-
-def _assert_data_batch_matches(
-	actual: int,
-	payload: List[int],
-	zc: int,
-	info_group: int,
-	scenario_name: str,
-) -> None:
-	expected = _compute_expected_data_batch(payload, zc, info_group)
-	if actual != expected:
-		raise AssertionError(
-			f"{scenario_name}: data_batch_o mismatch for zc={zc}, info_group={info_group}; "
-			f"expected=0x{expected:096x} actual=0x{actual:096x}"
-		)
-
-
-def _info_group_max_for_base_graph(base_graph: str) -> int:
-	bg = base_graph.upper()
-	if bg == "BG1":
-		return KB_MAX
-	if bg == "BG2":
-		return min(KB_MAX, BG2_INFO_GROUP_MAX)
-	raise AssertionError(f"Unsupported base graph {base_graph}")
-
-
-def _is_standard_info_group(base_graph: str, info_group: int) -> bool:
-	bg = base_graph.upper()
-	if bg == "BG1":
-		return 1 <= info_group <= KB_MAX
-	if bg == "BG2":
-		return 1 <= info_group <= BG2_INFO_GROUP_MAX
-	raise AssertionError(f"Unsupported base graph {base_graph}")
-
-
-def _normalize_scenario(scn: LdpcScenario) -> LdpcScenario:
-	if scn.zc <= 0 or scn.zc > ZC_MAX:
-		raise AssertionError(f"Invalid lifting size Zc={scn.zc} for scenario {scn.name}")
-	if scn.info_group < 0 or scn.info_group > KB_MAX:
-		raise AssertionError(
-			f"Invalid info_group={scn.info_group} for scenario {scn.name}"
-		)
-
-	required_bits = _required_input_bits(scn.zc, scn.info_group)
-	target_bits = max(scn.input_bits, required_bits)
-	target_bits = ((target_bits + DATA_WIDTH - 1) // DATA_WIDTH) * DATA_WIDTH
-	if target_bits > INPUT_BITS_MAX:
-		raise AssertionError(
-			f"Scenario {scn.name} requires {target_bits} input bits, "
-			f"exceeds INPUT_BITS_MAX={INPUT_BITS_MAX}"
-		)
-
-	return LdpcScenario(
-		name=scn.name,
-		base_graph=scn.base_graph,
-		zc=scn.zc,
-		info_group=scn.info_group,
-		input_bits=target_bits,
-		ready_drop_chance=scn.ready_drop_chance,
-		read_start_gap=scn.read_start_gap,
-		done_delay_cycles=scn.done_delay_cycles,
-	)
-
-
-def _safe_int(signal, name: str) -> int:
-	try:
-		return int(signal.value)
-	except Exception as exc:
-		bits = getattr(signal.value, "binstr", str(signal.value))
-		raise AssertionError(f"Signal {name} is not fully resolved: {bits}") from exc
-
-
-def _build_payload(scn: LdpcScenario, block_idx: int) -> List[int]:
-	words = scn.input_bits // DATA_WIDTH
-	rng = random.Random((0x5A17 << 8) ^ (block_idx * 0x1F3) ^ scn.zc ^ (scn.info_group << 4))
-	payload = []
-
-	for i in range(words):
-		tag = ((block_idx & 0xFF) << 24) | ((scn.zc & 0xFF) << 16)
-		tag ^= ((scn.info_group & 0x1F) << 11) | (i & 0x7FF)
-		payload.append((tag ^ rng.getrandbits(32)) & 0xFFFF_FFFF)
-
-	return payload
-
-
-def _build_scenarios() -> List[LdpcScenario]:
-	# Start simple (small BG2/Zc, no backpressure), then increase complexity.
-	directed = [
-		LdpcScenario(
-			name="bg2_simple_z24",
-			base_graph="BG2",
-			zc=24,
-			info_group=1,
-			input_bits=256,
-			ready_drop_chance=0.0,
-			read_start_gap=0,
-			done_delay_cycles=1,
-		),
-		LdpcScenario(
-			name="bg2_medium_z96",
-			base_graph="BG2",
-			zc=96,
-			info_group=1,
-			input_bits=1024,
-			ready_drop_chance=0.10,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		),
-		LdpcScenario(
-			name="bg1_transition_z192",
-			base_graph="BG1",
-			zc=192,
-			info_group=3,
-			input_bits=3072,
-			ready_drop_chance=0.20,
-			read_start_gap=2,
-			done_delay_cycles=3,
-		),
-		LdpcScenario(
-			name="bg1_large_z384",
-			base_graph="BG1",
-			zc=384,
-			info_group=6,
-			input_bits=6144,
-			ready_drop_chance=0.30,
-			read_start_gap=3,
-			done_delay_cycles=4,
-		),
-	]
-
-	rng = random.Random(0x1D5C)
-	zc_pool = [2, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384]
-	random_phase = []
-	for i in range(6):
-		zc = zc_pool[rng.randrange(len(zc_pool))]
-		input_bits = rng.randrange(16, 220) * DATA_WIDTH
-		bg = "BG2" if input_bits <= 3840 else "BG1"
-		if bg == "BG2":
-			info_group = rng.randrange(1, BG2_INFO_GROUP_MAX + 1)
-		else:
-			info_group = rng.randrange(1, KB_MAX + 1)
-		random_phase.append(
-			LdpcScenario(
-				name=f"continuous_random_{i}",
-				base_graph=bg,
-				zc=zc,
-				info_group=info_group,
-				input_bits=input_bits,
-				ready_drop_chance=min(0.55, 0.20 + (0.05 * i)),
-				read_start_gap=1 + (i % 4),
-				done_delay_cycles=1 + (i % 5),
-			)
-		)
-
-	return [_normalize_scenario(s) for s in (directed + random_phase)]
-
-
-async def _reset_dut(dut) -> None:
-	dut.arst_ni.value = 0
-	dut.s_axis_tdata.value = 0
-	dut.s_axis_tvalid.value = 0
-	dut.ldpc_ready_i.value = 0
-	dut.ldpc_done_i.value = 0
-	dut.lifting_size_i.value = 0
-	dut.input_bits_i.value = 0
-	dut.info_group_i.value = 0
-
-	for _ in range(6):
-		await RisingEdge(dut.clk_i)
-
-	dut.arst_ni.value = 1
-	for _ in range(4):
-		await RisingEdge(dut.clk_i)
-
-
-async def _pulse_reset(dut, low_cycles: int = 3, settle_cycles: int = 2) -> None:
-	# Asynchronous reset pulse for mid-transaction reset coverage.
-	dut.arst_ni.value = 0
-	dut.s_axis_tvalid.value = 0
-	dut.s_axis_tdata.value = 0
-	dut.ldpc_ready_i.value = 0
-	dut.ldpc_done_i.value = 0
-
-	for _ in range(low_cycles):
-		await RisingEdge(dut.clk_i)
-
-	dut.arst_ni.value = 1
-	for _ in range(settle_cycles):
-		await RisingEdge(dut.clk_i)
-
-
-async def _pulse_done(dut, delay_cycles: int = 0) -> None:
-	for _ in range(delay_cycles):
-		await RisingEdge(dut.clk_i)
-
-	dut.ldpc_done_i.value = 1
-	await RisingEdge(dut.clk_i)
-	dut.ldpc_done_i.value = 0
-	await RisingEdge(dut.clk_i)
-
-
-async def _drive_axis_block(dut, scn: LdpcScenario, payload: List[int]) -> int:
-	words = len(payload)
-	handshakes = 0
-	saw_ready_low = False
-
-	dut.lifting_size_i.value = scn.zc
-	dut.input_bits_i.value = scn.input_bits
-	dut.info_group_i.value = scn.info_group
-
-	word_idx = 0
-	while word_idx < words:
-		dut.s_axis_tvalid.value = 1
-		dut.s_axis_tdata.value = payload[word_idx]
-
-		await RisingEdge(dut.clk_i)
-
-		ready = _safe_int(dut.s_axis_tready, "s_axis_tready")
-		if ready == 0:
-			saw_ready_low = True
-		if ready == 1:
-			handshakes += 1
-			word_idx += 1
-
-	dut.s_axis_tvalid.value = 0
-	dut.s_axis_tdata.value = 0
-
-	if not saw_ready_low:
-		for _ in range(12):
-			await RisingEdge(dut.clk_i)
-			if _safe_int(dut.s_axis_tready, "s_axis_tready") == 0:
-				saw_ready_low = True
-				break
-
-	if not saw_ready_low:
-		raise AssertionError(f"{scn.name}: s_axis_tready never deasserted after full write")
-	if handshakes != words:
-		raise AssertionError(
-			f"{scn.name}: handshake count mismatch ({handshakes} != {words})"
-		)
-
-	return handshakes
-
-
-async def _drive_axis_until_backpressure(dut, scn: LdpcScenario, payload: List[int]) -> int:
-	words = len(payload)
-	if words == 0:
-		raise AssertionError(f"{scn.name}: payload must contain at least one word")
-
-	handshakes = 0
-	max_cycles = (words * 4) + 64
-
-	dut.lifting_size_i.value = scn.zc
-	dut.input_bits_i.value = scn.input_bits
-	dut.info_group_i.value = scn.info_group
-
-	for _ in range(max_cycles):
-		data_idx = handshakes if handshakes < words else (words - 1)
-		dut.s_axis_tvalid.value = 1
-		dut.s_axis_tdata.value = payload[data_idx]
-
-		await RisingEdge(dut.clk_i)
-
-		ready = _safe_int(dut.s_axis_tready, "s_axis_tready")
-		if ready == 0:
-			break
-		if ready == 1:
-			handshakes += 1
-	else:
-		raise AssertionError(f"{scn.name}: timeout waiting for s_axis_tready deassertion")
-
-	dut.s_axis_tvalid.value = 0
-	dut.s_axis_tdata.value = 0
-
-	expected_handshakes = scn.input_bits // DATA_WIDTH
-	if handshakes != expected_handshakes:
-		raise AssertionError(
-			f"{scn.name}: handshakes before backpressure mismatch "
-			f"({handshakes} != {expected_handshakes})"
-		)
-
-	return handshakes
-
-
-async def _consume_one_block(
-	dut,
-	scn: LdpcScenario,
-	rng: random.Random,
-	payload: List[int],
-	fetch_info_group: Optional[int] = None,
-	pulse_done: bool = True,
-) -> int:
-	# Keep ready low while spacing out reads for continuous behavior.
-	dut.ldpc_ready_i.value = 0
-	dut.ldpc_done_i.value = 0
-
-	for _ in range(scn.read_start_gap):
-		await RisingEdge(dut.clk_i)
-
-	# Kick read engine in DUT.
-	dut.ldpc_ready_i.value = 1
-	await RisingEdge(dut.clk_i)
-	dut.ldpc_ready_i.value = 0
-
-	# Conservative wait so read pipeline can collect data before consumption.
-	min_wait = 6 + ((_out_sel(scn.zc) + 1) * 2)
-	timeout = 1200
-	info_group = scn.info_group if fetch_info_group is None else fetch_info_group
-	standard_info_group = _is_standard_info_group(scn.base_graph, info_group)
-	baseline_batch = _safe_int(dut.data_batch_o, "data_batch_o")
-	cycles = 0
-	observed = None
-
-	while cycles < timeout:
-		cycles += 1
-		ready = 0
-		if cycles >= min_wait:
-			ready = 0 if (rng.random() < scn.ready_drop_chance) else 1
-
-		dut.ldpc_ready_i.value = ready
-		await RisingEdge(dut.clk_i)
-
-		valid = _safe_int(dut.ldpc_valid_o, "ldpc_valid_o")
-		if cycles >= min_wait and ready == 1 and valid == 1:
-			candidate = _safe_int(dut.data_batch_o, "data_batch_o")
-			# Prefer a newly produced batch; force progress if valid is stuck high.
-			if candidate != baseline_batch or cycles >= (min_wait + 64):
-				if standard_info_group:
-					_assert_data_batch_matches(
-						actual=candidate,
-						payload=payload,
-						zc=scn.zc,
-						info_group=info_group,
-						scenario_name=scn.name,
-					)
-				observed = candidate
-				break
-
-	dut.ldpc_ready_i.value = 0
-	if observed is None:
-		raise AssertionError(f"{scn.name}: timeout waiting for ldpc_valid_o handshake")
-
-	if pulse_done:
-		await _pulse_done(dut, delay_cycles=scn.done_delay_cycles)
-
-	return observed
-
-
-async def _sweep_info_groups_for_block(
-	dut,
-	base_graph: str,
-	zc: int,
-	block_idx: int,
-	rng_seed: int,
-	write_until_backpressure: bool = False,
-) -> List[int]:
-	max_info_group = _info_group_max_for_base_graph(base_graph)
-	scn = _normalize_scenario(
-		LdpcScenario(
-			name=f"{base_graph.lower()}_full_info_group_sweep",
-			base_graph=base_graph,
-			zc=zc,
-			info_group=max_info_group,
-			input_bits=2048,
-			ready_drop_chance=0.0,
-			read_start_gap=0,
-			done_delay_cycles=1,
-		)
-	)
-
-	payload = _build_payload(scn, block_idx)
-	if write_until_backpressure:
-		await _drive_axis_until_backpressure(dut, scn, payload)
-	else:
-		await _drive_axis_block(dut, scn, payload)
-
-	rng = random.Random(rng_seed)
-	observed = []
-	for info_group in range(1, max_info_group + 1):
-		dut.info_group_i.value = info_group
-		observed.append(
-			await _consume_one_block(
-				dut,
-				scn,
-				rng,
-				payload=payload,
-				fetch_info_group=info_group,
-				pulse_done=False,
-			)
-		)
-
-	await _pulse_done(dut, delay_cycles=scn.done_delay_cycles)
-
-	if _safe_int(dut.ldpc_valid_o, "ldpc_valid_o") != 0:
-		raise AssertionError(f"{base_graph}: ldpc_valid_o should clear after done")
-
-	return observed
+DATA_WIDTH = 32
+
+async def reset_dut(dut):
+    """Asserts reset and initializes all control signals."""
+    dut.arst_ni.value = 0
+    dut.s_axis_tdata.value = 0
+    dut.s_axis_tvalid.value = 0
+    dut.ldpc_clear_i.value = 0
+    dut.lifting_size_i.value = 0
+    dut.input_bits_i.value = 0
+    dut.info_group_i.value = 0
+    
+    await ClockCycles(dut.clk_i, 5)
+    dut.arst_ni.value = 1
+    await ClockCycles(dut.clk_i, 5)
+
+async def axis_master(dut, data_words, zc, total_bits):
+    """Drives the AXI Stream input."""
+    # Setup configuration for the block
+    dut.lifting_size_i.value = zc
+    dut.input_bits_i.value = total_bits
+    
+    idx = 0
+    while idx < len(data_words):
+        # Optional: Randomize valid drops to test FSM W_IDLE/W_PACK transitions
+        valid = random.choice([0, 1]) if random.random() < 0.3 else 1
+        dut.s_axis_tvalid.value = valid
+        
+        if valid:
+            dut.s_axis_tdata.value = data_words[idx]
+        else:
+            dut.s_axis_tdata.value = 0xDEADBEEF # Junk data
+            
+        await RisingEdge(dut.clk_i)
+        
+        # If transaction was valid and ready, advance
+        if valid and dut.s_axis_tready.value == 1:
+            idx += 1
+            
+    # Deassert at the end
+    dut.s_axis_tvalid.value = 0
+    await RisingEdge(dut.clk_i)
+
+async def ldpc_sink(dut, expected_data, zc, info_groups, delay_reads=False):
+    """Monitors ldpc_valid_o, reads from RAM, and verifies the output with 1-cycle latency."""
+    await RisingEdge(dut.clk_i)
+    
+    while dut.ldpc_valid_o.value == 0:
+        await RisingEdge(dut.clk_i)
+        
+    if delay_reads:
+        await ClockCycles(dut.clk_i, random.randint(10, 50))
+        
+    actual_data = []
+    
+    # Continuously stream addresses 1 per cycle
+    for group in range(info_groups):
+        # 1. Drive the read address (stable setup before next RisingEdge)
+        dut.info_group_i.value = group
+        
+        # 2. Wait for the clock edge that latches the data into data_batch_o
+        await RisingEdge(dut.clk_i) 
+        
+        # 3. Wait for the falling edge to safely read the registered output 
+        #    and exit the strict simulation delta-cycle phases
+        await FallingEdge(dut.clk_i)
+        
+        # FIX: Replaced deprecated .integer with .to_unsigned()
+        raw_output = dut.data_batch_o.value.to_unsigned()
+        
+        # Determine how the output was supposed to be duplicated by out_sel
+        if zc > (ZC_MAX >> 1):   # > 192 (out_sel 2'b11)
+            extracted_val = raw_output & ((1 << ZC_MAX) - 1)
+        elif zc > (ZC_MAX >> 2): # > 96 (out_sel 2'b01)
+            extracted_val = raw_output & ((1 << (ZC_MAX >> 1)) - 1)
+            copy2 = (raw_output >> (ZC_MAX >> 1)) & ((1 << (ZC_MAX >> 1)) - 1)
+            assert extracted_val == copy2, f"Duplication failed for Zc={zc}"
+        else:                    # <= 96 (out_sel 2'b00)
+            extracted_val = raw_output & ((1 << (ZC_MAX >> 2)) - 1)
+            for j in range(1, 4):
+                copy_j = (raw_output >> ((ZC_MAX >> 2) * j)) & ((1 << (ZC_MAX >> 2)) - 1)
+                assert extracted_val == copy_j, f"Duplication failed for Zc={zc} at section {j}"
+                
+        extracted_val = extracted_val & ((1 << zc) - 1)
+        actual_data.append(extracted_val)
+        
+    # Assert ldpc_clear_i to swap buffers
+    dut.ldpc_clear_i.value = 1
+    await RisingEdge(dut.clk_i)
+    dut.ldpc_clear_i.value = 0
+    
+    # Verify the actual grouped data against expected
+    for i in range(info_groups):
+        assert actual_data[i] == expected_data[i], \
+            f"Data mismatch at info group {i}. Expected: {hex(expected_data[i])}, Actual: {hex(actual_data[i])}"
+            
+    dut._log.info(f"Successfully validated block of Zc={zc}, Info Groups={info_groups}")
+
+
+# ==============================================================================
+# TESTS
+# ==============================================================================
+
+def generate_test_data(zc, info_groups):
+    """Helper to generate AXIS words and expected Zc-sized chunks."""
+    total_bits = zc * info_groups
+    
+    # Generate random bitstream
+    bitstream = random.getrandbits(total_bits)
+    
+    # Slice into 32-bit AXI words
+    num_words = (total_bits + 31) // 32
+    axis_words = []
+    for i in range(num_words):
+        axis_words.append((bitstream >> (i * 32)) & 0xFFFFFFFF)
+        
+    # Slice into expected Zc sized vectors for validation
+    expected_zc_chunks = []
+    for i in range(info_groups):
+        expected_zc_chunks.append((bitstream >> (i * zc)) & ((1 << zc) - 1))
+        
+    return axis_words, expected_zc_chunks, total_bits
 
 
 @cocotb.test()
-async def input_buffer_continuous_progressive_test(dut):
-	"""
-	Continuous cocotb test for input_buffer with progressively harder 5G-LDPC-like scenarios.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
-
-	scenarios = _build_scenarios()
-	rng = random.Random(0xC0C07B)
-	observed_batches: List[int] = []
-	total_words = 0
-
-	LOG.info("Starting continuous progressive test with %d scenarios", len(scenarios))
-	for idx, scn in enumerate(scenarios):
-		payload = _build_payload(scn, idx)
-		LOG.info(
-			"[%02d/%02d] %s: BG=%s Zc=%d Kb=%d input_bits=%d words=%d drop=%.2f",
-			idx + 1,
-			len(scenarios),
-			scn.name,
-			scn.base_graph,
-			scn.zc,
-			scn.info_group,
-			scn.input_bits,
-			len(payload),
-			scn.ready_drop_chance,
-		)
-
-		total_words += await _drive_axis_block(dut, scn, payload)
-		batch_val = await _consume_one_block(dut, scn, rng, payload=payload)
-		observed_batches.append(batch_val)
-
-	unique_count = len(set(observed_batches))
-	if unique_count < max(2, len(observed_batches) // 3):
-		raise AssertionError(
-			"Observed data batches are unexpectedly repetitive; "
-			f"unique={unique_count}, total={len(observed_batches)}"
-		)
-
-	if not any(v != 0 for v in observed_batches):
-		raise AssertionError("All observed data_batch_o values are zero")
-
-	LOG.info(
-		"Completed progressive continuous run: blocks=%d total_words=%d unique_batches=%d",
-		len(scenarios),
-		total_words,
-		unique_count,
-	)
-
+async def test_basic_transfer(dut):
+    """Test a simple back-to-back transfer without stalls."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    zc = 384
+    info_groups = 10
+    axis_words, expected, total_bits = generate_test_data(zc, info_groups)
+    
+    # Launch sender and receiver
+    driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits))
+    sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+    
+    await driver_task
+    await sink_task
 
 @cocotb.test()
-async def input_buffer_zc_boundary_edge_cases_test(dut):
-	"""
-	Exercise Zc boundaries around output selection transitions and edge values.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
-
-	edge_scenarios = [
-		LdpcScenario(
-			name="zc2_bg2_max_info",
-			base_graph="BG2",
-			zc=2,
-			info_group=BG2_INFO_GROUP_MAX,
-			input_bits=32,
-			ready_drop_chance=0.00,
-			read_start_gap=0,
-			done_delay_cycles=1,
-		),
-		LdpcScenario(
-			name="zc95_boundary_low",
-			base_graph="BG2",
-			zc=95,
-			info_group=1,
-			input_bits=256,
-			ready_drop_chance=0.10,
-			read_start_gap=1,
-			done_delay_cycles=1,
-		),
-		LdpcScenario(
-			name="zc96_boundary",
-			base_graph="BG2",
-			zc=96,
-			info_group=BG2_INFO_GROUP_MAX,
-			input_bits=512,
-			ready_drop_chance=0.15,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		),
-		LdpcScenario(
-			name="zc97_boundary_high",
-			base_graph="BG2",
-			zc=97,
-			info_group=BG2_INFO_GROUP_MAX,
-			input_bits=768,
-			ready_drop_chance=0.20,
-			read_start_gap=2,
-			done_delay_cycles=2,
-		),
-		LdpcScenario(
-			name="zc191_boundary_low",
-			base_graph="BG1",
-			zc=191,
-			info_group=10,
-			input_bits=1024,
-			ready_drop_chance=0.25,
-			read_start_gap=2,
-			done_delay_cycles=2,
-		),
-		LdpcScenario(
-			name="zc192_boundary",
-			base_graph="BG1",
-			zc=192,
-			info_group=22,
-			input_bits=2048,
-			ready_drop_chance=0.25,
-			read_start_gap=2,
-			done_delay_cycles=3,
-		),
-		LdpcScenario(
-			name="zc193_boundary_high",
-			base_graph="BG1",
-			zc=193,
-			info_group=22,
-			input_bits=2048,
-			ready_drop_chance=0.30,
-			read_start_gap=3,
-			done_delay_cycles=3,
-		),
-		LdpcScenario(
-			name="zc384_max",
-			base_graph="BG1",
-			zc=384,
-			info_group=6,
-			input_bits=6144,
-			ready_drop_chance=0.35,
-			read_start_gap=3,
-			done_delay_cycles=4,
-		),
-	]
-
-	edge_scenarios = [_normalize_scenario(s) for s in edge_scenarios]
-	rng = random.Random(0x0B0A0D)
-	seen_modes = set()
-
-	for idx, scn in enumerate(edge_scenarios):
-		seen_modes.add(_out_sel(scn.zc))
-		payload = _build_payload(scn, idx + 200)
-		await _drive_axis_block(dut, scn, payload)
-		_ = await _consume_one_block(dut, scn, rng, payload=payload)
-
-	if seen_modes != {0, 2, 3}:
-		raise AssertionError(f"Expected all out_sel modes {{0,2,3}}, got {seen_modes}")
-
+async def test_lifting_size_duplication(dut):
+    """Test the dynamic vector duplication logic for various lifting sizes."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    # Test boundary limits for the output duplicator
+    test_zcs = [384, 256, 192, 128, 96, 64]
+    info_groups = 5
+    
+    for zc in test_zcs:
+        axis_words, expected, total_bits = generate_test_data(zc, info_groups)
+        
+        driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits))
+        sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+        
+        await driver_task
+        await sink_task
+        await ClockCycles(dut.clk_i, 5)
 
 @cocotb.test()
-async def input_buffer_midstream_reset_edge_cases_test(dut):
-	"""
-	Assert reset robustness during active write and active read windows.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
+async def test_ping_pong_backpressure(dut):
+    """Test the ping pong buffer's ability to stall AXI stream when both RAMs are full."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    zc = 100 # Arbitrary offset
+    info_groups = 8
+    
+    # Generate 4 separate blocks of data to feed sequentially
+    blocks = [generate_test_data(zc, info_groups) for _ in range(4)]
+    
+    async def continuous_axis_driver():
+        for axis_words, _, total_bits in blocks:
+            await axis_master(dut, axis_words, zc, total_bits)
+            
+    async def delayed_sink():
+        for _, expected, _ in blocks:
+            # Delay reads heavily to ensure W_STALL is hit
+            await ldpc_sink(dut, expected, zc, info_groups, delay_reads=True)
+            
+    driver_task = cocotb.start_soon(continuous_axis_driver())
+    sink_task = cocotb.start_soon(delayed_sink())
+    
+    await driver_task
+    await sink_task
+    
+# ==============================================================================
+# Randomized Zc based on 5G NR LDPC parameters
+# ==============================================================================
 
-	# 1) Reset while write stream is active.
-	write_scn = _normalize_scenario(
-		LdpcScenario(
-			name="reset_during_write",
-			base_graph="BG1",
-			zc=192,
-			info_group=8,
-			input_bits=4096,
-			ready_drop_chance=0.10,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		)
-	)
-	payload = _build_payload(write_scn, 500)
-
-	dut.lifting_size_i.value = write_scn.zc
-	dut.input_bits_i.value = write_scn.input_bits
-	dut.info_group_i.value = write_scn.info_group
-
-	handshakes = 0
-	word_idx = 0
-	while handshakes < 20 and word_idx < len(payload):
-		dut.s_axis_tvalid.value = 1
-		dut.s_axis_tdata.value = payload[word_idx]
-		await RisingEdge(dut.clk_i)
-		if _safe_int(dut.s_axis_tready, "s_axis_tready") == 1:
-			handshakes += 1
-			word_idx += 1
-
-	await _pulse_reset(dut, low_cycles=4, settle_cycles=3)
-
-	if _safe_int(dut.ldpc_valid_o, "ldpc_valid_o") != 0:
-		raise AssertionError("ldpc_valid_o should be cleared after reset during write")
-
-	# Recovery block after write-reset.
-	recover_scn_a = _normalize_scenario(
-		LdpcScenario(
-			name="post_write_reset_recovery",
-			base_graph="BG2",
-			zc=96,
-			info_group=4,
-			input_bits=2048,
-			ready_drop_chance=0.15,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		)
-	)
-	rng = random.Random(0x0E5E7A)
-	recover_payload_a = _build_payload(recover_scn_a, 501)
-	await _drive_axis_block(dut, recover_scn_a, recover_payload_a)
-	_ = await _consume_one_block(dut, recover_scn_a, rng, payload=recover_payload_a)
-
-	# 2) Reset while read phase is in progress.
-	read_scn = _normalize_scenario(
-		LdpcScenario(
-			name="reset_during_read",
-			base_graph="BG1",
-			zc=193,
-			info_group=12,
-			input_bits=4096,
-			ready_drop_chance=0.30,
-			read_start_gap=2,
-			done_delay_cycles=3,
-		)
-	)
-	await _drive_axis_block(dut, read_scn, _build_payload(read_scn, 502))
-
-	dut.ldpc_ready_i.value = 1
-	await RisingEdge(dut.clk_i)
-	dut.ldpc_ready_i.value = 0
-	for _ in range(4):
-		await RisingEdge(dut.clk_i)
-
-	await _pulse_reset(dut, low_cycles=4, settle_cycles=3)
-
-	if _safe_int(dut.ldpc_valid_o, "ldpc_valid_o") != 0:
-		raise AssertionError("ldpc_valid_o should be cleared after reset during read")
-
-	# Recovery block after read-reset.
-	recover_scn_b = _normalize_scenario(
-		LdpcScenario(
-			name="post_read_reset_recovery",
-			base_graph="BG2",
-			zc=97,
-			info_group=5,
-			input_bits=2048,
-			ready_drop_chance=0.20,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		)
-	)
-	recover_payload_b = _build_payload(recover_scn_b, 503)
-	await _drive_axis_block(dut, recover_scn_b, recover_payload_b)
-	_ = await _consume_one_block(dut, recover_scn_b, rng, payload=recover_payload_b)
-
+def get_5gnr_zc():
+    """Generates a valid 5G NR LDPC lifting size (Zc)."""
+    base_z_set = [2, 3, 5, 7, 9, 11, 13, 15]
+    valid_zcs = []
+    
+    for base in base_z_set:
+        for j in range(8): # j = 0 to 7
+            zc = base * (2 ** j)
+            # Filter out sizes that exceed the hardware maximum
+            if zc <= ZC_MAX:
+                valid_zcs.append(zc)
+                
+    return random.choice(valid_zcs)
 
 @cocotb.test()
-async def input_buffer_bg1_full_info_group_sweep_test(dut):
-	"""
-	For one BG1 block, consume all info_group_i values before asserting done.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
+async def test_randomized_zc_5gnr(dut):
+    """Test using dynamically generated valid 5G NR LDPC lifting sizes."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    # Run a few iterations with different valid Zc values
+    for _ in range(5):
+        zc = get_5gnr_zc()
+        info_groups = random.randint(2, 8)
+        
+        dut._log.info(f"Testing randomized 5G NR Zc: {zc} with {info_groups} Info Groups")
+        axis_words, expected, total_bits = generate_test_data(zc, info_groups)
+        
+        driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits))
+        sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+        
+        await driver_task
+        await sink_task
 
-	observed = await _sweep_info_groups_for_block(
-		dut=dut,
-		base_graph="BG1",
-		zc=192,
-		block_idx=900,
-		rng_seed=0xB61A,
-	)
+# ==============================================================================
+# Changing inputs during a transaction
+# ==============================================================================
 
-	if len(observed) != KB_MAX:
-		raise AssertionError(f"BG1 sweep count mismatch ({len(observed)} != {KB_MAX})")
-
-
-@cocotb.test()
-async def input_buffer_bg2_full_info_group_sweep_test(dut):
-	"""
-	For one BG2 block, consume all info_group_i values before asserting done.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
-
-	bg2_max = _info_group_max_for_base_graph("BG2")
-	observed = await _sweep_info_groups_for_block(
-		dut=dut,
-		base_graph="BG2",
-		zc=96,
-		block_idx=901,
-		rng_seed=0xB62B,
-	)
-
-	if len(observed) != bg2_max:
-		raise AssertionError(f"BG2 sweep count mismatch ({len(observed)} != {bg2_max})")
-
-
-@cocotb.test()
-async def input_buffer_bg_info_sweep_write_until_backpressure_test(dut):
-	"""
-	Sweep BG2 and BG1 info groups after streaming AXI input until backpressure.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
-
-	sweep_cases = [
-		("BG2", 96, 920, 0xB71E),
-		("BG1", 192, 921, 0xB72F),
-	]
-
-	for base_graph, zc, block_idx, seed in sweep_cases:
-		observed = await _sweep_info_groups_for_block(
-			dut=dut,
-			base_graph=base_graph,
-			zc=zc,
-			block_idx=block_idx,
-			rng_seed=seed,
-			write_until_backpressure=True,
-		)
-
-		expected = _info_group_max_for_base_graph(base_graph)
-		if len(observed) != expected:
-			raise AssertionError(
-				f"{base_graph} backpressure sweep count mismatch ({len(observed)} != {expected})"
-			)
-
-		if not any(v != 0 for v in observed):
-			raise AssertionError(f"{base_graph} backpressure sweep observed only zero outputs")
-
+async def axis_master_mutating_config(dut, data_words, original_zc, total_bits):
+    """Drives the AXI Stream while mutating config midway to test register latching."""
+    dut.lifting_size_i.value = original_zc
+    dut.input_bits_i.value = total_bits
+    
+    idx = 0
+    while idx < len(data_words):
+        dut.s_axis_tvalid.value = 1
+        dut.s_axis_tdata.value = data_words[idx]
+        await RisingEdge(dut.clk_i)
+        
+        if dut.s_axis_tready.value == 1:
+            idx += 1
+            
+            # INTERFERENCE: Change configs exactly halfway through the block packing
+            if idx == len(data_words) // 2:
+                fake_zc = get_5gnr_zc()
+                dut._log.info(f"Mutating inputs mid-transaction! Zc: {original_zc} -> {fake_zc}")
+                dut.lifting_size_i.value = fake_zc
+                dut.input_bits_i.value = 9999 # Chaos value
+                
+    dut.s_axis_tvalid.value = 0
+    await RisingEdge(dut.clk_i)
 
 @cocotb.test()
-async def input_buffer_back_to_back_without_done_test(dut):
-	"""
-	Write two complete inputs back-to-back before ldpc_done_i of the first input.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
+async def test_config_change_during_transaction(dut):
+    """Verifies that changing lifting_size_i and input_bits_i midway is ignored safely."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    zc = 112
+    info_groups = 6
+    axis_words, expected, total_bits = generate_test_data(zc, info_groups)
+    
+    # Drive with the mutating master, but the sink still validates against the ORIGINAL expected
+    driver_task = cocotb.start_soon(axis_master_mutating_config(dut, axis_words, zc, total_bits))
+    sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+    
+    await driver_task
+    await sink_task
+    
+    dut._log.info("Transaction completed successfully using only latched initial inputs.")
 
-	scn_a = _normalize_scenario(
-		LdpcScenario(
-			name="back_to_back_first",
-			base_graph="BG2",
-			zc=96,
-			info_group=4,
-			input_bits=2048,
-			ready_drop_chance=0.15,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		)
-	)
-	scn_b = _normalize_scenario(
-		LdpcScenario(
-			name="back_to_back_second",
-			base_graph="BG2",
-			zc=97,
-			info_group=5,
-			input_bits=2048,
-			ready_drop_chance=0.20,
-			read_start_gap=1,
-			done_delay_cycles=2,
-		)
-	)
+# ==============================================================================
+# Buggy LDPC Core (Dropped/Glitchy Clear Signal)
+# ==============================================================================
 
-	rng = random.Random(0xB2B0A2)
-	payload_a = _build_payload(scn_a, 820)
-	payload_b = _build_payload(scn_b, 821)
-
-	# Fill first block and consume one batch without signaling done.
-	await _drive_axis_block(dut, scn_a, payload_a)
-	first_batch = await _consume_one_block(dut, scn_a, rng, payload=payload_a, pulse_done=False)
-	if _safe_int(dut.ldpc_done_i, "ldpc_done_i") != 0:
-		raise AssertionError("ldpc_done_i must stay low before second write")
-
-	# Write second block while the first is still pending done.
-	await _drive_axis_block(dut, scn_b, payload_b)
-
-	# Retire first, then retire second and check activity.
-	await _pulse_done(dut, delay_cycles=scn_a.done_delay_cycles)
-	second_batch = await _consume_one_block(dut, scn_b, rng, payload=payload_b, pulse_done=True)
-
-	if first_batch == 0 and second_batch == 0:
-		raise AssertionError("Back-to-back test observed zero data_batch_o for both blocks")
-
+async def ldpc_sink_buggy_clear(dut, expected_data, zc, info_groups):
+    """Monitors ldpc_valid_o but simulates a buggy clear signal with 1-cycle latency reads."""
+    await RisingEdge(dut.clk_i)
+    
+    while dut.ldpc_valid_o.value == 0:
+        await RisingEdge(dut.clk_i)
+        
+    actual_data = []
+    for group in range(info_groups):
+        dut.info_group_i.value = group
+        await RisingEdge(dut.clk_i) 
+        await FallingEdge(dut.clk_i) # Safe sample point
+        
+        # FIX: Replaced deprecated .integer with .to_unsigned()
+        raw_output = dut.data_batch_o.value.to_unsigned()
+        extracted_val = raw_output & ((1 << ZC_MAX) - 1) 
+        extracted_val = extracted_val & ((1 << zc) - 1)
+        actual_data.append(extracted_val)
+        
+    # --- BUG INJECTION ---
+    bug_type = random.choice(["DROPPED", "STUCK"])
+    
+    if bug_type == "DROPPED":
+        dut._log.info("Buggy Core: Dropped clear signal (stalling for 100 cycles)...")
+        await ClockCycles(dut.clk_i, 100)
+        dut.ldpc_clear_i.value = 1
+        await RisingEdge(dut.clk_i)
+        dut.ldpc_clear_i.value = 0
+        
+    elif bug_type == "STUCK":
+        dut._log.info("Buggy Core: Stuck clear signal (asserted for 5 cycles)...")
+        dut.ldpc_clear_i.value = 1
+        await ClockCycles(dut.clk_i, 5)
+        dut.ldpc_clear_i.value = 0
+        
+    for i in range(info_groups):
+        assert actual_data[i] == expected_data[i], "Data corrupted by buggy clear!"
 
 @cocotb.test()
-async def input_buffer_payload_size_edge_cases_test(dut):
-	"""
-	Exercise very small and maximum input_bits configurations with continuous operation.
-	"""
-	cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-	await _reset_dut(dut)
+async def test_buggy_ldpc_clear(dut):
+    """Tests the input buffer's resilience to a buggy LDPC core clear signal."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    zc = 96
+    info_groups = 4
+    
+    # We send two blocks to ensure that the buggy clear from the first block
+    # doesn't completely break the FSM for the second block.
+    blocks = [generate_test_data(zc, info_groups) for _ in range(2)]
+    
+    async def driver():
+        for axis_words, _, total_bits in blocks:
+            # Wait for clear input before pushing next to avoid standard backpressure locking
+            dut.lifting_size_i.value = zc
+            dut.input_bits_i.value = total_bits
+            await axis_master(dut, axis_words, zc, total_bits)
+            
+    async def sink():
+        for _, expected, _ in blocks:
+            await ldpc_sink_buggy_clear(dut, expected, zc, info_groups)
+            
+    await cocotb.start_soon(driver())
+    await sink()
 
-	scenarios = [
-		LdpcScenario(
-			name="min_payload_bits",
-			base_graph="BG2",
-			zc=2,
-			info_group=0,
-			input_bits=32,
-			ready_drop_chance=0.00,
-			read_start_gap=0,
-			done_delay_cycles=1,
-		),
-		LdpcScenario(
-			name="min_payload_bits_kbmax",
-			base_graph="BG2",
-			zc=2,
-			info_group=22,
-			input_bits=32,
-			ready_drop_chance=0.05,
-			read_start_gap=1,
-			done_delay_cycles=1,
-		),
-		LdpcScenario(
-			name="max_payload_bits",
-			base_graph="BG1",
-			zc=24,
-			info_group=1,
-			input_bits=INPUT_BITS_MAX,
-			ready_drop_chance=0.20,
-			read_start_gap=2,
-			done_delay_cycles=3,
-		),
-	]
+# ==============================================================================
+# Sweeping BG1 and BG2 Info Groups
+# ==============================================================================
 
-	rng = random.Random(0x51AE)
-	observed = []
-	for idx, raw_scn in enumerate(scenarios):
-		scn = _normalize_scenario(raw_scn)
-		payload = _build_payload(scn, 700 + idx)
-		await _drive_axis_block(dut, scn, payload)
-		observed.append(await _consume_one_block(dut, scn, rng, payload=payload))
+@cocotb.test()
+async def test_bg1_bg2_sweep(dut):
+    """
+    Test 1: The LDPC core consumes/sweeps through all the info bit groups 
+    for BG1 (22 groups) and BG2 (10 groups).
+    """
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    # 5G NR constants for Info Groups (kb)
+    KB_BG1 = 22
+    KB_BG2 = 10
+    
+    # BG1 Sweep
+    zc_bg1 = 128
+    dut._log.info(f"Starting BG1 sweep: Zc={zc_bg1}, Info Groups={KB_BG1}")
+    axis_words_1, expected_1, total_bits_1 = generate_test_data(zc_bg1, KB_BG1)
+    
+    driver_task_1 = cocotb.start_soon(axis_master(dut, axis_words_1, zc_bg1, total_bits_1))
+    sink_task_1 = cocotb.start_soon(ldpc_sink(dut, expected_1, zc_bg1, KB_BG1))
+    
+    await driver_task_1
+    await sink_task_1
+    dut._log.info("BG1 sweep completed successfully.")
+    
+    await ClockCycles(dut.clk_i, 10)
+    
+    # BG2 Sweep
+    zc_bg2 = 256
+    dut._log.info(f"Starting BG2 sweep: Zc={zc_bg2}, Info Groups={KB_BG2}")
+    axis_words_2, expected_2, total_bits_2 = generate_test_data(zc_bg2, KB_BG2)
+    
+    driver_task_2 = cocotb.start_soon(axis_master(dut, axis_words_2, zc_bg2, total_bits_2))
+    sink_task_2 = cocotb.start_soon(ldpc_sink(dut, expected_2, zc_bg2, KB_BG2))
+    
+    await driver_task_2
+    await sink_task_2
+    dut._log.info("BG2 sweep completed successfully.")
 
-	if not any(v != 0 for v in observed):
-		raise AssertionError("Payload edge-case test observed only zero outputs")
 
+# ==============================================================================
+# Full Ping-Pong Saturation & Resumption
+# ==============================================================================
+
+@cocotb.test()
+async def test_ping_pong_stall_and_resume(dut):
+    """
+    Test 2: Fill both RAMs to force a stall, wait for AXI-Stream to hang.
+    Consume one RAM, verify AXI resumes writing to the freed RAM while 
+    the core waits to consume again.
+    """
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+    await reset_dut(dut)
+    
+    zc = 96
+    info_groups = 5 # Arbitrary block size
+    
+    blocks = [generate_test_data(zc, info_groups) for _ in range(3)]
+    
+    async def overzealous_driver():
+        for i, (axis_words, _, total_bits) in enumerate(blocks):
+            dut._log.info(f"AXI Master: Attempting to send Block {i}")
+            dut.lifting_size_i.value = zc
+            dut.input_bits_i.value = total_bits
+            await axis_master(dut, axis_words, zc, total_bits)
+            dut._log.info(f"AXI Master: Finished sending Block {i}")
+
+    async def deliberate_sink():
+        # 1. Wait until AXI stream triggers a SUSTAINED stall
+        dut._log.info("LDPC Sink: Waiting for both RAMs to fill and stall the AXI bus...")
+        
+        stall_cycles = 0
+        while True:
+            await RisingEdge(dut.clk_i)
+            if dut.s_axis_tready.value == 0 and dut.s_axis_tvalid.value == 1:
+                stall_cycles += 1
+                if stall_cycles >= 15: 
+                    break
+            else:
+                stall_cycles = 0
+                
+        dut._log.info("LDPC Sink: Sustained stall verified. Consuming RAM 0 to free up space...")
+        
+        # 2. Read Block 0 (RAM 0). This clears RAM 0.
+        _, expected_0, _ = blocks[0]
+        await ldpc_sink(dut, expected_0, zc, info_groups)
+        
+        # Verify that the stall is broken and AXI resumes writing Block 2
+        # We check over a 10-cycle window because tready drops momentarily during W_UNPACK
+        resumed = False
+        for _ in range(10):
+            await RisingEdge(dut.clk_i)
+            if dut.s_axis_tready.value == 1:
+                resumed = True
+                break
+                
+        assert resumed, "AXI stream failed to resume after clear!"
+        
+        # 3. Read Block 1 (RAM 1).
+        dut._log.info("LDPC Sink: Consuming RAM 1...")
+        _, expected_1, _ = blocks[1]
+        await ldpc_sink(dut, expected_1, zc, info_groups)
+        
+        # 4. Read Block 2 (from the newly re-written RAM 0)
+        dut._log.info("LDPC Sink: Consuming Block 2 (reused RAM)...")
+        _, expected_2, _ = blocks[2]
+        await ldpc_sink(dut, expected_2, zc, info_groups)
+        
+        dut._log.info("LDPC Sink: All blocks processed seamlessly!")
+
+    # Execute concurrently
+    driver_task = cocotb.start_soon(overzealous_driver())
+    sink_task = cocotb.start_soon(deliberate_sink())
+    
+    await driver_task
+    await sink_task
