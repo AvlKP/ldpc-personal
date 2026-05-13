@@ -7,10 +7,10 @@
 - [x] Task: Conductor - User Manual Verification 'Paper to RTL Mapping' (Protocol in workflow.md)
 
 ## Phase 2: Structural Inventory & Connectivity
-- [ ] Task: Map top-level module hierarchy.
-- [ ] Task: Document module interconnections in `doc/interconnect_map.md`.
-- [ ] Task: Identify and document data flow through the encoder stages.
-- [ ] Task: Conductor - User Manual Verification 'Structural Inventory & Connectivity' (Protocol in workflow.md)
+- [x] Task: Map top-level module hierarchy. [fb453bd]
+- [x] Task: Document module interconnections in `doc/interconnect_map.md`. [fb453bd]
+- [x] Task: Identify and document data flow through the encoder stages. [fb453bd]
+- [~] Task: Conductor - User Manual Verification 'Structural Inventory & Connectivity' (Protocol in workflow.md)
 
 ## Phase 3: Completeness & Evaluation Baseline
 - [ ] Task: Analyze each module for placeholder logic or "TODO" markers.
