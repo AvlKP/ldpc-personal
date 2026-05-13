@@ -13,7 +13,7 @@
 - [x] Task: Conductor - User Manual Verification 'Structural Inventory & Connectivity' (Protocol in workflow.md)
 
 ## Phase 3: Completeness & Evaluation Baseline
-- [ ] Task: Analyze each module for placeholder logic or "TODO" markers.
-- [ ] Task: Create `doc/module_status.md` flagging incomplete/skeleton modules.
-- [ ] Task: Perform baseline evaluation (resource/timing estimates) for "complete" modules.
+- [x] Task: Analyze each module for placeholder logic or "TODO" markers. [fb7ec5d]
+- [x] Task: Create `doc/module_status.md` flagging incomplete/skeleton modules. [fb7ec5d]
+- [~] Task: Perform baseline evaluation (resource/timing estimates) for "complete" modules.
 - [ ] Task: Conductor - User Manual Verification 'Completeness & Evaluation Baseline' (Protocol in workflow.md)
