@@ -1,9 +1,9 @@
 # Implementation Plan - RTL Audit and Evaluation
 
 ## Phase 1: Paper to RTL Mapping
-- [ ] Task: Review Petrović paper architecture (Figures 10, 11).
-- [ ] Task: Associate `rtl/*.sv` files with paper components (e.g., CS network, Parity bit calculators).
-- [ ] Task: Create `doc/architecture_mapping.md` with initial findings.
+- [x] Task: Review Petrović paper architecture (Figures 10, 11).
+- [x] Task: Associate `rtl/*.sv` files with paper components (e.g., CS network, Parity bit calculators).
+- [~] Task: Create `doc/architecture_mapping.md` with initial findings.
 - [ ] Task: Conductor - User Manual Verification 'Paper to RTL Mapping' (Protocol in workflow.md)
 
 ## Phase 2: Structural Inventory & Connectivity
