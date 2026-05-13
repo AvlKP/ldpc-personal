@@ -12,8 +12,8 @@
 - [x] Task: Identify and document data flow through the encoder stages. [fb453bd]
 - [x] Task: Conductor - User Manual Verification 'Structural Inventory & Connectivity' (Protocol in workflow.md)
 
-## Phase 3: Completeness & Evaluation Baseline
+## Phase 3: Completeness & Evaluation Baseline [checkpoint: 782babf]
 - [x] Task: Analyze each module for placeholder logic or "TODO" markers. [fb7ec5d]
 - [x] Task: Create `doc/module_status.md` flagging incomplete/skeleton modules. [fb7ec5d]
 - [x] Task: Perform baseline evaluation (resource/timing estimates) for "complete" modules. [b5cd763]
-- [~] Task: Conductor - User Manual Verification 'Completeness & Evaluation Baseline' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Completeness & Evaluation Baseline' (Protocol in workflow.md)
