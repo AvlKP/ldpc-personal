@@ -1,20 +1,19 @@
 # Implementation Plan - RTL Audit and Evaluation
 
-## Phase 1: Architectural Mapping
-- [ ] Task: Map top-level module hierarchy and interconnections.
-- [ ] Task: Document data flow from input buffer to output codeword generator.
-- [ ] Task: Map the register address space to RTL modules.
-- [ ] Task: Conductor - User Manual Verification 'Architectural Mapping' (Protocol in workflow.md)
+## Phase 1: Paper to RTL Mapping
+- [ ] Task: Review Petrović paper architecture (Figures 10, 11).
+- [ ] Task: Associate `rtl/*.sv` files with paper components (e.g., CS network, Parity bit calculators).
+- [ ] Task: Create `doc/architecture_mapping.md` with initial findings.
+- [ ] Task: Conductor - User Manual Verification 'Paper to RTL Mapping' (Protocol in workflow.md)
 
-## Phase 2: Detailed Module Evaluation
-- [ ] Task: Evaluate `ldpc_encoder.sv` (Resource, Timing, Performance).
-- [ ] Task: Evaluate `barrel_shifter.sv` and `top_level_shifter.sv`.
-- [ ] Task: Evaluate Parity Calculation modules (`core_parity_bit_calculator.sv`, `parity_core_calc.sv`).
-- [ ] Task: Evaluate Buffers (`input_buffer.sv`, `output_buffer.sv`).
-- [ ] Task: Conductor - User Manual Verification 'Detailed Module Evaluation' (Protocol in workflow.md)
+## Phase 2: Structural Inventory & Connectivity
+- [ ] Task: Map top-level module hierarchy.
+- [ ] Task: Document module interconnections in `doc/interconnect_map.md`.
+- [ ] Task: Identify and document data flow through the encoder stages.
+- [ ] Task: Conductor - User Manual Verification 'Structural Inventory & Connectivity' (Protocol in workflow.md)
 
-## Phase 3: Best Practices & Bug Audit
-- [ ] Task: Audit code for Xilinx Vivado best practices (DSP48/BRAM usage).
-- [ ] Task: Identify potential race conditions or synchronization issues in pipelined stages.
-- [ ] Task: Verify adherence to naming conventions (snake_case).
-- [ ] Task: Conductor - User Manual Verification 'Best Practices & Bug Audit' (Protocol in workflow.md)
+## Phase 3: Completeness & Evaluation Baseline
+- [ ] Task: Analyze each module for placeholder logic or "TODO" markers.
+- [ ] Task: Create `doc/module_status.md` flagging incomplete/skeleton modules.
+- [ ] Task: Perform baseline evaluation (resource/timing estimates) for "complete" modules.
+- [ ] Task: Conductor - User Manual Verification 'Completeness & Evaluation Baseline' (Protocol in workflow.md)

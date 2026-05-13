@@ -4,5 +4,5 @@
   "status": "new",
   "created_at": "2026-05-13T10:00:00Z",
   "updated_at": "2026-05-13T10:00:00Z",
-  "description": "Review the current RTL and make detailed evaluation report documents in 'doc/'. Make a map of the modules and how they interconnect. Do not run simulation yet. Analyze the RTL and ask further questions if needed."
+  "description": "Map current RTL to Petrović 2021 paper. Document module hierarchy and connectivity in 'doc/'. Flag incomplete modules for project understanding baseline."
 }

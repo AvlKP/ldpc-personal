@@ -1,20 +1,21 @@
 # Specification - RTL Audit and Evaluation
 
 ## Goal
-Perform a comprehensive static analysis and architectural review of the current SystemVerilog RTL implementation to ensure alignment with the Petrović et al. (2021) architecture and Xilinx Vivado best practices.
+Map current RTL implementation to Petrović et al. (2021) architecture. Create initial understanding baseline for future development. Identify incomplete modules.
 
 ## Scope
-- **Analysis:** All files in the `rtl/` directory.
-- **Mapping:** Creation of a module hierarchy and interconnection map.
-- **Evaluation:** Generation of detailed reports for core modules (LDPC Encoder, Shifters, Parity Calculators, Buffers).
-- **Audit:** Identifying potential bugs, timing bottlenecks, and optimization opportunities (DSP48, BRAM).
+- RTL files in `rtl/`.
+- Petrović 2021 paper in `doc/`.
+- Mapping RTL components to paper sections/figures.
+- High-level module connectivity.
+- Identify missing or skeleton-only modules.
 
 ## Deliverables
-- Module interconnection map (documented in `doc/`).
-- Evaluation reports for major modules in `doc/` following the `GEMINI.md` template.
-- Identification of any architectural deviations from the reference paper.
+- `doc/architecture_mapping.md`: Table/Map linking RTL modules to paper concepts (e.g., Circular Shifter, λ-vector calculation).
+- `doc/module_status.md`: Inventory of all modules with completion status (Complete / Incomplete / Skeleton).
+- Interconnection map in `doc/`.
 
 ## Constraints
-- **No Simulation:** This track is strictly for analysis and documentation.
-- **Read-Only Analysis:** No modifications to the RTL code are permitted in this track.
-- **Target:** Xilinx XC7Z020 FPGA.
+- **No Simulation:** Static analysis only.
+- **Read-Only:** Do not modify RTL.
+- **Assumptions:** Do not assume code works or is finished.
