@@ -15,6 +15,7 @@ module csr_decoder #(
   input logic start_i, // control the initialization
 
   input logic base_graph_i,
+  input logic [ZC_WIDTH-1:0] lifting_size_i,
   input logic [ROW_WIDTH-1:0] row_i, // current row, converted to row group of 4
 
   output logic [3:0][ZC_WIDTH-1:0] permutation_o, // will be -1 when col is unavailable
@@ -40,17 +41,21 @@ typedef struct packed {
 logic inner_ready, inner_valid;
 logic bg_q, bg_n;
 logic [ROW_WIDTH-1:0] row_q, row_n;
+logic [ZC_WIDTH-1:0] zc_q, zc_n;
 
 assign bg_n = (start_i & state_q == INIT)? base_graph_i : bg_q;
 assign row_n = (start_i & state_q == INIT)? row_i : row_q;
+assign zc_n = (start_i & state_q == INIT)? lifting_size_i : zc_q;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : input_lock
   if (!arst_ni) begin
     bg_q <= 0;
     row_q <= '0;
+    zc_q <= '0;
   end else if (start_i & state_q == INIT) begin
     bg_q <= base_graph_i;
     row_q <= row_i;
+    zc_q <= lifting_size_i;
   end
 end
 
@@ -248,6 +253,8 @@ always_comb begin
   if (cidx_temp[0] <= cidx_temp[1]) col_curr_n = cidx_temp[0][COL_WIDTH-1:0];
   else col_curr_n = cidx_temp[1][COL_WIDTH-1:0];
 end
+
+// select which values ROM to read from
 
 // Values ROM
 generate

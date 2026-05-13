@@ -200,7 +200,6 @@
 /foss/designs/ldpc_personal/rtl/lutrom.sv
 /foss/designs/ldpc_personal/rtl/rom_dp.sv
 /foss/designs/ldpc_personal/rtl/lutram.sv
-/foss/designs/ldpc_personal/rtl/input_buffer_bank.sv
 /foss/designs/ldpc_personal/rtl/csr_decoder.sv
 /foss/designs/ldpc_personal/rtl/input_buffer.sv
 /foss/designs/ldpc_personal/rtl/ldpc_encoder.sv

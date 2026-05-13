@@ -12,9 +12,9 @@
 ## Register Bitfields
 
 ### 0x0000 - STATUS (RO)
-- `[0] READY`: encoder ready to receive input.
-- `[1] BUSY`: encoder processing active block.
-- `[2] DONE`: last encode operation completed.
+- `[0] READY`: encoder ready to receive input. -> from input buffer
+- `[1] BUSY`: encoder processing active block. -> from core
+- `[2] DONE`: last encode operation completed. -> from output buffer
 - `[31:3] RESERVED`
 
 ### 0x0004 - CFG (RW)

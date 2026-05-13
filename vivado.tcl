@@ -180,9 +180,9 @@ add_files -norecurse -fileset [current_fileset] [list \
 ]
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/rtl/ldpc_pkg.sv \
-    $ROOT/rtl/rom_lutram.sv \
+    $ROOT/rtl/lutrom.sv \
     $ROOT/rtl/rom_dp.sv \
-    $ROOT/rtl/asym_rgw_sdp_bram.sv \
+    $ROOT/rtl/lutram.sv \
     $ROOT/rtl/csr_decoder.sv \
     $ROOT/rtl/input_buffer.sv \
     $ROOT/rtl/ldpc_encoder.sv \

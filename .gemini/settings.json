@@ -1,0 +1,7 @@
+{
+  "tools": {
+    "allowed": [
+      "activate_skill"
+    ]
+  }
+}

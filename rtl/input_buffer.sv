@@ -38,8 +38,9 @@ module input_buffer #(
 
   // store in inner register
   // change upon LDPC inner handshake
-  input logic [KB_WIDTH-1:0] info_group_i,
-  output logic [ZC_MAX-1:0] data_batch_o
+  input logic [KB_WIDTH-1:0] info_group_sel_i,
+  output logic [ZC_WIDTH-1:0] lifting_size_o,
+  output logic [ZC_MAX-1:0] info_group_o
 );
 
 localparam int unsigned ACCUM_SIZE = ZC_MAX + DATA_WIDTH;
@@ -209,34 +210,37 @@ generate
   end
 endgenerate
 
-// Read logic
-logic [1:0] out_sel; // select data_batch size according to zc
-assign out_sel[1] = (ram_zc_q[r_swap_q] > ZC_MAX >> 1); // zc > 192
-assign out_sel[0] = (ram_zc_q[r_swap_q] > ZC_MAX >> 2); // zc > 96
+// // Read logic
+// logic [1:0] out_sel; // select data_batch size according to zc
+// assign out_sel[1] = (ram_zc_q[r_swap_q] > ZC_MAX >> 1); // zc > 192
+// assign out_sel[0] = (ram_zc_q[r_swap_q] > ZC_MAX >> 2); // zc > 96
 
-assign r_addr = info_group_i;
+assign r_addr = info_group_sel_i;
 assign ldpc_valid_o = ram_full_q[r_swap_q];
 
 always_ff @(posedge clk_i) begin : out_selector
   if (!arst_ni) begin
-    data_batch_o <= '0;
+    info_group_o <= '0;
+    lifting_size_o <= '0;
   end else begin
-    case (out_sel)
-      2'b00: begin
-        for (int unsigned j = 0; j < 4; j++) begin
-          data_batch_o[(ZC_MAX >> 2)*j +: (ZC_MAX >> 2)] 
-            <= {r_data[r_swap_q]}[0 +: (ZC_MAX >> 2)];
-        end
-      end
-      2'b01: begin
-        for (int unsigned j = 0; j < 2; j++) begin
-          data_batch_o[(ZC_MAX >> 1)*j +: (ZC_MAX >> 1)] 
-            <= {r_data[r_swap_q]}[0 +: (ZC_MAX >> 1)];
-        end
-      end
-      2'b11: data_batch_o <= r_data[r_swap_q];
-      default: data_batch_o <= '0;
-    endcase
+    // case (out_sel)
+    //   2'b00: begin
+    //     for (int unsigned j = 0; j < 4; j++) begin
+    //       info_group_o[(ZC_MAX >> 2)*j +: (ZC_MAX >> 2)] 
+    //         <= {r_data[r_swap_q]}[0 +: (ZC_MAX >> 2)];
+    //     end
+    //   end
+    //   2'b01: begin
+    //     for (int unsigned j = 0; j < 2; j++) begin
+    //       info_group_o[(ZC_MAX >> 1)*j +: (ZC_MAX >> 1)] 
+    //         <= {r_data[r_swap_q]}[0 +: (ZC_MAX >> 1)];
+    //     end
+    //   end
+    //   2'b11: info_group_o <= r_data[r_swap_q];
+    //   default: info_group_o <= '0;
+    // endcase
+    info_group_o <= r_data[r_swap_q];
+    lifting_size_o <= ram_zc_q[r_swap_q];
   end
 end
 

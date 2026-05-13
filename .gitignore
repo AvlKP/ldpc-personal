@@ -14,3 +14,4 @@ venv/
 notebooks/*.txt
 notebooks/*.mem
 **/vivado/
+rtl/deprecated/

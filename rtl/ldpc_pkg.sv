@@ -23,4 +23,24 @@ package ldpc_pkg;
   parameter int unsigned KB_WIDTH = $clog2(KB_BG1 + 1);
   parameter int unsigned RG_BG1 = 12;
   parameter int unsigned RG_BG2 = 11;
+
+  parameter int unsigned NUM_CS = 4;
+  parameter int unsigned BG1_H = 46;
+  parameter int unsigned BG1_W = 68;
+  parameter int unsigned BG1_WEFF = 26;
+  parameter int unsigned BG2_H = 42;
+  parameter int unsigned BG2_W = 52;
+  parameter int unsigned BG2_WEFF = 14;
+
+  typedef enum logic [1:0] {
+    CASE_A = 2'b00,
+    CASE_B = 2'b01,
+    CASE_C = 2'b10
+  } cases_e;
+
+  typedef enum logic [1:0] {
+      B_IN = 2'b00,
+      PC_IN = 2'b01,
+      PA_IN = 2'b10
+  } cwgen_mode_e;
 endpackage
