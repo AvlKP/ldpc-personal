@@ -15,5 +15,5 @@
 ## Phase 3: Completeness & Evaluation Baseline
 - [x] Task: Analyze each module for placeholder logic or "TODO" markers. [fb7ec5d]
 - [x] Task: Create `doc/module_status.md` flagging incomplete/skeleton modules. [fb7ec5d]
-- [~] Task: Perform baseline evaluation (resource/timing estimates) for "complete" modules.
-- [ ] Task: Conductor - User Manual Verification 'Completeness & Evaluation Baseline' (Protocol in workflow.md)
+- [x] Task: Perform baseline evaluation (resource/timing estimates) for "complete" modules. [b5cd763]
+- [~] Task: Conductor - User Manual Verification 'Completeness & Evaluation Baseline' (Protocol in workflow.md)
