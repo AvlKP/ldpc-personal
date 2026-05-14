@@ -33,10 +33,10 @@ package ldpc_pkg;
   parameter int unsigned BG2_WEFF = 14;
 
   typedef enum logic [1:0] {
-    CASE_A = 2'b00,
-    CASE_B = 2'b01,
-    CASE_C = 2'b10
-  } cases_e;
+    ZC_SMALL  = 2'b00,
+    ZC_MEDIUM = 2'b01,
+    ZC_LARGE  = 2'b11
+  } zc_group_t;
 
   typedef enum logic [1:0] {
       B_IN = 2'b00,

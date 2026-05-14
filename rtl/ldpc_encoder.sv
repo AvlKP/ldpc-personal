@@ -36,7 +36,8 @@ module ldpc_encoder (
   // AXI-Stream Master (DMA controls periph to mem)
   output logic [DATA_WIDTH-1:0]  m_axis_tdata,
   output logic         m_axis_tvalid,
-  input  logic         m_axis_tready
+  input  logic         m_axis_tready,
+  output logic         m_axis_tlast
 );
 
 // ==== AXI LITE Register Interface ====
@@ -102,17 +103,17 @@ assign input_bits_reg = DATA_WIDTH'(reg_q[11:8]);
 assign output_bits_reg = DATA_WIDTH'(reg_q[15:12]);
 
 // signal level
-logic ldpc_ready;
-logic ldpc_busy;
-logic ldpc_done;
+// logic ldpc_ready;
+// logic ldpc_busy;
+// logic ldpc_done;
 logic ldpc_base_graph;
 logic [ZC_WIDTH-1:0] ldpc_lifting_size;
 logic [15:0] ldpc_input_bits;
 logic [15:0] ldpc_output_bits;
 
-assign ldpc_ready = status_reg[0];
-assign ldpc_busy = status_reg[1];
-assign ldpc_done = status_reg[2];
+// assign ldpc_ready = status_reg[0];
+// assign ldpc_busy = status_reg[1];
+// assign ldpc_done = status_reg[2];
 assign ldpc_base_graph = config_reg[0];
 assign ldpc_lifting_size = config_reg[9:1];
 assign ldpc_input_bits = input_bits_reg[15:0];
@@ -137,11 +138,84 @@ axi_lite_regs #(
   .reg_q_o(reg_q)
 );
 
-// ==== AXI Stream input ====
+logic [ZC_WIDTH-1:0] core_lifting_size;
+logic [15:0] core_input_bits;
+logic [15:0] core_output_bits;
+logic core_base_graph;
+logic core_clear, core_valid;
+logic [KB_WIDTH-1:0] core_kb;
+logic [ZC_MAX-1:0] core_data_in;
+logic core_done;
+logic core_idle;
+logic [10:0] core_word_cnt;
 
+logic outbuff_full;
+logic outbuff_wr_en;
+logic [4:0] outbuff_addr;
+logic [(ZC_MAX << 2)-1:0] outbuff_data;
+
+// ==== AXI Stream input ====
+input_buffer input_buffer (
+  .clk_i           (clk_i),
+  .arst_ni         (arst_ni),
+  .s_axis_tdata    (s_axis_tdata),
+  .s_axis_tvalid   (s_axis_tvalid),
+  .s_axis_tready   (s_axis_tready),
+  .ldpc_clear_i    (core_clear),
+  .ldpc_valid_o    (core_valid),
+  .lifting_size_i  (ldpc_lifting_size),
+  .input_bits_i    (ldpc_input_bits),
+  .output_bits_i   (ldpc_output_bits),
+  .base_graph_i    (ldpc_base_graph),
+  .lifting_size_o  (core_lifting_size),
+  .input_bits_o    (core_input_bits),
+  .output_bits_o   (core_output_bits),
+  .base_graph_o    (core_base_graph),
+  .info_group_sel_i(core_kb),
+  .info_group_o    (core_data_in)
+);
 
 // ==== AXI Stream output ====
+output_buffer #(
+  .ZC_MAX    (ZC_MAX /* default 384 */),
+  .ADDR_WIDTH(5 /* default 5 */)
+ ) output_buffer (
+  .clk           (clk_i),
+  .rst_n         (arst_ni),
+  .wr_data_i     (outbuff_data),
+  .wr_addr_i     (outbuff_addr),
+  .wr_en_i       (outbuff_wr_en),
+  .cw_done_i     (core_done),
+  .total_words_i (core_word_cnt),
+  .outbuff_full_o(outbuff_full),
+  .m_axis_tdata  (m_axis_tdata),
+  .m_axis_tlast  (m_axis_tlast),
+  .m_axis_tvalid (m_axis_tvalid),
+  .m_axis_tready (m_axis_tready)
+);
 
 // ==== LDPC Core ====
+ldpc_encoder_core #(
+  .ZC_PER_CS(96),
+  .NUM_CS   (4)
+ ) ldpc_encoder_core (
+  .clk_i           (clk_i),
+  .arst_ni         (arst_ni),
+  .base_graph_i    (core_base_graph),
+  .input_bits_i    (core_input_bits),
+  .output_bits_i   (core_output_bits),
+  .lifting_size_i  (core_lifting_size),
+  .idle_o          (core_idle),
+  .inbuff_clear_o  (core_clear),
+  .inbuff_valid_i  (core_valid),
+  .info_group_sel_o(core_kb),
+  .info_group_i    (core_data_in),
+  .outbuff_full_i  (outbuff_full),
+  .outbuff_addr_o  (outbuff_addr),
+  .outbuff_wr_en_o (outbuff_wr_en),
+  .outbuff_data_o  (outbuff_data),
+  .cw_done_o       (core_done),
+  .total_words_o   (core_word_cnt)
+);
 
 endmodule

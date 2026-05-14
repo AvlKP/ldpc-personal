@@ -53,9 +53,10 @@ endef
 -include $(SIM_DIR)/Makefiles/*.mk
 
 # --- Group Targets ---
-.PHONY: group_input_buffer group_csr_decoder
+.PHONY: group_input_buffer group_csr_decoder group_ldpc_core
 group_input_buffer: test_input_buffer test_progressive test_zc_edges test_reset_edges test_payload_edges test_bg1_info_sweep
 group_csr_decoder: test_csr_decoder test_csr_bg1 test_csr_bg2 test_csr_arbitrary test_csr_backpressure
+group_ldpc_core: test_ldpc_encoder_core
 all: test_input_buffer test_csr_decoder
 
 # ==========================================

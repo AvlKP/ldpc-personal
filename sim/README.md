@@ -16,6 +16,7 @@ This directory provides a cocotb-based verification flow for the LDPC IP cores u
 2. Python with cocotb installed.
 3. `cocotb-config` available on PATH.
 4. Optional waveform viewer: Surfer or GTKWave (with FST support).
+5. For LDPC core pyuvm verification: `python3 -m pip install pyuvm py3gpp`
 
 ## Quick Start
 
@@ -30,6 +31,7 @@ To run test suites for specific modules:
 ```bash
 make group_input_buffer
 make group_csr_decoder
+make group_ldpc_core
 ```
 
 ## Run Individual Tests
@@ -51,6 +53,9 @@ These targets automatically sandbox themselves into unique `sim_build/<target>` 
 - `make test_csr_bg2`
 - `make test_csr_arbitrary`
 - `make test_csr_backpressure`
+
+**LDPC Encoder Top-Level (pyuvm):**
+- `make test_ldpc_encoder_core`
 
 ## Waveform Generation and Viewing
 

@@ -1,4 +1,4 @@
-`timescale 1ns / 1ps
+import ldpc_pkg::*;
 
 module codeword_generator #(
     parameter int ZC_MAX     = 384,
@@ -24,8 +24,8 @@ module codeword_generator #(
     input  logic [3:0][ZC_MAX-1:0]      parity_additional_i,
     input  logic                        parity_additional_valid_i,
 
-    // Parity Group Selector (2'b00: 1 group, 2'b01: 2 groups, 2'b11: 4 groups)
-    input  logic [1:0]                  parity_groups_i,
+    // Parity Group Selector (ZC_SMALL: 1 group, ZC_MEDIUM: 2 groups, ZC_LARGE: 4 groups)
+    input  zc_group_t                   parity_groups_i,
 
     // Flow Control
     input  logic                        outbuff_full_i,
@@ -62,15 +62,15 @@ module codeword_generator #(
             else if (parity_core_valid_i) begin
                 outbuff_wr_en_o = 1'b1;
                 case (parity_groups_i)
-                    2'b00: begin 
+                    ZC_SMALL: begin 
                         outbuff_data_o[ZC_MAX-1:0]     = parity_core_i[0];
                         incoming_bits                  = {7'd0, zc_i};
                     end
-                    2'b01: begin 
+                    ZC_MEDIUM: begin 
                         outbuff_data_o[(ZC_MAX*2)-1:0] = {parity_core_i[1], parity_core_i[0]};
                         incoming_bits                  = {6'd0, zc_i, 1'b0}; // zc_i * 2
                     end
-                    2'b11: begin 
+                    ZC_LARGE: begin 
                         outbuff_data_o[(ZC_MAX*4)-1:0] = {parity_core_i[3], parity_core_i[2], parity_core_i[1], parity_core_i[0]};
                         incoming_bits                  = {5'd0, zc_i, 2'b00}; // zc_i * 4
                     end
@@ -83,15 +83,15 @@ module codeword_generator #(
             else if (parity_additional_valid_i) begin
                 outbuff_wr_en_o = 1'b1;
                 case (parity_groups_i)
-                    2'b00: begin 
+                    ZC_SMALL: begin 
                         outbuff_data_o[ZC_MAX-1:0]     = parity_additional_i[0];
                         incoming_bits                  = {7'd0, zc_i};
                     end
-                    2'b01: begin 
+                    ZC_MEDIUM: begin 
                         outbuff_data_o[(ZC_MAX*2)-1:0] = {parity_additional_i[1], parity_additional_i[0]};
                         incoming_bits                  = {6'd0, zc_i, 1'b0}; // zc_i * 2
                     end
-                    2'b11: begin 
+                    ZC_LARGE: begin 
                         outbuff_data_o[(ZC_MAX*4)-1:0] = {parity_additional_i[3], parity_additional_i[2], parity_additional_i[1], parity_additional_i[0]};
                         incoming_bits                  = {5'd0, zc_i, 2'b00}; // zc_i * 4
                     end

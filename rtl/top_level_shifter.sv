@@ -8,8 +8,7 @@ module top_level_shifter #(
     input  logic [8:0]               z,
     input  logic [NUM_CS-1:0][8:0]               p,
     output logic [NUM_CS*ZC_PER_CS-1:0] data_out,
-    input  logic [1:0] d
-    // output cases_e d
+    input  zc_group_t d
 );
     
     // From parameter_calculation

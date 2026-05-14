@@ -1,10 +1,12 @@
+import ldpc_pkg::*;
+
 module direct_bit_permutation #(
     parameter int ZC_PER_CS = 96, 
     parameter int NUM_CS = 4,
     parameter logic is_reverse = 0
 )(
     input  logic [NUM_CS*ZC_PER_CS-1:0] data_in,
-    input  logic [1:0]                    d,       // [00 = 1, 01 = 2, 11 = 4]
+    input  zc_group_t                     d,       // [00 = 1, 01 = 2, 11 = 4]
     output logic [NUM_CS*ZC_PER_CS-1:0] data_out
 );
 
@@ -15,7 +17,7 @@ module direct_bit_permutation #(
         data_out = data_in; 
         
         case (d)
-          2'b01: begin
+          ZC_MEDIUM: begin
             for (int j = 0; j < NUM_CS/2; j++) begin
               for (int i = 0; i < ZC_PER_CS*2; i++) begin
                 data_out[j*(ZC_PER_CS*2) + i] = data_in[ j*(ZC_PER_CS*2) + (i & 1) * ZC_PER_CS + (i >> 1) ];
@@ -23,7 +25,7 @@ module direct_bit_permutation #(
             end
           end
           
-          2'b11: begin
+          ZC_LARGE: begin
             for (int j = 0; j < NUM_CS/4; j++) begin
               for (int i = 0; i < ZC_PER_CS*4; i++) begin
                 data_out[j*(ZC_PER_CS*4) + i] = data_in[ j*(ZC_PER_CS*4) + (i & 3) * ZC_PER_CS + (i >> 2) ];
@@ -42,7 +44,7 @@ module direct_bit_permutation #(
         data_out = data_in;
         
         case (d)
-          2'b01: begin
+          ZC_MEDIUM: begin
             for (int j = 0; j < NUM_CS/2; j++) begin
               for (int i = 0; i < ZC_PER_CS*2; i++) begin
                 data_out[ j*(ZC_PER_CS*2) + (i & 1) * ZC_PER_CS + (i >> 1) ] = data_in[j*(ZC_PER_CS*2) + i];
@@ -50,7 +52,7 @@ module direct_bit_permutation #(
             end
           end
           
-          2'b11: begin
+          ZC_LARGE: begin
             for (int j = 0; j < NUM_CS/4; j++) begin
               for (int i = 0; i < ZC_PER_CS*4; i++) begin
                 data_out[ j*(ZC_PER_CS*4) + (i & 3) * ZC_PER_CS + (i >> 2) ] = data_in[j*(ZC_PER_CS*4) + i];
