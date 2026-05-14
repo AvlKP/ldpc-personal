@@ -138,6 +138,8 @@ logic [3:0] gf2_en_q, gf2_en_qdly;
 logic csr_ready;
 
 assign csr_ready = ~rowgrp_changed_q;
+assign info_group_sel_o = KB_WIDTH'(col_curr_q);
+assign inbuff_clear_o = cw_done_o;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
   if (!arst_ni) begin
@@ -157,7 +159,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
 end
 
 logic [ROW_WIDTH-1:0] row_cnt_csr;
-assign row_cnt_csr = (row_cnt_q == '0)? row_cnt_q : row_cnt_n;
+assign row_cnt_csr = row_cnt_q;
 csr_decoder csr_decoder (
   .clk_i         (clk_i),
   .arst_ni       (arst_ni),
