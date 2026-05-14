@@ -12,7 +12,7 @@ export WAVES ?= 1
 # Base directories
 export SIM_DIR := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
 export RTL_DIR := $(SIM_DIR)/../rtl
-export GOLDEN_DATA_DIR := $(SIM_DIR)/../notebooks
+export GOLDEN_DATA_DIR := $(SIM_DIR)/../script/data
 
 # Default Goal
 .DEFAULT_GOAL := all
