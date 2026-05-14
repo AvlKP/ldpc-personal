@@ -1,0 +1,8 @@
+{
+  "track_id": "rtl_audit_20260513",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-05-13T10:00:00Z",
+  "updated_at": "2026-05-13T10:00:00Z",
+  "description": "Map current RTL to Petrović 2021 paper. Document module hierarchy and connectivity in 'doc/'. Flag incomplete modules for project understanding baseline."
+}
