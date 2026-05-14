@@ -21,7 +21,7 @@ module csr_decoder #(
   output logic [3:0][ZC_WIDTH-1:0] permutation_o, // will be -1 when col is unavailable
   output logic [3:0] gf2_en_o, // alternative to above's indicator
   output logic [COL_WIDTH-1:0] col_curr_o, // current column index being prrocessed
-  output logic rg_changed_o // flags that a row group change has occured
+  output logic rowgrp_changed_o // flags that a row group change has occured
 );
 
 typedef enum logic { 
@@ -39,27 +39,18 @@ typedef struct packed {
 } ldpc_packet_t;
 
 logic inner_ready, inner_valid;
-logic bg_q, bg_n;
 logic [ROW_WIDTH-1:0] row_q, row_n;
-logic [ZC_WIDTH-1:0] zc_q, zc_n;
 
-assign bg_n = (start_i & state_q == INIT)? base_graph_i : bg_q;
 assign row_n = (start_i & state_q == INIT)? row_i : row_q;
-assign zc_n = (start_i & state_q == INIT)? lifting_size_i : zc_q;
-
 always_ff @(posedge clk_i or negedge arst_ni) begin : input_lock
   if (!arst_ni) begin
-    bg_q <= 0;
     row_q <= '0;
-    zc_q <= '0;
   end else if (start_i & state_q == INIT) begin
-    bg_q <= base_graph_i;
     row_q <= row_i;
-    zc_q <= lifting_size_i;
   end
 end
 
-logic rg_changed_n, rg_changed_q;
+logic rowgrp_changed_n, rowgrp_changed_q;
 logic [COL_WIDTH-1:0] col_curr_n, col_curr_q;
 logic [3:0] gf2_en_q;
 logic [3:0][ZC_WIDTH-1:0] permutation;
@@ -90,7 +81,7 @@ assign col_curr_o = ldpc_packet_o.col_curr;
 assign gf2_en_o = ldpc_packet_o.gf2_en;
 assign permutation_o = ldpc_packet_o.permutation;
 
-assign rg_changed_o = rg_changed_q;
+assign rowgrp_changed_o = rowgrp_changed_q;
 
 // FSM
 logic ldpc_handshake;
@@ -100,28 +91,19 @@ assign inner_valid = (state_q == VALID)? 1 : 0;
 assign ldpc_handshake = inner_ready & inner_valid;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : state_ff
-  if (!arst_ni) state_q <= INIT;
-  else begin
-    if (state_q == VALID & ~ldpc_handshake) 
-      state_q <= state_q; // backpressure
-    else
-      state_q <= next_state;
-  end
+  if (!arst_ni) 
+    state_q <= INIT;
+  else if (!(state_q == VALID & ~ldpc_handshake)) 
+    // only transition when there's no backpressure
+    state_q <= next_state;
 end
 
 logic [3:0] row_changed;
 always_comb begin
-  case (state_q)
-    INIT: begin
-      if (start_i) next_state = VALID; // 1 clock delay
-      else next_state = INIT; // hold init if core is not starting the process yet
-    end
-    VALID: begin
-      // handle backpressure and row change
-      if (ldpc_handshake & rg_changed_n) next_state = INIT; 
-      else next_state = state_q;
-    end
-    default: next_state = state_q;
+  unique case (state_q)
+    INIT:    next_state = start_i ? VALID : INIT;
+    VALID:   next_state = (ldpc_handshake & rowgrp_changed_n) ? INIT : VALID;
+    default: next_state = INIT; // Safe state recovery
   endcase
 end
 
@@ -129,31 +111,33 @@ end
 localparam int unsigned RPW_SIZE = $ceil(RP_SIZE/4.0);
 localparam int unsigned RPW_WIDTH = $clog2(RPW_SIZE+1);
 logic [KB_WIDTH-1:0] kb_max;
-logic [RPW_WIDTH-1:0] rg_max;
+logic [RPW_WIDTH-1:0] rowgrp_max;
 
-assign kb_max = (bg_n)? KB_WIDTH'(KB_BG2) : KB_WIDTH'(KB_BG1);
-assign rg_max = (bg_n)? RPW_WIDTH'(RG_BG2+RG_BG1) : RPW_WIDTH'(RG_BG1);
+assign kb_max = (base_graph_i)? KB_WIDTH'(KB_BG2-1) : KB_WIDTH'(KB_BG1-1);
+assign rowgrp_max = (base_graph_i)? RPW_WIDTH'(RG_BG2+RG_BG1-1) : RPW_WIDTH'(RG_BG1-1);
 
 // Row Pointer ROM
-logic [3:0][BASEP_WIDTH-1:0] rp_wire, rp_limit_q;
-logic [RPW_WIDTH-1:0] rg, rg_base;
+logic [3:0][BASEP_WIDTH-1:0] rowpnt_n, rowpnt_limit_q;
+logic [RPW_WIDTH-1:0] rowgrp, rowgrp_base;
 
-assign rg_base = 
-  (bg_n)? RPW_WIDTH'(RG_BG1) + RPW_WIDTH'(row_n >> 2)
+assign rowgrp_base = 
+  (base_graph_i)? RPW_WIDTH'(RG_BG1) + RPW_WIDTH'(row_n >> 2)
         : RPW_WIDTH'(row_n >> 2);
-assign rg = rg_base + RPW_WIDTH'(state_q);
+assign rowgrp = rowgrp_base + RPW_WIDTH'(state_q);
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : rp_ff
-  if (!arst_ni) rp_limit_q <= '1;
+  if (!arst_ni) begin
+    rowpnt_limit_q <= '1;
+  end
   else begin
-    case (state_q)
+    unique case (state_q)
       INIT : begin
-        rp_limit_q[2:0] <= rp_wire[3:1];
-        rp_limit_q[3] <= '1;
+        rowpnt_limit_q[2:0] <= rowpnt_n[3:1];
+        rowpnt_limit_q[3] <= '1;
       end 
       VALID : begin
-        rp_limit_q[3] <= rp_wire[0];
-        rp_limit_q[2:0] <= rp_limit_q[2:0];
+        rowpnt_limit_q[3] <= rowpnt_n[0];
+        rowpnt_limit_q[2:0] <= rowpnt_limit_q[2:0];
       end 
     endcase
   end
@@ -165,8 +149,8 @@ lutrom #(
   .NUM_PORTS (1),
   .MEM_INIT  ("mem/row_ptr.mem")
 ) rp_rom (
-  .addr_i('{rg}),
-  .dout_o('{{rp_wire}})
+  .addr_i({rowgrp}),
+  .dout_o({>>{rowpnt_n}})
 );
 
 // Column Indices ROM
@@ -176,37 +160,44 @@ logic [3:0][COL_WIDTH-1:0] col_idx;
 
 logic [3:0] row_en;
 always_comb begin
-  for (int unsigned i = 0; i < 4; i++) begin
-    // enable when it is current col or a core parity bit
-    row_en[i] = ((col_idx[i] <= 7'(kb_max-1) & col_curr_n == col_idx[i]) 
-              | (col_idx[i] > 7'(kb_max-1) & ~row_changed[i]));
+  if (rowgrp_base >= rowgrp_max) begin
+    row_en[3:2] = 2'b00;
+    for (int unsigned i = 0; i < 2; i++) begin
+      // enable when it is current col or a core parity bit
+      row_en[i] = ((col_idx[i] <= kb_max & col_curr_n == col_idx[i]) 
+                | (col_idx[i] > kb_max & ~row_changed[i]));
+    end
+  end else begin
+    for (int unsigned i = 0; i < 4; i++) begin
+      row_en[i] = ((col_idx[i] <= kb_max & col_curr_n == col_idx[i]) 
+                | (col_idx[i] > kb_max & ~row_changed[i]));
+    end
   end
 end
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : colval_addressing
-for (int unsigned i = 0; i < 4; i++) begin
   if (!arst_ni) begin
-    colval_addr_q[i] <= '0;
-  end else begin
-    if (state_q == VALID & ~ldpc_handshake) colval_addr_q[i] <= colval_addr_q[i]; // backpressure
-    else if (state_q == INIT) begin
-      // take data from bypass to increment correctly after init
-      if (row_en[i]) colval_addr_q[i] <= colval_addr_n[i] + 1;
-      else colval_addr_q[i] <= colval_addr_n[i];
-    end
-    else begin
-      if (row_en[i]) colval_addr_q[i] <= colval_addr_q[i] + 1;
-      else colval_addr_q[i] <= colval_addr_q[i];      
+    colval_addr_q <= '0;
+  end else if (!(state_q == VALID & ~ldpc_handshake)) begin
+    for (int unsigned i = 0; i < 4; i++) begin
+      if (state_q == INIT) begin
+        // take data from bypass to increment correctly after init
+        colval_addr_q[i] <= (row_en[i])? colval_addr_n[i] + 1
+                                      : colval_addr_n[i];
+      end
+      else begin
+        colval_addr_q[i] <= (row_en[i])? colval_addr_q[i] + 1
+                              : colval_addr_q[i];
+      end
     end
   end
-end
 end
 
 // bypass colval_addr_q reg for the 1 cycle during INIT
 always_comb begin
   for (int unsigned i = 0; i < 4; i++) begin
     case (state_q)
-      INIT : colval_addr_n[i] = rp_wire[i];
+      INIT : colval_addr_n[i] = rowpnt_n[i];
       VALID: colval_addr_n[i] = colval_addr_q[i];
       default: colval_addr_n[i] = colval_addr_q[i];
     endcase
@@ -230,55 +221,82 @@ logic [3:0][COL_WIDTH:0] cidx_comp;
 always_comb begin
   for (int unsigned i = 0; i < 4; i++) begin
     // row change check
-    row_changed[i] = colval_addr_n[i] == rp_limit_q[i];
+    row_changed[i] = colval_addr_n[i] == rowpnt_limit_q[i];
 
     // append row change to skew comparison
     cidx_comp[i] = {row_changed[i], col_idx[i]};
   end
 end
-assign rg_changed_n = &row_changed;
+assign rowgrp_changed_n = &row_changed;
 
 // Get current column
 always_comb begin
-  // compare row 1 and 2
-  if (cidx_comp[0] <= cidx_comp[1]) cidx_temp[0] = cidx_comp[0];
-  else cidx_temp[0] = cidx_comp[1];
+  cidx_temp[0] = (cidx_comp[0] <= cidx_comp[1])? cidx_comp[0] : cidx_comp[1];
+  cidx_temp[1] = (rowgrp_base >= rowgrp_max) ? '1 :
+                ((cidx_comp[2] <= cidx_comp[3])? cidx_comp[2] : cidx_comp[3]);
 
-  // compare row 3 and 4
-  if (rg_base >= rg_max - 1) cidx_temp[1] = '1; // guard for last row
-  else if (cidx_comp[2] <= cidx_comp[3]) cidx_temp[1] = cidx_comp[2];
-  else cidx_temp[1] = cidx_comp[3];  
-
-  // get minimum of all 4 rows
-  if (cidx_temp[0] <= cidx_temp[1]) col_curr_n = cidx_temp[0][COL_WIDTH-1:0];
-  else col_curr_n = cidx_temp[1][COL_WIDTH-1:0];
+  col_curr_n = (cidx_temp[0] <= cidx_temp[1])?
+    cidx_temp[0][COL_WIDTH-1:0] : cidx_temp[1][COL_WIDTH-1:0];
 end
 
 // select which values ROM to read from
+logic [2:0] rom_sel;
+logic       sel_valid;
+
+zc_decoder zc_decoder (
+  .clk_i      (clk_i),
+  .arst_ni    (arst_ni),
+  .zc_i       (lifting_size_i),
+  .zc_valid_i (1'b1),
+  .i_ls_o     (rom_sel),
+  .sel_valid_o(sel_valid)
+);
 
 // Values ROM
 generate
-  genvar rom_i;
+  genvar rom_i, set_idx;
   for (rom_i = 0; rom_i < 2; rom_i++) begin : val_rom_gen
-    logic [1:0][CSR_WIDTH-1:0] val_addr;
-    logic [1:0][ZC_WIDTH-1:0] val, val_held_q, val_muxed;
-    logic val_is_held;
+    logic [1:0][CSR_WIDTH-1:0]        val_addr;
+    logic [1:0][ZC_WIDTH-1:0]         val, val_held_q, val_muxed;
+    logic [7:0][1:0][ZC_WIDTH-1:0]    val_all_sets;
+    logic                             val_is_held;
+    logic [7:0]                       rom_en_decoded;
 
     assign val_addr = colval_addr_n[rom_i*2 +: 2];
+    always_comb begin
+      // PLACEHOLDER
+      // TODO: Add pipelining and actual wait for this to be stable
+      if (state_q == INIT) rom_en_decoded = '1;
+      else begin
+        rom_en_decoded = 8'h00;
+        rom_en_decoded[rom_sel] = 1'b1;
+      end
+    end
 
-    rom_dp #(
-      .WORD_WIDTH(BASEP_WIDTH),
-      .SIZE      (CSR_SIZE),
-      .MEM_INIT  ("mem/values.mem")
-    ) val_rom (
-      .clk_i  (clk_i),
-      .en_a_i (1),
-      .addra_i(val_addr[0]),
-      .douta_o(val[0]),
-      .en_b_i (1),
-      .addrb_i(val_addr[1]),
-      .doutb_o(val[1])
-    );
+    for (set_idx = 0; set_idx < 8; set_idx++) begin : set_rom_gen
+      rom_dp #(
+        .WORD_WIDTH(BASEP_WIDTH),
+        .SIZE      (CSR_SIZE),
+        .MEM_INIT  ((set_idx == 0) ? "mem/values_0.mem" : 
+                    (set_idx == 1) ? "mem/values_1.mem" :
+                    (set_idx == 2) ? "mem/values_2.mem" :
+                    (set_idx == 3) ? "mem/values_3.mem" :
+                    (set_idx == 4) ? "mem/values_4.mem" :
+                    (set_idx == 5) ? "mem/values_5.mem" :
+                    (set_idx == 6) ? "mem/values_6.mem" : "mem/values_7.mem")
+      ) val_rom (
+        .clk_i  (clk_i),
+        .en_a_i (rom_en_decoded[set_idx]),
+        .addra_i(val_addr[0]),
+        .douta_o(val_all_sets[set_idx][0]),
+        .en_b_i (rom_en_decoded[set_idx]),
+        .addrb_i(val_addr[1]),
+        .doutb_o(val_all_sets[set_idx][1])
+      );
+    end
+
+    assign val[0] = val_all_sets[rom_sel][0];
+    assign val[1] = val_all_sets[rom_sel][1];
 
     // skid buffer ready delay handling
     // NOTE: due to 1 clock delay, even if address changed
@@ -317,28 +335,22 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : output_ff
   if (!arst_ni) begin
     col_curr_q <= '0;
     gf2_en_q <= '0; 
-  end else begin
-    if (state_q == VALID & ~ldpc_handshake) begin
-      // backpressure
-      col_curr_q <= col_curr_q;
-      gf2_en_q <= gf2_en_q;
-    end else begin
-      col_curr_q <= col_curr_n;
-      gf2_en_q <= row_en;
-    end
+  end else if (!(state_q == VALID & ~ldpc_handshake)) begin
+    col_curr_q <= col_curr_n;
+    gf2_en_q <= row_en;
   end
 end
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : row_change_ff
   if (!arst_ni) begin
-    rg_changed_q <= 0;
+    rowgrp_changed_q <= 0;
   end else begin
     if (state_q == INIT & ~start_i) begin
-      rg_changed_q <= rg_changed_q;
+      rowgrp_changed_q <= rowgrp_changed_q;
     end else if (state_q == VALID) begin
-      rg_changed_q <= rg_changed_n & ldpc_handshake;
+      rowgrp_changed_q <= rowgrp_changed_n & ldpc_handshake;
     end else begin
-      rg_changed_q <= 0; 
+      rowgrp_changed_q <= 0; 
     end
   end
 end

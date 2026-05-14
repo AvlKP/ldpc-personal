@@ -14,6 +14,37 @@ _cached_golden_matrix = None
 _golden_matrix_loaded = False
 _cached_raw_data = None
 
+def get_zc_set_index(zc):
+    """Matches rtl/zc_decoder.sv mapping from Zc to values_* set index."""
+    if zc in {2, 4, 8, 16, 32, 64, 128, 256}:
+        return 0
+    if zc in {3, 6, 12, 24, 48, 96, 192, 384}:
+        return 1
+    if zc in {5, 10, 20, 40, 80, 160, 320}:
+        return 2
+    if zc in {7, 14, 28, 56, 112, 224}:
+        return 3
+    if zc in {9, 18, 36, 72, 144, 288}:
+        return 4
+    if zc in {11, 22, 44, 88, 176, 352}:
+        return 5
+    if zc in {13, 26, 52, 104, 208}:
+        return 6
+    if zc in {15, 30, 60, 120, 240}:
+        return 7
+    return 0
+
+def get_valid_5gnr_zcs():
+    """Returns all valid Zc values accepted by zc_decoder."""
+    base_z_set = [2, 3, 5, 7, 9, 11, 13, 15]
+    valid = []
+    for base in base_z_set:
+        for j in range(8):
+            zc = base * (2 ** j)
+            if zc <= 384:
+                valid.append(zc)
+    return valid
+
 def load_golden_matrix(dut):
     """
     Parses the human-readable text files to generate a golden reference matrix.
@@ -40,10 +71,16 @@ def load_golden_matrix(dut):
 
         row_ptrs = parse_file_safe(row_ptr_path)
         col_indices = parse_file_safe(col_idx_path)
-        values = parse_file_safe(val_path)
+        values_by_set = {}
+        for set_idx in range(8):
+            set_path = os.path.join(data_dir, f"values_readable_{set_idx}.txt")
+            if os.path.exists(set_path):
+                values_by_set[set_idx] = parse_file_safe(set_path)
+        if not values_by_set:
+            values_by_set[0] = parse_file_safe(val_path)
         
         # Cache the raw arrays for the cycle-accurate monitor
-        _cached_raw_data = (row_ptrs, col_indices, values)
+        _cached_raw_data = (row_ptrs, col_indices, values_by_set)
         
         if len(row_ptrs) == 0:
             dut._log.warning("Row pointers list is empty!")
@@ -60,8 +97,8 @@ def load_golden_matrix(dut):
                 continue 
                 
             for idx in range(start_idx, end_idx):
-                if idx < len(col_indices) and idx < len(values):
-                    golden_matrix[r][col_indices[idx]] = values[idx]
+                if idx < len(col_indices) and idx < len(values_by_set[0]):
+                    golden_matrix[r][col_indices[idx]] = values_by_set[0][idx]
                     
         dut._log.info("Golden matrix and raw arrays successfully loaded.")
         
@@ -81,13 +118,14 @@ async def reset_dut(dut):
     dut.start_i.value = 0
     dut.base_graph_i.value = 0
     dut.row_i.value = 0
+    dut.lifting_size_i.value = 0
     
     await ClockCycles(dut.clk_i, 5)
     
     dut.arst_ni.value = 1
     await ClockCycles(dut.clk_i, 5)
 
-async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
+async def wait_for_row_completion(dut, start_row, bg, zc, golden_matrix):
     """
     Monitors the DUT output cycle-accurately against the raw memory arrays.
     Matches the RTL's state machine, including continuous streaming of 
@@ -99,11 +137,13 @@ async def wait_for_row_completion(dut, start_row, bg, golden_matrix):
         dut._log.warning("Raw data missing. Skipping checks for this row.")
         while True:
             await RisingEdge(dut.clk_i)
-            if dut.rg_changed_o.value == 1:
+            if dut.rowgrp_changed_o.value == 1:
                 break
         return
         
-    row_ptrs_list, col_indices, values = _cached_raw_data
+    row_ptrs_list, col_indices, values_by_set = _cached_raw_data
+    set_idx = get_zc_set_index(zc)
+    values = values_by_set.get(set_idx, values_by_set[0])
     
     # BG1 has 46 rows, meaning it uses 47 pointers (indices 0 to 46) including the end pointer.
     # In the unified memory list, BG2's row 0 starts exactly at index 47.
@@ -205,6 +245,7 @@ async def test_continuous_decoding(dut):
     
     num_tests = 10
     test_configs = []
+    valid_zcs = get_valid_5gnr_zcs()
     
     # Pre-generate the sequence of row configs
     for _ in range(num_tests):
@@ -212,12 +253,14 @@ async def test_continuous_decoding(dut):
         row_max = BG1_ROW_COUNT if bg == 0 else BG2_ROW_COUNT
         # Generate an unprocessed physical row increment (0, 4, 8...)
         physical_row = random.randrange(0, row_max, 4) 
-        test_configs.append((bg, physical_row))
+        zc = random.choice(valid_zcs)
+        test_configs.append((bg, physical_row, zc))
         
     async def driver():
         """Feeds start_i and row configurations continuously."""
-        for i, (bg, physical_row) in enumerate(test_configs):
+        for i, (bg, physical_row, zc) in enumerate(test_configs):
             dut.base_graph_i.value = bg
+            dut.lifting_size_i.value = zc
             dut.row_i.value = physical_row
             dut.start_i.value = 1
             await RisingEdge(dut.clk_i)
@@ -228,13 +271,13 @@ async def test_continuous_decoding(dut):
                 while True:
                     await RisingEdge(dut.clk_i)
                     # ldpc_valid_o == 0 ensures no inflight data is destroyed by the next start_i
-                    if dut.rg_changed_o.value == 1 and dut.ldpc_valid_o.value == 0:
+                    if dut.rowgrp_changed_o.value == 1 and dut.ldpc_valid_o.value == 0:
                         break
                         
     async def monitor():
         """Validates outputs against the golden model."""
-        for bg, physical_row in test_configs:
-            await wait_for_row_completion(dut, physical_row, bg, golden_matrix)
+        for bg, physical_row, zc in test_configs:
+            await wait_for_row_completion(dut, physical_row, bg, zc, golden_matrix)
             
     async def backpressure():
         """Randomly toggles ready_i to simulate downstream pressure."""
@@ -265,6 +308,7 @@ async def test_bg1_full_sweep(dut):
 
     dut.ldpc_ready_i.value = 1
     dut.base_graph_i.value = 0
+    dut.lifting_size_i.value = 128
 
     dut._log.info("Starting BG1 row sweep...")
     # Increment by 4 to jump to the next unprocessed physical row
@@ -274,7 +318,7 @@ async def test_bg1_full_sweep(dut):
         await RisingEdge(dut.clk_i)
         dut.start_i.value = 0
         
-        await wait_for_row_completion(dut, physical_row, 0, golden_matrix)
+        await wait_for_row_completion(dut, physical_row, 0, 128, golden_matrix)
         dut._log.info(f"Completed BG1 physical rows {physical_row} to {physical_row+3}.")
         
     await ClockCycles(dut.clk_i, 10)
@@ -290,6 +334,7 @@ async def test_bg2_full_sweep(dut):
 
     dut.ldpc_ready_i.value = 1
     dut.base_graph_i.value = 1
+    dut.lifting_size_i.value = 256
 
     dut._log.info("Starting BG2 row sweep...")
     # Increment by 4 to jump to the next unprocessed physical row
@@ -299,7 +344,7 @@ async def test_bg2_full_sweep(dut):
         await RisingEdge(dut.clk_i)
         dut.start_i.value = 0
         
-        await wait_for_row_completion(dut, physical_row, 1, golden_matrix)
+        await wait_for_row_completion(dut, physical_row, 1, 256, golden_matrix)
         dut._log.info(f"Completed BG2 physical rows {physical_row} to {physical_row+3}.")
 
     await ClockCycles(dut.clk_i, 10)
@@ -321,7 +366,8 @@ async def test_arbitrary_input_changes(dut):
     dut.start_i.value = 0
 
     # Spawn an asynchronous thread to independently monitor correctness
-    monitor_task = cocotb.start_soon(wait_for_row_completion(dut, 0, 0, golden_matrix))
+    dut.lifting_size_i.value = 128
+    monitor_task = cocotb.start_soon(wait_for_row_completion(dut, 0, 0, 128, golden_matrix))
 
     # Wait until FSM enters VALID state to start interference
     while dut.ldpc_valid_o.value != 1:
@@ -330,15 +376,13 @@ async def test_arbitrary_input_changes(dut):
     # Throw chaotic permutations onto inputs while the row is being processed
     timeout_ctr = 0
     while not monitor_task.done():
-        toggle_mask = random.randint(1, 7)
+        toggle_mask = random.randint(1, 5)
         
         start_val = 1 if (toggle_mask & 0b001) else 0
-        bg_val = random.choice([0, 1]) if (toggle_mask & 0b010) else dut.base_graph_i.value
         # Ensure we send a randomly chosen valid physical row
         row_val = random.randrange(0, BG1_ROW_COUNT, 4) if (toggle_mask & 0b100) else dut.row_i.value
         
         dut.start_i.value = start_val
-        dut.base_graph_i.value = bg_val
         dut.row_i.value = row_val
         
         await RisingEdge(dut.clk_i)
@@ -372,12 +416,13 @@ async def test_backpressure_and_delays(dut):
 
         dut.base_graph_i.value = bg
         dut.row_i.value = row
+        dut.lifting_size_i.value = 256
         dut.start_i.value = 1
         await RisingEdge(dut.clk_i)
         dut.start_i.value = 0
 
         # Delegate validation to the standard robust monitor
-        monitor_task = cocotb.start_soon(wait_for_row_completion(dut, row, bg, golden_matrix))
+        monitor_task = cocotb.start_soon(wait_for_row_completion(dut, row, bg, 256, golden_matrix))
 
         # Randomly toggle backpressure while the row group streams out
         timeout_ctr = 0
@@ -387,7 +432,10 @@ async def test_backpressure_and_delays(dut):
             
             timeout_ctr += 1
             if timeout_ctr > 5000:
-                dut._log.error(f"Timeout! valid_o={dut.ldpc_valid_o.value}, ready_i={dut.ldpc_ready_i.value}, rg_changed_o={dut.rg_changed_o.value}")
+                dut._log.error(
+                    f"Timeout! valid_o={dut.ldpc_valid_o.value}, ready_i={dut.ldpc_ready_i.value}, "
+                    f"rowgrp_changed_o={dut.rowgrp_changed_o.value}"
+                )
                 assert False, "Timeout waiting for row completion. RTL might be dropping signals when not ready, or ignoring start_i!"
 
         await monitor_task # Catch any exception thrown by the monitor
@@ -406,6 +454,7 @@ async def test_variable_row_increments(dut):
     await reset_dut(dut)
     
     test_configs = []
+    valid_zcs = get_valid_5gnr_zcs()
     
     # Generate a sequence covering both Base Graphs
     for bg in [0, 1]:
@@ -413,15 +462,17 @@ async def test_variable_row_increments(dut):
         physical_row = 0
         
         while physical_row < row_max:
-            test_configs.append((bg, physical_row))
+            zc = random.choice(valid_zcs)
+            test_configs.append((bg, physical_row, zc))
             # Dynamically select the next increment
             increment = random.choice([1, 2, 4])
             physical_row += increment
             
     async def driver():
         """Feeds start_i and row configurations with fixed safe-start logic."""
-        for i, (bg, physical_row) in enumerate(test_configs):
+        for i, (bg, physical_row, zc) in enumerate(test_configs):
             dut.base_graph_i.value = bg
+            dut.lifting_size_i.value = zc
             dut.row_i.value = physical_row
             dut.start_i.value = 1
             await RisingEdge(dut.clk_i)
@@ -431,13 +482,13 @@ async def test_variable_row_increments(dut):
                 # Wait for the DUT to finish and flush before pushing the next start
                 while True:
                     await RisingEdge(dut.clk_i)
-                    if dut.rg_changed_o.value == 1 and dut.ldpc_valid_o.value == 0:
+                    if dut.rowgrp_changed_o.value == 1 and dut.ldpc_valid_o.value == 0:
                         break
                         
     async def monitor():
         """Validates outputs against the golden model."""
-        for bg, physical_row in test_configs:
-            await wait_for_row_completion(dut, physical_row, bg, golden_matrix)
+        for bg, physical_row, zc in test_configs:
+            await wait_for_row_completion(dut, physical_row, bg, zc, golden_matrix)
             
     async def backpressure():
         """Randomly toggles ready_i to simulate downstream pressure."""

@@ -7,6 +7,10 @@ import random
 ZC_MAX = 384
 DATA_WIDTH = 32
 
+def get_codeword_bits(zc, base_graph):
+    """Returns encoded codeword length N = nb * Zc (BG1: 66, BG2: 50)."""
+    return (50 if base_graph else 66) * zc
+
 async def reset_dut(dut):
     """Asserts reset and initializes all control signals."""
     dut.arst_ni.value = 0
@@ -15,17 +19,23 @@ async def reset_dut(dut):
     dut.ldpc_clear_i.value = 0
     dut.lifting_size_i.value = 0
     dut.input_bits_i.value = 0
-    dut.info_group_i.value = 0
+    dut.output_bits_i.value = 0
+    dut.base_graph_i.value = 0
+    dut.info_group_sel_i.value = 0
     
     await ClockCycles(dut.clk_i, 5)
     dut.arst_ni.value = 1
     await ClockCycles(dut.clk_i, 5)
 
-async def axis_master(dut, data_words, zc, total_bits):
+async def axis_master(dut, data_words, zc, total_bits, output_bits=None, base_graph=0):
     """Drives the AXI Stream input."""
     # Setup configuration for the block
+    if output_bits is None:
+        output_bits = total_bits
     dut.lifting_size_i.value = zc
     dut.input_bits_i.value = total_bits
+    dut.output_bits_i.value = output_bits
+    dut.base_graph_i.value = base_graph
     
     idx = 0
     while idx < len(data_words):
@@ -48,7 +58,16 @@ async def axis_master(dut, data_words, zc, total_bits):
     dut.s_axis_tvalid.value = 0
     await RisingEdge(dut.clk_i)
 
-async def ldpc_sink(dut, expected_data, zc, info_groups, delay_reads=False):
+async def ldpc_sink(
+    dut,
+    expected_data,
+    zc,
+    info_groups,
+    expected_input_bits=None,
+    expected_output_bits=None,
+    expected_base_graph=None,
+    delay_reads=False
+):
     """Monitors ldpc_valid_o, reads from RAM, and verifies the output with 1-cycle latency."""
     await RisingEdge(dut.clk_i)
     
@@ -62,8 +81,14 @@ async def ldpc_sink(dut, expected_data, zc, info_groups, delay_reads=False):
     
     # Continuously stream addresses 1 per cycle
     for group in range(info_groups):
+        if expected_input_bits is not None:
+            assert dut.lifting_size_o.value.to_unsigned() == zc, "lifting_size_o does not match latched config"
+            assert dut.input_bits_o.value.to_unsigned() == expected_input_bits, "input_bits_o does not match latched config"
+            assert dut.output_bits_o.value.to_unsigned() == expected_output_bits, "output_bits_o does not match latched config"
+            assert int(dut.base_graph_o.value) == expected_base_graph, "base_graph_o does not match latched config"
+
         # 1. Drive the read address (stable setup before next RisingEdge)
-        dut.info_group_i.value = group
+        dut.info_group_sel_i.value = group
         
         # 2. Wait for the clock edge that latches the data into data_batch_o
         await RisingEdge(dut.clk_i) 
@@ -73,22 +98,10 @@ async def ldpc_sink(dut, expected_data, zc, info_groups, delay_reads=False):
         await FallingEdge(dut.clk_i)
         
         # FIX: Replaced deprecated .integer with .to_unsigned()
-        raw_output = dut.data_batch_o.value.to_unsigned()
+        raw_output = dut.info_group_o.value.to_unsigned()
         
-        # Determine how the output was supposed to be duplicated by out_sel
-        if zc > (ZC_MAX >> 1):   # > 192 (out_sel 2'b11)
-            extracted_val = raw_output & ((1 << ZC_MAX) - 1)
-        elif zc > (ZC_MAX >> 2): # > 96 (out_sel 2'b01)
-            extracted_val = raw_output & ((1 << (ZC_MAX >> 1)) - 1)
-            copy2 = (raw_output >> (ZC_MAX >> 1)) & ((1 << (ZC_MAX >> 1)) - 1)
-            assert extracted_val == copy2, f"Duplication failed for Zc={zc}"
-        else:                    # <= 96 (out_sel 2'b00)
-            extracted_val = raw_output & ((1 << (ZC_MAX >> 2)) - 1)
-            for j in range(1, 4):
-                copy_j = (raw_output >> ((ZC_MAX >> 2) * j)) & ((1 << (ZC_MAX >> 2)) - 1)
-                assert extracted_val == copy_j, f"Duplication failed for Zc={zc} at section {j}"
-                
-        extracted_val = extracted_val & ((1 << zc) - 1)
+        # Current RTL drives full info_group directly; only lower Zc bits are meaningful.
+        extracted_val = raw_output & ((1 << zc) - 1)
         actual_data.append(extracted_val)
         
     # Assert ldpc_clear_i to swap buffers
@@ -139,9 +152,18 @@ async def test_basic_transfer(dut):
     info_groups = 10
     axis_words, expected, total_bits = generate_test_data(zc, info_groups)
     
+    base_graph = 0
+    output_bits = get_codeword_bits(zc, base_graph)
     # Launch sender and receiver
-    driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits))
-    sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+    driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits, output_bits, base_graph))
+    sink_task = cocotb.start_soon(
+        ldpc_sink(
+            dut, expected, zc, info_groups,
+            expected_input_bits=total_bits,
+            expected_output_bits=output_bits,
+            expected_base_graph=base_graph
+        )
+    )
     
     await driver_task
     await sink_task
@@ -158,9 +180,18 @@ async def test_lifting_size_duplication(dut):
     
     for zc in test_zcs:
         axis_words, expected, total_bits = generate_test_data(zc, info_groups)
+        base_graph = 0
+        output_bits = get_codeword_bits(zc, base_graph)
         
-        driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits))
-        sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+        driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits, output_bits, base_graph))
+        sink_task = cocotb.start_soon(
+            ldpc_sink(
+                dut, expected, zc, info_groups,
+                expected_input_bits=total_bits,
+                expected_output_bits=output_bits,
+                expected_base_graph=base_graph
+            )
+        )
         
         await driver_task
         await sink_task
@@ -180,12 +211,22 @@ async def test_ping_pong_backpressure(dut):
     
     async def continuous_axis_driver():
         for axis_words, _, total_bits in blocks:
-            await axis_master(dut, axis_words, zc, total_bits)
+            base_graph = 0
+            output_bits = get_codeword_bits(zc, base_graph)
+            await axis_master(dut, axis_words, zc, total_bits, output_bits, base_graph)
             
     async def delayed_sink():
         for _, expected, _ in blocks:
             # Delay reads heavily to ensure W_STALL is hit
-            await ldpc_sink(dut, expected, zc, info_groups, delay_reads=True)
+            base_graph = 0
+            output_bits = get_codeword_bits(zc, base_graph)
+            await ldpc_sink(
+                dut, expected, zc, info_groups,
+                expected_input_bits=zc * info_groups,
+                expected_output_bits=output_bits,
+                expected_base_graph=base_graph,
+                delay_reads=True
+            )
             
     driver_task = cocotb.start_soon(continuous_axis_driver())
     sink_task = cocotb.start_soon(delayed_sink())
@@ -221,12 +262,21 @@ async def test_randomized_zc_5gnr(dut):
     for _ in range(5):
         zc = get_5gnr_zc()
         info_groups = random.randint(2, 8)
+        base_graph = random.choice([0, 1])
+        output_bits = get_codeword_bits(zc, base_graph)
         
         dut._log.info(f"Testing randomized 5G NR Zc: {zc} with {info_groups} Info Groups")
         axis_words, expected, total_bits = generate_test_data(zc, info_groups)
         
-        driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits))
-        sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+        driver_task = cocotb.start_soon(axis_master(dut, axis_words, zc, total_bits, output_bits, base_graph))
+        sink_task = cocotb.start_soon(
+            ldpc_sink(
+                dut, expected, zc, info_groups,
+                expected_input_bits=total_bits,
+                expected_output_bits=output_bits,
+                expected_base_graph=base_graph
+            )
+        )
         
         await driver_task
         await sink_task
@@ -235,10 +285,12 @@ async def test_randomized_zc_5gnr(dut):
 # Changing inputs during a transaction
 # ==============================================================================
 
-async def axis_master_mutating_config(dut, data_words, original_zc, total_bits):
+async def axis_master_mutating_config(dut, data_words, original_zc, total_bits, original_output_bits, base_graph):
     """Drives the AXI Stream while mutating config midway to test register latching."""
     dut.lifting_size_i.value = original_zc
     dut.input_bits_i.value = total_bits
+    dut.output_bits_i.value = original_output_bits
+    dut.base_graph_i.value = base_graph
     
     idx = 0
     while idx < len(data_words):
@@ -255,6 +307,8 @@ async def axis_master_mutating_config(dut, data_words, original_zc, total_bits):
                 dut._log.info(f"Mutating inputs mid-transaction! Zc: {original_zc} -> {fake_zc}")
                 dut.lifting_size_i.value = fake_zc
                 dut.input_bits_i.value = 9999 # Chaos value
+                dut.output_bits_i.value = 12345
+                dut.base_graph_i.value = 1 - base_graph
                 
     dut.s_axis_tvalid.value = 0
     await RisingEdge(dut.clk_i)
@@ -268,10 +322,21 @@ async def test_config_change_during_transaction(dut):
     zc = 112
     info_groups = 6
     axis_words, expected, total_bits = generate_test_data(zc, info_groups)
+    base_graph = 0
+    output_bits = get_codeword_bits(zc, base_graph)
     
     # Drive with the mutating master, but the sink still validates against the ORIGINAL expected
-    driver_task = cocotb.start_soon(axis_master_mutating_config(dut, axis_words, zc, total_bits))
-    sink_task = cocotb.start_soon(ldpc_sink(dut, expected, zc, info_groups))
+    driver_task = cocotb.start_soon(
+        axis_master_mutating_config(dut, axis_words, zc, total_bits, output_bits, base_graph)
+    )
+    sink_task = cocotb.start_soon(
+        ldpc_sink(
+            dut, expected, zc, info_groups,
+            expected_input_bits=total_bits,
+            expected_output_bits=output_bits,
+            expected_base_graph=base_graph
+        )
+    )
     
     await driver_task
     await sink_task
@@ -282,7 +347,15 @@ async def test_config_change_during_transaction(dut):
 # Buggy LDPC Core (Dropped/Glitchy Clear Signal)
 # ==============================================================================
 
-async def ldpc_sink_buggy_clear(dut, expected_data, zc, info_groups):
+async def ldpc_sink_buggy_clear(
+    dut,
+    expected_data,
+    zc,
+    info_groups,
+    expected_input_bits,
+    expected_output_bits,
+    expected_base_graph
+):
     """Monitors ldpc_valid_o but simulates a buggy clear signal with 1-cycle latency reads."""
     await RisingEdge(dut.clk_i)
     
@@ -291,12 +364,17 @@ async def ldpc_sink_buggy_clear(dut, expected_data, zc, info_groups):
         
     actual_data = []
     for group in range(info_groups):
-        dut.info_group_i.value = group
+        assert dut.lifting_size_o.value.to_unsigned() == zc, "lifting_size_o does not match latched config"
+        assert dut.input_bits_o.value.to_unsigned() == expected_input_bits, "input_bits_o does not match latched config"
+        assert dut.output_bits_o.value.to_unsigned() == expected_output_bits, "output_bits_o does not match latched config"
+        assert int(dut.base_graph_o.value) == expected_base_graph, "base_graph_o does not match latched config"
+
+        dut.info_group_sel_i.value = group
         await RisingEdge(dut.clk_i) 
         await FallingEdge(dut.clk_i) # Safe sample point
         
         # FIX: Replaced deprecated .integer with .to_unsigned()
-        raw_output = dut.data_batch_o.value.to_unsigned()
+        raw_output = dut.info_group_o.value.to_unsigned()
         extracted_val = raw_output & ((1 << ZC_MAX) - 1) 
         extracted_val = extracted_val & ((1 << zc) - 1)
         actual_data.append(extracted_val)
@@ -335,14 +413,17 @@ async def test_buggy_ldpc_clear(dut):
     
     async def driver():
         for axis_words, _, total_bits in blocks:
-            # Wait for clear input before pushing next to avoid standard backpressure locking
-            dut.lifting_size_i.value = zc
-            dut.input_bits_i.value = total_bits
-            await axis_master(dut, axis_words, zc, total_bits)
+            base_graph = 0
+            output_bits = get_codeword_bits(zc, base_graph)
+            await axis_master(dut, axis_words, zc, total_bits, output_bits, base_graph)
             
     async def sink():
-        for _, expected, _ in blocks:
-            await ldpc_sink_buggy_clear(dut, expected, zc, info_groups)
+        for _, expected, total_bits in blocks:
+            base_graph = 0
+            output_bits = get_codeword_bits(zc, base_graph)
+            await ldpc_sink_buggy_clear(
+                dut, expected, zc, info_groups, total_bits, output_bits, base_graph
+            )
             
     await cocotb.start_soon(driver())
     await sink()
@@ -366,11 +447,22 @@ async def test_bg1_bg2_sweep(dut):
     
     # BG1 Sweep
     zc_bg1 = 128
+    bg1 = 0
+    output_bits_bg1 = get_codeword_bits(zc_bg1, bg1)
     dut._log.info(f"Starting BG1 sweep: Zc={zc_bg1}, Info Groups={KB_BG1}")
     axis_words_1, expected_1, total_bits_1 = generate_test_data(zc_bg1, KB_BG1)
     
-    driver_task_1 = cocotb.start_soon(axis_master(dut, axis_words_1, zc_bg1, total_bits_1))
-    sink_task_1 = cocotb.start_soon(ldpc_sink(dut, expected_1, zc_bg1, KB_BG1))
+    driver_task_1 = cocotb.start_soon(
+        axis_master(dut, axis_words_1, zc_bg1, total_bits_1, output_bits_bg1, bg1)
+    )
+    sink_task_1 = cocotb.start_soon(
+        ldpc_sink(
+            dut, expected_1, zc_bg1, KB_BG1,
+            expected_input_bits=total_bits_1,
+            expected_output_bits=output_bits_bg1,
+            expected_base_graph=bg1
+        )
+    )
     
     await driver_task_1
     await sink_task_1
@@ -380,11 +472,22 @@ async def test_bg1_bg2_sweep(dut):
     
     # BG2 Sweep
     zc_bg2 = 256
+    bg2 = 1
+    output_bits_bg2 = get_codeword_bits(zc_bg2, bg2)
     dut._log.info(f"Starting BG2 sweep: Zc={zc_bg2}, Info Groups={KB_BG2}")
     axis_words_2, expected_2, total_bits_2 = generate_test_data(zc_bg2, KB_BG2)
     
-    driver_task_2 = cocotb.start_soon(axis_master(dut, axis_words_2, zc_bg2, total_bits_2))
-    sink_task_2 = cocotb.start_soon(ldpc_sink(dut, expected_2, zc_bg2, KB_BG2))
+    driver_task_2 = cocotb.start_soon(
+        axis_master(dut, axis_words_2, zc_bg2, total_bits_2, output_bits_bg2, bg2)
+    )
+    sink_task_2 = cocotb.start_soon(
+        ldpc_sink(
+            dut, expected_2, zc_bg2, KB_BG2,
+            expected_input_bits=total_bits_2,
+            expected_output_bits=output_bits_bg2,
+            expected_base_graph=bg2
+        )
+    )
     
     await driver_task_2
     await sink_task_2
@@ -413,9 +516,9 @@ async def test_ping_pong_stall_and_resume(dut):
     async def overzealous_driver():
         for i, (axis_words, _, total_bits) in enumerate(blocks):
             dut._log.info(f"AXI Master: Attempting to send Block {i}")
-            dut.lifting_size_i.value = zc
-            dut.input_bits_i.value = total_bits
-            await axis_master(dut, axis_words, zc, total_bits)
+            base_graph = i % 2
+            output_bits = get_codeword_bits(zc, base_graph)
+            await axis_master(dut, axis_words, zc, total_bits, output_bits, base_graph)
             dut._log.info(f"AXI Master: Finished sending Block {i}")
 
     async def deliberate_sink():
@@ -435,8 +538,13 @@ async def test_ping_pong_stall_and_resume(dut):
         dut._log.info("LDPC Sink: Sustained stall verified. Consuming RAM 0 to free up space...")
         
         # 2. Read Block 0 (RAM 0). This clears RAM 0.
-        _, expected_0, _ = blocks[0]
-        await ldpc_sink(dut, expected_0, zc, info_groups)
+        _, expected_0, total_bits_0 = blocks[0]
+        await ldpc_sink(
+            dut, expected_0, zc, info_groups,
+            expected_input_bits=total_bits_0,
+            expected_output_bits=get_codeword_bits(zc, 0),
+            expected_base_graph=0
+        )
         
         # Verify that the stall is broken and AXI resumes writing Block 2
         # We check over a 10-cycle window because tready drops momentarily during W_UNPACK
@@ -451,13 +559,23 @@ async def test_ping_pong_stall_and_resume(dut):
         
         # 3. Read Block 1 (RAM 1).
         dut._log.info("LDPC Sink: Consuming RAM 1...")
-        _, expected_1, _ = blocks[1]
-        await ldpc_sink(dut, expected_1, zc, info_groups)
+        _, expected_1, total_bits_1 = blocks[1]
+        await ldpc_sink(
+            dut, expected_1, zc, info_groups,
+            expected_input_bits=total_bits_1,
+            expected_output_bits=get_codeword_bits(zc, 1),
+            expected_base_graph=1
+        )
         
         # 4. Read Block 2 (from the newly re-written RAM 0)
         dut._log.info("LDPC Sink: Consuming Block 2 (reused RAM)...")
-        _, expected_2, _ = blocks[2]
-        await ldpc_sink(dut, expected_2, zc, info_groups)
+        _, expected_2, total_bits_2 = blocks[2]
+        await ldpc_sink(
+            dut, expected_2, zc, info_groups,
+            expected_input_bits=total_bits_2,
+            expected_output_bits=get_codeword_bits(zc, 0),
+            expected_base_graph=0
+        )
         
         dut._log.info("LDPC Sink: All blocks processed seamlessly!")
 

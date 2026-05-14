@@ -16,7 +16,7 @@ Unlike the hardcoded schedule optimized via Genetic Algorithm in the paper, this
 | **Flexible Cyclic Shifter (CS)** | `top_level_shifter.sv` | Implements the shifting network. Sub-modules require scrutiny during evaluation due to coding style. |
 | **GF(2) Sum** | `gf2_sum.sv` | XOR summation network for λ vector calculation. |
 | **Merge / Select λ** | `merge_sel_lambda.sv` | Arranges λ vectors for core parity bit calculation. |
-| **Calculate core parity bits** | `core_parity_bit_calculator.sv` | Calculates the initial core parity bits ($p_{c,1}$ through $p_{c,4}$). Note: `parity_core_calc.sv` is deprecated. |
+| **Calculate core parity bits** | `core_parity_bit_calculator.sv` | Calculates the initial core parity bits ($p_{c,1}$ through $p_{c,4}$). |
 | **Output code word generator** | `codeword_generator.sv` | Collects information and parity bits for output. |
 | **Output Buffer** | `output_buffer.sv` | Instantiated in `ldpc_encoder.sv`. |
 

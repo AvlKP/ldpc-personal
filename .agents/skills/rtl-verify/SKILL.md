@@ -1,5 +1,5 @@
 ---
-name: modern-verification-methodologies
+name: rtl-verify
 description: Orchestrates and generates modern verification testbenches for SystemVerilog RTL. Use when the user asks to "write a testbench", "setup a UVM environment", "create a cocotb simulation", "run formal verification", or "configure Verilator".
 ---
 

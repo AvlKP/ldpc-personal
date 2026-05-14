@@ -29,17 +29,25 @@ module input_buffer #(
   // a valid input is available for read
   output logic ldpc_valid_o,
 
+  // FROM CONFIG REG
   // store in inner register local to each RAM
   // change upon first AXIS handshake after counter >= input_bits_i
   input logic [ZC_WIDTH-1:0] lifting_size_i,
   // store in inner register
   // change upon first AXIS handshake after counter >= input_bits_i
   input logic [15:0] input_bits_i, 
+  input logic [15:0] output_bits_i,
+  input logic base_graph_i,
+
+  // PASS TO CORE
+  output logic [ZC_WIDTH-1:0] lifting_size_o,
+  output logic [15:0] input_bits_o, 
+  output logic [15:0] output_bits_o,
+  output logic base_graph_o,
 
   // store in inner register
   // change upon LDPC inner handshake
   input logic [KB_WIDTH-1:0] info_group_sel_i,
-  output logic [ZC_WIDTH-1:0] lifting_size_o,
   output logic [ZC_MAX-1:0] info_group_o
 );
 
@@ -51,7 +59,10 @@ logic [ACCUM_SIZE-1:0] accum_data_q;
 logic [ACCUM_WIDTH-1:0] accum_count_q;
 
 logic [1:0] ram_full_q;
+logic ram_bg_q [0:1];
 logic [ZC_WIDTH-1:0] ram_zc_q [0:1];
+logic [15:0] ram_input_bits_q [0:1];
+logic [15:0] ram_output_bits_q [0:1];
 
 logic w_swap_q;
 logic [ZC_MAX-1:0] w_mask, w_data;
@@ -73,24 +84,27 @@ w_state_t w_state_n, w_state_q;
 logic axis_handshake;
 assign axis_handshake = s_axis_tready & s_axis_tvalid;
 
-// FSM
-logic tran_en, accum_to_ram_en, stall_en; 
-logic tran_init, tran_done;
+// --------------------------------------------------------
+// Optimized Output Control Logic (Decoupled from w_state_n)
+// --------------------------------------------------------
+assign tran_en         = axis_handshake; 
+assign accum_to_ram_en = (accum_count_q >= ram_zc_q[w_swap_q]);
 
-assign tran_en = (w_state_n == W_PACK);
-assign accum_to_ram_en = (w_state_n == W_UNPACK);
+assign tran_init       = (w_state_q == W_IDLE) & axis_handshake;
+assign tran_done       = ((w_state_q == W_PACK) | (w_state_q == W_UNPACK)) 
+                       & (accum_count_q < ram_zc_q[w_swap_q]) 
+                       & (w_cnt_q >= w_limit_q);
 
-assign tran_init = (w_state_n == W_PACK & w_state_q == W_IDLE);
-assign tran_done = (((w_state_q == W_UNPACK) | (w_state_q == W_PACK))
-                  & w_state_n == W_IDLE);
+assign stall_en        = (ram_full_q == 2'b11);
 
-assign stall_en = (ram_full_q == 2'b11);
-// cannot use w_state_n because some of their paths depend on axis_handshake
-// resulting in combinational loop
-assign s_axis_tready = (w_cnt_q < w_limit_q)
-                      & (accum_count_q < ram_zc_q[w_swap_q])
-                      & ~stall_en;
+// s_axis_tready cleanly defines when the module can accept data
+assign s_axis_tready   = (w_cnt_q < w_limit_q)
+                       & (accum_count_q < ram_zc_q[w_swap_q])
+                       & ~stall_en;
 
+// --------------------------------------------------------
+// FSM State Transition Logic
+// --------------------------------------------------------
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
     w_state_q <= W_IDLE;
@@ -100,24 +114,31 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
 end
 
 always_comb begin
-  case (w_state_q)
+  // Use unique case for optimal LUT synthesis and latch prevention
+  unique case (w_state_q)
     W_IDLE:
       if (axis_handshake) w_state_n = W_PACK;
-      else w_state_n = W_IDLE;
+      else                w_state_n = W_IDLE;
+      
     W_PACK: 
       if (accum_count_q >= ram_zc_q[w_swap_q]) w_state_n = W_UNPACK;
-      else if (w_cnt_q >= w_limit_q) w_state_n = W_IDLE;
-      else if (axis_handshake) w_state_n = W_PACK;
-      else w_state_n = W_STALL;
+      else if (w_cnt_q >= w_limit_q)           w_state_n = W_IDLE;
+      else if (axis_handshake)                 w_state_n = W_PACK;
+      else                                     w_state_n = W_STALL;
+      
     W_UNPACK:
       if (accum_count_q >= ram_zc_q[w_swap_q]) w_state_n = W_UNPACK;
-      else if (w_cnt_q >= w_limit_q) w_state_n = W_IDLE;
-      else if (axis_handshake) w_state_n = W_PACK;
-      else w_state_n = W_STALL;
+      else if (w_cnt_q >= w_limit_q)           w_state_n = W_IDLE;
+      else if (axis_handshake)                 w_state_n = W_PACK;
+      else                                     w_state_n = W_STALL;
+      
     W_STALL:
       if (axis_handshake) w_state_n = W_PACK;
-      else w_state_n = W_STALL;
-    default: w_state_n = W_STALL;
+      else                w_state_n = W_STALL;
+      
+    default: 
+      // Safe state recovery pattern
+      w_state_n = W_IDLE; 
   endcase
 end
 
@@ -127,15 +148,30 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : ram_control
     w_limit_q <= '1;
 
     ram_full_q <= 2'b00;
-    ram_zc_q[0] <= '1;
-    ram_zc_q[1] <= '1;
+
+    for (int unsigned i = 0; i < 2; i++) begin
+      ram_zc_q[i] <= '1;
+      ram_bg_q[i] <= 0;
+      ram_input_bits_q[i] <= 0;
+      ram_output_bits_q[i] <= 0;
+    end
 
     w_swap_q <= 0;
     r_swap_q <= 0;
   end else begin
     for (int unsigned i = 0; i < 2; i++) begin
-      if (ldpc_clear_i & (r_swap_q == i)) ram_zc_q[i] <= '1;
-      else if (tran_init & (w_swap_q == i)) ram_zc_q[i] <= lifting_size_i;
+      if (ldpc_clear_i & (r_swap_q == i)) begin
+        ram_zc_q[i] <= '1;
+        ram_bg_q[i] <= 0;
+        ram_input_bits_q[i] <= 0;
+        ram_output_bits_q[i] <= 0;
+      end 
+      else if (tran_init & (w_swap_q == i)) begin
+        ram_zc_q[i] <= lifting_size_i;
+        ram_bg_q[i] <= base_graph_i;
+        ram_input_bits_q[i] <= input_bits_i;
+        ram_output_bits_q[i] <= output_bits_i;
+      end 
 
       if (ldpc_clear_i & (r_swap_q == i)) ram_full_q[i] <= 0;
       else if (tran_done & (w_swap_q == i)) ram_full_q[i] <= 1; 
@@ -222,6 +258,9 @@ always_ff @(posedge clk_i) begin : out_selector
   if (!arst_ni) begin
     info_group_o <= '0;
     lifting_size_o <= '0;
+    input_bits_o <= '0;
+    output_bits_o <= '0;
+    base_graph_o <= 0;
   end else begin
     // case (out_sel)
     //   2'b00: begin
@@ -241,6 +280,9 @@ always_ff @(posedge clk_i) begin : out_selector
     // endcase
     info_group_o <= r_data[r_swap_q];
     lifting_size_o <= ram_zc_q[r_swap_q];
+    input_bits_o <= ram_input_bits_q[r_swap_q];
+    output_bits_o <= ram_output_bits_q[r_swap_q];
+    base_graph_o <= ram_bg_q[r_swap_q];
   end
 end
 
