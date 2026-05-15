@@ -135,7 +135,7 @@ assign idle_o = (state_q == IDLE);
 // so ...
 logic pc_to_pc, lambda_to_pc;
 
-assign lambda_to_pc = row_cnt_n >= ROW_WIDTH'(3'd4);
+assign lambda_to_pc = row_cnt_q > 2'(zc_group);
 assign pc_to_pc = pc_state_cnt_q < 2'(zc_group);
 
 always_ff @(posedge clk_i or negedge arst_ni) begin
