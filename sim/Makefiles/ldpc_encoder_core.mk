@@ -12,7 +12,6 @@ LDPC_TOP_SRCS := \
 	$(RTL_DIR)/gf2_sum.sv \
 	$(RTL_DIR)/group_reordering.sv \
 	$(RTL_DIR)/input_buffer.sv \
-	$(RTL_DIR)/input_sel.sv \
 	$(RTL_DIR)/ldpc_encoder.sv \
 	$(RTL_DIR)/ldpc_encoder_core.sv \
 	$(RTL_DIR)/lutram.sv \

@@ -1,20 +1,18 @@
-`timescale 1ns / 1ps
-
 module output_buffer #(
     parameter int ZC_MAX     = 384,
-    parameter int ADDR_WIDTH = 5   // 5 bits supports up to 32 depth (32 * 1536 = 49,152 bits)
+    parameter int ADDR_WIDTH = 7   // 7 bits = 128 depth (128 * 384 = 49,152 bits)
 )(
     input  logic                        clk,
     input  logic                        rst_n,
 
-    // Interface from codeword_generator
-    input  logic [(ZC_MAX << 2)-1:0]    wr_data_i,
+    // Interface from codeword_generator (Now matches native 384-bit datapath)
+    input  logic [ZC_MAX-1:0]           wr_data_i,
     input  logic [ADDR_WIDTH-1:0]       wr_addr_i,
     input  logic                        wr_en_i,
     
     // Control Interface
-    input  logic                        cw_done_i,       // Triggers the stream-out process
-    input  logic [10:0]                 total_words_i,   // Total 32-bit words to stream out for this codeword
+    input  logic                        cw_done_i,       
+    input  logic [10:0]                 total_words_i,   
     output logic                        outbuff_full_o,
     
     // AXI-Stream Interface
@@ -24,8 +22,8 @@ module output_buffer #(
     input  logic                        m_axis_tready
 );
 
-    localparam int ROW_WIDTH = ZC_MAX << 2; // 1536 bits
-    localparam int WORDS_PER_ROW = ROW_WIDTH / 32; // 48 words
+    localparam int ROW_WIDTH = ZC_MAX;             // 384 bits
+    localparam int WORDS_PER_ROW = ROW_WIDTH / 32; // 12 words
     localparam int MUX_IDX_WIDTH = $clog2(WORDS_PER_ROW);
 
     // -------------------------------------------------------------------------
@@ -41,11 +39,8 @@ module output_buffer #(
     // -------------------------------------------------------------------------
     (* ram_style = "distributed" *) logic [ROW_WIDTH-1:0] mem [(1<<ADDR_WIDTH)-1:0];
 
-    // Synchronous Write
     always_ff @(posedge clk) begin
-        if (wr_en_i) begin
-            mem[wr_addr_i] <= wr_data_i;
-        end
+        if (wr_en_i) mem[wr_addr_i] <= wr_data_i;
     end
 
     // -------------------------------------------------------------------------
@@ -67,13 +62,9 @@ module output_buffer #(
     logic                   internal_tvalid;
     logic                   internal_tready; 
 
-    // Asynchronous Read from LUTRAM
     assign current_row = mem[rd_addr];
 
-    // Combinational Payload Generation
     assign internal_payload.tdata = current_row[word_idx * 32 +: 32];
-    
-    // TLAST is asserted when the currently evaluated word is the final word of the stream
     assign internal_payload.tlast = (words_streamed + 1'b1 == total_words_i);
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -101,7 +92,6 @@ module output_buffer #(
                 end
 
                 STREAMING: begin
-                    // Advance only if the downstream spill register accepts the data
                     if (internal_tready && internal_tvalid) begin
                         words_streamed <= words_streamed + 1'b1;
 
@@ -113,7 +103,6 @@ module output_buffer #(
                         else begin
                             internal_tvalid <= 1'b1; 
                             
-                            // Advance chunk/row pointers
                             if (word_idx + 1'b1 == WORDS_PER_ROW) begin
                                 word_idx <= '0;
                                 rd_addr  <= rd_addr + 1'b1;
@@ -146,7 +135,6 @@ module output_buffer #(
         .data_o  (m_axis_payload)
     );
 
-    // Unpack the payload at the top-level boundary
     assign m_axis_tdata = m_axis_payload.tdata;
     assign m_axis_tlast = m_axis_payload.tlast;
 

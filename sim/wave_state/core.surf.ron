@@ -152,7 +152,7 @@
                 (
                     item_ref: (139),
                     level: 0,
-                    unfolded: false,
+                    unfolded: true,
                     selected: false,
                 ),
                 (
@@ -330,6 +330,12 @@
                     selected: false,
                 ),
                 (
+                    item_ref: (296),
+                    level: 1,
+                    unfolded: true,
+                    selected: false,
+                ),
+                (
                     item_ref: (256),
                     level: 1,
                     unfolded: true,
@@ -410,7 +416,7 @@
                 (
                     item_ref: (271),
                     level: 1,
-                    unfolded: true,
+                    unfolded: false,
                     selected: false,
                 ),
                 (
@@ -440,7 +446,7 @@
                 (
                     item_ref: (156),
                     level: 0,
-                    unfolded: true,
+                    unfolded: false,
                     selected: false,
                 ),
                 (
@@ -518,7 +524,7 @@
                 (
                     item_ref: (175),
                     level: 0,
-                    unfolded: true,
+                    unfolded: false,
                     selected: false,
                 ),
                 (
@@ -768,12 +774,6 @@
                     selected: false,
                 ),
                 (
-                    item_ref: (294),
-                    level: 0,
-                    unfolded: true,
-                    selected: false,
-                ),
-                (
                     item_ref: (295),
                     level: 0,
                     unfolded: true,
@@ -782,12 +782,6 @@
             ],
         ),
         displayed_items: {
-            (294): Marker((
-                color: None,
-                background_color: None,
-                name: None,
-                idx: 0,
-            )),
             (111): Variable((
                 variable_ref: (
                     path: (
@@ -3280,6 +3274,12 @@
                 height_scaling_factor: None,
                 analog: None,
             )),
+            (296): Marker((
+                color: None,
+                background_color: None,
+                name: None,
+                idx: 0,
+            )),
             (173): Variable((
                 variable_ref: (
                     path: (
@@ -3434,11 +3434,11 @@
                 analog: None,
             )),
         },
-        display_item_ref_counter: 295,
+        display_item_ref_counter: 296,
         viewports: [
             (
-                curr_left: (-0.2),
-                curr_right: (1.2),
+                curr_left: (0.007930751223478947),
+                curr_right: (0.008550408050198372),
                 target_left: (-0.2),
                 target_right: (1.2),
                 move_start_left: (-0.2),
@@ -3448,20 +3448,20 @@
             ),
         ],
         cursor: Some((1, [
-            6274296,
+            2150000,
         ])),
         markers: {
             1: (1, [
                 1685346,
             ]),
             0: (1, [
-                6280386,
+                2148272,
             ]),
         },
-        focused_item: None,
+        focused_item: Some((30)),
         focused_transaction: (None, None),
         default_variable_name_type: Unique,
-        scroll_offset: 0.0,
+        scroll_offset: 32.0,
         display_variable_indices: true,
         graphics: {},
     )),

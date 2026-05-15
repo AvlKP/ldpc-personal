@@ -151,8 +151,8 @@ logic [10:0] core_word_cnt;
 
 logic outbuff_full;
 logic outbuff_wr_en;
-logic [4:0] outbuff_addr;
-logic [(ZC_MAX << 2)-1:0] outbuff_data;
+logic [6:0] outbuff_addr;
+logic [ZC_MAX-1:0] outbuff_data;
 
 // ==== AXI Stream input ====
 input_buffer input_buffer (
@@ -178,7 +178,7 @@ input_buffer input_buffer (
 // ==== AXI Stream output ====
 output_buffer #(
   .ZC_MAX    (ZC_MAX /* default 384 */),
-  .ADDR_WIDTH(5 /* default 5 */)
+  .ADDR_WIDTH(7)
  ) output_buffer (
   .clk           (clk_i),
   .rst_n         (arst_ni),

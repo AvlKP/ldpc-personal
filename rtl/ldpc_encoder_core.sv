@@ -31,9 +31,9 @@ module ldpc_encoder_core #(
   input logic [ZC_MAX-1:0] info_group_i,
 
   input logic outbuff_full_i,
-  output logic [4:0] outbuff_addr_o,
+  output logic [6:0] outbuff_addr_o,
   output logic outbuff_wr_en_o,
-  output logic [(ZC_MAX << 2)-1:0] outbuff_data_o,
+  output logic [ZC_MAX-1:0] outbuff_data_o,
   output logic cw_done_o, // Pulses on final write
   output logic [10:0] total_words_o // Passed to buffer for AXI TLAST
 );
@@ -268,6 +268,7 @@ logic [1:0] merge_d_cycle;
 logic [IDX_WIDTH-1:0] merge_row_idx;
 assign merge_row_idx = IDX_WIDTH'(row_cnt_q);
 
+// TODO: make sequential based on calc_pc state counter
 always_comb begin
   case (zc_group)
     // make unused case calculate the same thing for res efficiency
@@ -289,6 +290,9 @@ merge_select_lambda #(
 );
 
 logic [3:0][ZC_MAX-1:0] parity_core;
+logic [3:0][(ZC_MAX >> 2)-1:0] parity_additional;
+
+assign parity_additional = row_sum;
 
 always_comb begin
   cpb_en = '0;
@@ -348,25 +352,63 @@ always_comb begin
   end
 end
 
-logic parity_core_valid_q, parity_additional_valid_q;
-logic [3:0][ZC_MAX-1:0] parity_additional;
+logic [ZC_MAX-1:0] parity_core_packed, parity_additional_packed;
+logic parity_core_valid, parity_additional_valid;
 logic info_valid;
 
-assign parity_additional = lambda;
-assign info_valid = (state_q == CALC_LAMBDA);
-always_ff @(posedge clk_i or negedge arst_ni) begin
-  if (!arst_ni) begin
-    parity_core_valid_q <= 0;
-    parity_additional_valid_q <= 0;
-  end else begin
-    parity_core_valid_q <= (state_q == CALC_PC) & rowgrp_changed_qdly;
-    parity_additional_valid_q <= (state_q == CALC_PA) & rowgrp_changed_qdly;
-  end
+always_comb begin
+  case (zc_group)
+    ZC_SMALL: for (int unsigned i = 0; i < 4; i++) begin
+      parity_core_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
+        parity_core[i][(ZC_MAX >> 2)-1:0];
+      
+      parity_additional_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
+        parity_additional[i][(ZC_MAX >> 2)-1:0];
+    end
+    ZC_MEDIUM: for (int unsigned i = 0; i < 2; i++) begin
+      parity_core_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] =
+        parity_core[2*merge_row_idx[i]+1][(ZC_MAX >> 1)-1:0];
+
+      parity_additional_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] = 
+        {parity_additional[2*i+1][(ZC_MAX >> 2)-1:0],
+         parity_additional[2*i][(ZC_MAX >> 2)-1:0]};
+    end
+    ZC_LARGE: begin
+      parity_core_packed = parity_core[merge_row_idx];
+
+      parity_additional_packed =
+        {parity_additional[3], 
+        parity_additional[2],
+        parity_additional[1],
+        parity_additional[0]};
+    end
+    default: begin
+      parity_core_packed = '0;
+      parity_additional_packed = '0;
+    end
+  endcase
 end
+// logic [3:0][ZC_MAX-1:0] parity_additional;
+// logic parity_core_valid_q, parity_additional_valid_q;
+
+// assign parity_additional = lambda;
+assign info_valid = (state_q == CALC_LAMBDA);
+assign parity_core_valid = (state_q == CALC_PC);
+assign parity_additional_valid = (state_q == CALC_PA) & rowgrp_changed_qdly;
+
+// always_ff @(posedge clk_i or negedge arst_ni) begin
+//   if (!arst_ni) begin
+//     parity_core_valid_q <= 0;
+//     parity_additional_valid_q <= 0;
+//   end else begin
+//     parity_core_valid_q <= (state_q == CALC_PC) & rowgrp_changed_qdly;
+//     parity_additional_valid_q <= (state_q == CALC_PA) & rowgrp_changed_qdly;
+//   end
+// end
 
 codeword_generator #(
   .ZC_MAX    (ZC_MAX /* default 384 */),
-  .ADDR_WIDTH(5 /* default 5 */)
+  .ADDR_WIDTH(7 /* default 7 */)
  ) codeword_generator (
   .clk                      (clk_i),
   .rst_n                    (arst_ni),
@@ -376,10 +418,10 @@ codeword_generator #(
   .info_valid_i             (info_valid),
   .kb_max_i                 (kb_max),
   .curr_col_i               (col_curr_q),
-  .parity_core_i            (parity_core),
-  .parity_core_valid_i      (parity_core_valid_q),
-  .parity_additional_i      (parity_additional),
-  .parity_additional_valid_i(parity_additional_valid_q),
+  .parity_core_i            (parity_core_packed),
+  .parity_core_valid_i      (parity_core_valid),
+  .parity_additional_i      (parity_additional_packed),
+  .parity_additional_valid_i(parity_additional_valid),
   .parity_groups_i          (zc_group),
   .outbuff_full_i           (outbuff_full_i),
   .core_stall_o             (stall_en),
@@ -389,5 +431,31 @@ codeword_generator #(
   .cw_done_o                (cw_done_o),
   .total_words_o            (total_words_o)
 );
+
+// codeword_generator #(
+//   .ZC_MAX    (ZC_MAX /* default 384 */),
+//   .ADDR_WIDTH(5 /* default 5 */)
+//  ) codeword_generator (
+//   .clk                      (clk_i),
+//   .rst_n                    (arst_ni),
+//   .expected_cw_bits_i       (output_bits_i),
+//   .zc_i                     (lifting_size_i),
+//   .info_group_i             (info_group_i),
+//   .info_valid_i             (info_valid),
+//   .kb_max_i                 (kb_max),
+//   .curr_col_i               (col_curr_q),
+//   .parity_core_i            (parity_core),
+//   .parity_core_valid_i      (parity_core_valid_q),
+//   .parity_additional_i      (parity_additional),
+//   .parity_additional_valid_i(parity_additional_valid_q),
+//   .parity_groups_i          (zc_group),
+//   .outbuff_full_i           (outbuff_full_i),
+//   .core_stall_o             (stall_en),
+//   .outbuff_data_o           (outbuff_data_o),
+//   .outbuff_addr_o           (outbuff_addr_o),
+//   .outbuff_wr_en_o          (outbuff_wr_en_o),
+//   .cw_done_o                (cw_done_o),
+//   .total_words_o            (total_words_o)
+// );
 
 endmodule
