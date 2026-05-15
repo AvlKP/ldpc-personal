@@ -1,10 +1,10 @@
 # Implementation Plan: Golden Algorithmic Model
 
-## Phase 1: Foundation and CSR Parsing
+## Phase 1: Foundation and CSR Parsing [checkpoint: cbb8a90]
 - [x] Task: Set up the Python module structure (e.g., `sim/golden_model.py`). 3d61d01
 - [x] Task: Implement the logic to read and parse the CSR `.mem` files from `rtl/mem/`. 22ffbca
 - [x] Task: Write unit tests to verify the CSR parsing logic accurately reflects the matrices. 769c95a
-- [ ] Task: Conductor - User Manual Verification 'Phase 1: Foundation and CSR Parsing' (Protocol in workflow.md)
+- [x] Task: Conductor - User Manual Verification 'Phase 1: Foundation and CSR Parsing' (Protocol in workflow.md) cbb8a90
 
 ## Phase 2: Core Algorithm Implementation & Validation
 - [ ] Task: Implement the core encoding algorithm based on the Petrović et al. (2021) architecture.
