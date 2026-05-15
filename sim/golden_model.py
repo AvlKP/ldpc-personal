@@ -8,6 +8,8 @@ class LdpcEncoderGoldenModel:
         self.values = []
         self.values_sets = {}
         self.hooks = {}
+        self._row_to_ptr_index_bg1 = {}
+        self._row_to_ptr_index_bg2 = {}
 
     def _read_hex_file(self, filepath):
         """Reads a hex memory file and returns a list of integers."""
@@ -40,6 +42,7 @@ class LdpcEncoderGoldenModel:
         col_indices_path = os.path.join(mem_dir, 'col_indices.mem')
         row_ptr_path = os.path.join(mem_dir, 'row_ptr.mem')
         values_path = os.path.join(mem_dir, 'values.mem')
+        row_schedule_path = os.path.join(mem_dir, 'row_schedule.mem')
 
         if not (os.path.exists(col_indices_path) and os.path.exists(row_ptr_path) and os.path.exists(values_path)):
             raise FileNotFoundError(f"Missing CSR memory files in {mem_dir}")
@@ -53,29 +56,64 @@ class LdpcEncoderGoldenModel:
             if os.path.exists(val_path):
                 self.values_sets[i] = self._read_hex_file(val_path)
 
+        self._row_to_ptr_index_bg1 = {}
+        self._row_to_ptr_index_bg2 = {}
+
+        # Load optimized schedule from .mem file
+        if os.path.exists(row_schedule_path):
+            sched_data = self._read_hex_file(row_schedule_path)
+            
+            # BG1 has 46 rows.
+            bg1_sched = sched_data[:46]
+            for idx, actual_row in enumerate(bg1_sched):
+                self._row_to_ptr_index_bg1[actual_row] = idx
+                
+            # BG2 has 42 rows, follows immediately after BG1 in the schedule file.
+            bg2_sched = sched_data[46:46+42]
+            
+            # BUG FIX: row_ptr is word-aligned/padded. BG1 is padded to 48.
+            # So BG2's chronological indices start at offset 48 in the unpacked row_ptr array.
+            bg2_ptr_offset = 48
+            
+            for idx, actual_row in enumerate(bg2_sched):
+                self._row_to_ptr_index_bg2[actual_row] = idx + bg2_ptr_offset
+        else:
+            print(f"Warning: {row_schedule_path} not found. Falling back to identity mapping.")
+
+
     def _get_shift_value(self, z_idx, csr_idx, Z):
-        """Gets the shift value for a given Z index and CSR element."""
         val = self.values_sets[z_idx][csr_idx]
         return val % Z
 
+    def _get_matrix_shift(self, bg_idx, z_idx, Z, target_row, target_col):
+        """Dynamically retrieves the shift value for a specific row and column from the CSR matrix."""
+        if bg_idx == 1 and self._row_to_ptr_index_bg1 and target_row in self._row_to_ptr_index_bg1:
+            ptr_idx = self._row_to_ptr_index_bg1[target_row]
+        elif bg_idx == 2 and self._row_to_ptr_index_bg2 and target_row in self._row_to_ptr_index_bg2:
+            ptr_idx = self._row_to_ptr_index_bg2[target_row]
+        else:
+            ptr_idx = target_row
+
+        start_idx = self.row_ptr[ptr_idx]
+        end_idx = self.row_ptr[ptr_idx+1] if (ptr_idx+1) < len(self.row_ptr) else len(self.col_indices)
+
+        for csr_idx in range(start_idx, end_idx):
+            if self.col_indices[csr_idx] == target_col:
+                return self._get_shift_value(z_idx, csr_idx, Z)
+        return -1 # Represents an empty/null connection
+
     def _circ_shift(self, vec, shift):
-        """Circularly shifts a vector to the right by `shift` places."""
         if shift == 0:
             return vec
-        return vec[-shift:] + vec[:-shift]
+        return vec[shift:] + vec[:shift]
 
     def _xor_vecs(self, v1, v2):
-        """Element-wise XOR of two vectors."""
         return [a ^ b for a, b in zip(v1, v2)]
 
     def encode(self, input_bits, Z, bg_idx=1):
-        """
-        Encodes the input bits using the 5G NR LDPC algorithm.
-        input_bits: list of ints (0 or 1)
-        Z: lifting size
-        bg_idx: Base graph index (1 or 2).
-        Returns: The encoded parity bits as a list of ints.
-        """
+        if not self.row_ptr:
+            raise RuntimeError("CSR memory arrays are empty. Call load_csr_data().")
+
         self.hooks = {'shifted_vectors': [], 'lambdas': [], 'p_groups': []}
         kb = 22 if bg_idx == 1 else 10
         mb = 46 if bg_idx == 1 else 42
@@ -88,79 +126,98 @@ class LdpcEncoderGoldenModel:
         z_idx_map = {2: 0, 3: 1, 5: 2, 7: 3, 9: 4, 11: 5, 13: 6, 15: 7}
         z_idx = z_idx_map[a]
         
-        # Group input into kb groups of size Z
         i_groups = [input_bits[i*Z:(i+1)*Z] for i in range(kb)]
-        
-        # Array to store parity groups (mb groups of size Z)
         p_groups = [[0]*Z for _ in range(mb)]
-        
-        # Calculate lambda_1 to lambda_4 (first 4 rows)
         lambdas = [[0]*Z for _ in range(4)]
         
+        # 1. Calculate lambdas (first 4 rows)
         for r in range(4):
-            start_idx = self.row_ptr[r]
-            end_idx = self.row_ptr[r+1] if (r+1) < len(self.row_ptr) else len(self.col_indices)
-            
+            if bg_idx == 1 and self._row_to_ptr_index_bg1 and r in self._row_to_ptr_index_bg1:
+                ptr_idx = self._row_to_ptr_index_bg1[r]
+            elif bg_idx == 2 and self._row_to_ptr_index_bg2 and r in self._row_to_ptr_index_bg2:
+                ptr_idx = self._row_to_ptr_index_bg2[r]
+            else:
+                ptr_idx = r
+
+            start_idx = self.row_ptr[ptr_idx]
+            end_idx = self.row_ptr[ptr_idx+1] if (ptr_idx+1) < len(self.row_ptr) else len(self.col_indices)
+
             for csr_idx in range(start_idx, end_idx):
                 col = self.col_indices[csr_idx]
-                if col < kb: # Only consider information bits for lambdas
+                if col < kb:
                     shift = self._get_shift_value(z_idx, csr_idx, Z)
                     shifted_vec = self._circ_shift(i_groups[col], shift)
                     lambdas[r] = self._xor_vecs(lambdas[r], shifted_vec)
-                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'vec': shifted_vec})
+                    
         self.hooks['lambdas'] = [l.copy() for l in lambdas]
                     
-        # Core parity bit calculation
-        # p_c1 = sum(lambda_1 ... lambda_4) (shifted left by 1 since it's shifted right by 1 in PCM)
-        p_c1_shifted = lambdas[0]
+        # 2. Core parity bit calculation
+        sum_lambdas = lambdas[0]
         for i in range(1, 4):
-            p_c1_shifted = self._xor_vecs(p_c1_shifted, lambdas[i])
+            sum_lambdas = self._xor_vecs(sum_lambdas, lambdas[i])
             
-        p_c1 = self._circ_shift(p_c1_shifted, Z - 1) # Shift back (left by 1 = right by Z-1)
+        # Corrected P_A and P_B shifts statically from 3GPP TS 38.212
+        if bg_idx == 1:
+            # Extracted directly from bg1.csv (Row 0 Col 22, Row 1 Col 22)
+            pa_shifts = [1, 1, 1, 1, 1, 1, 0, 1] 
+            pb_shifts = [0, 0, 0, 0, 0, 0, 105, 0]
+        else:
+            # Extracted directly from bg2.csv (Row 0 Col 10, Row 2 Col 10)
+            pa_shifts = [0, 0, 0, 1, 0, 0, 0, 1]
+            pb_shifts = [1, 1, 1, 0, 1, 1, 1, 0]
+            
+        pa_shift = pa_shifts[z_idx]
+        pb_shift = pb_shifts[z_idx]
+            
+        # P_B^-1 * sum_lambdas translates to shifting left by (Z - pb_shift) 
+        p_c1 = self._circ_shift(sum_lambdas, (Z - pb_shift) % Z)
         p_groups[0] = p_c1
+
+        # P_A * p_c1
+        pa_pc1 = self._circ_shift(p_c1, pa_shift)
         
-        # p_c2, p_c3, p_c4
-        p_groups[1] = self._xor_vecs(lambdas[0], p_c1)
+        # Resolve p_c2, p_c3, p_c4 using algebraic relations
+        p_groups[1] = self._xor_vecs(lambdas[0], pa_pc1) # p_c2
         
         if bg_idx == 1:
-            p_groups[3] = self._xor_vecs(lambdas[3], p_c1)
-            p_groups[2] = self._xor_vecs(lambdas[2], p_groups[3])
+            p_groups[3] = self._xor_vecs(lambdas[3], pa_pc1) # p_c4
+            p_groups[2] = self._xor_vecs(lambdas[2], p_groups[3]) # p_c3
         else: # BG2
-            p_groups[2] = self._xor_vecs(lambdas[1], p_groups[1])
-            p_groups[3] = self._xor_vecs(lambdas[3], p_c1)
+            p_groups[3] = self._xor_vecs(lambdas[3], pa_pc1) # p_c4
+            p_groups[2] = self._xor_vecs(lambdas[1], p_groups[1]) # p_c3
 
-        # Calculate remaining parity bits (additional parity bits)
-        # For row r >= 4: p_r = sum(shifted information bits) + sum(shifted core parity bits)
+        # 3. Calculate remaining parity bits (r >= 4)
         for r in range(4, mb):
-            start_idx = self.row_ptr[r]
-            end_idx = self.row_ptr[r+1] if (r+1) < len(self.row_ptr) else len(self.col_indices)
-            
+            if bg_idx == 1 and self._row_to_ptr_index_bg1 and r in self._row_to_ptr_index_bg1:
+                ptr_idx = self._row_to_ptr_index_bg1[r]
+            elif bg_idx == 2 and self._row_to_ptr_index_bg2 and r in self._row_to_ptr_index_bg2:
+                ptr_idx = self._row_to_ptr_index_bg2[r]
+            else:
+                ptr_idx = r
+
+            start_idx = self.row_ptr[ptr_idx]
+            end_idx = self.row_ptr[ptr_idx+1] if (ptr_idx+1) < len(self.row_ptr) else len(self.col_indices)
+
             p_r = [0]*Z
             for csr_idx in range(start_idx, end_idx):
                 col = self.col_indices[csr_idx]
                 shift = self._get_shift_value(z_idx, csr_idx, Z)
-                
+
                 if col < kb:
-                    # Information bit
                     shifted_vec = self._circ_shift(i_groups[col], shift)
                     p_r = self._xor_vecs(p_r, shifted_vec)
-                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'vec': shifted_vec})
                 elif col < kb + 4:
-                    # Core parity bit
+                    # Note: These columns ARE present in the CSR for rows >= 4
                     c_idx = col - kb
                     shifted_vec = self._circ_shift(p_groups[c_idx], shift)
                     p_r = self._xor_vecs(p_r, shifted_vec)
-                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'vec': shifted_vec})
-                # Note: Parity bit from identity matrix part is the parity bit itself, we are solving for it.
             
             p_groups[r] = p_r
             
         self.hooks['p_groups'] = [g.copy() for g in p_groups]
         
-        # Flatten parity groups
         parity_bits = []
         for g in p_groups:
             parity_bits.extend(g)
             
         return parity_bits
-

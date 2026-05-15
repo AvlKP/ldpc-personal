@@ -1,9 +1,5 @@
 import ldpc_pkg::*;
 
-// TODO:
-// 1. output buffer should be written according to zc_group, not once per row group no matter zc_group
-// 2. transition from IDLE to LAMBDA should not happen before input buffer clears the data
-
 module ldpc_encoder_core #(
   // Top-level parameters mirroring the sub-modules
   parameter int ZC_PER_CS = 96,
@@ -117,9 +113,6 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
 end
 
 // TODO: optimize this (new state?)
-// assign csr_start = ((rowgrp_changed_q & row_cnt_n < row_limit) 
-//                 | ((state_q == IDLE) & inbuff_valid_i))
-//                 & ~inbuff_clear_o;
 logic csr_start_init, csr_start_calc;
 
 assign csr_start_init = (state_q == IDLE) 
@@ -185,6 +178,7 @@ logic [3:0][ZC_WIDTH-1:0] permutation_q, permutation_qdly;
 logic [COL_WIDTH-1:0] col_curr_q;
 logic [3:0] gf2_en_q, gf2_en_qdly;
 logic [NUM_CS-1:0] cs_pc_sel_q, cs_pc_sel_qdly;
+logic [3:0][ROW_WIDTH-1:0] actual_row_q;
 logic csr_ready;
 
 assign csr_ready = ~rowgrp_changed_q;
@@ -224,6 +218,7 @@ csr_decoder csr_decoder (
   .row_i         (row_cnt_csr),
   .permutation_o (permutation_q),
   .gf2_en_o      (gf2_en_q),
+  .actual_row_o  (actual_row_q),
   .col_curr_o    (col_curr_q),
   .parity_core_col_o (cs_pc_sel_q),
   .rowgrp_changed_o  (rowgrp_changed_q)
@@ -388,23 +383,10 @@ always_comb begin
     end
   endcase
 end
-// logic [3:0][ZC_MAX-1:0] parity_additional;
-// logic parity_core_valid_q, parity_additional_valid_q;
 
-// assign parity_additional = lambda;
 assign info_valid = (state_q == CALC_LAMBDA);
 assign parity_core_valid = (state_q == CALC_PC);
 assign parity_additional_valid = (state_q == CALC_PA) & rowgrp_changed_qdly;
-
-// always_ff @(posedge clk_i or negedge arst_ni) begin
-//   if (!arst_ni) begin
-//     parity_core_valid_q <= 0;
-//     parity_additional_valid_q <= 0;
-//   end else begin
-//     parity_core_valid_q <= (state_q == CALC_PC) & rowgrp_changed_qdly;
-//     parity_additional_valid_q <= (state_q == CALC_PA) & rowgrp_changed_qdly;
-//   end
-// end
 
 codeword_generator #(
   .ZC_MAX    (ZC_MAX /* default 384 */),
@@ -431,31 +413,4 @@ codeword_generator #(
   .cw_done_o                (cw_done_o),
   .total_words_o            (total_words_o)
 );
-
-// codeword_generator #(
-//   .ZC_MAX    (ZC_MAX /* default 384 */),
-//   .ADDR_WIDTH(5 /* default 5 */)
-//  ) codeword_generator (
-//   .clk                      (clk_i),
-//   .rst_n                    (arst_ni),
-//   .expected_cw_bits_i       (output_bits_i),
-//   .zc_i                     (lifting_size_i),
-//   .info_group_i             (info_group_i),
-//   .info_valid_i             (info_valid),
-//   .kb_max_i                 (kb_max),
-//   .curr_col_i               (col_curr_q),
-//   .parity_core_i            (parity_core),
-//   .parity_core_valid_i      (parity_core_valid_q),
-//   .parity_additional_i      (parity_additional),
-//   .parity_additional_valid_i(parity_additional_valid_q),
-//   .parity_groups_i          (zc_group),
-//   .outbuff_full_i           (outbuff_full_i),
-//   .core_stall_o             (stall_en),
-//   .outbuff_data_o           (outbuff_data_o),
-//   .outbuff_addr_o           (outbuff_addr_o),
-//   .outbuff_wr_en_o          (outbuff_wr_en_o),
-//   .cw_done_o                (cw_done_o),
-//   .total_words_o            (total_words_o)
-// );
-
 endmodule
