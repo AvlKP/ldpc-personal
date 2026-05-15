@@ -1,0 +1,8 @@
+{
+  "track_id": "golden_model_20260515",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-05-15T00:00:00Z",
+  "updated_at": "2026-05-15T00:00:00Z",
+  "description": "Make a golden algorithmic model - Use @doc/Petrović et al. - 2021 - Flexible 5G New Radio LDPC Encoder Optimized for High Hardware Usage Efficiency.pdf for the algorithm - Add the Compressed Sparse Row (CSR) novelty to the model - It does not need to be cycle accurate. It is only used to compare results of each step against RTL for correctness - Make sure the algorithm is correct"
+}
