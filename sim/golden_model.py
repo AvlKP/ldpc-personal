@@ -61,21 +61,21 @@ class LdpcEncoderGoldenModel:
 
         # Load optimized schedule from .mem file
         if os.path.exists(row_schedule_path):
-            sched_data = self._read_hex_file(row_schedule_path)
+            # UPDATE: Use the 4-per-word unpacker since schedule now mimics row_ptr format
+            sched_data = self._read_row_ptr_file(row_schedule_path)
             
-            # BG1 has 46 rows.
+            # BG1 has 46 valid rows, padded to 48.
             bg1_sched = sched_data[:46]
             for idx, actual_row in enumerate(bg1_sched):
                 self._row_to_ptr_index_bg1[actual_row] = idx
                 
-            # BG2 has 42 rows, follows immediately after BG1 in the schedule file.
-            bg2_sched = sched_data[46:46+42]
-            
-            # BUG FIX: row_ptr is word-aligned/padded. BG1 is padded to 48.
-            # So BG2's chronological indices start at offset 48 in the unpacked row_ptr array.
+            # BG2 has 42 valid rows, padded to 44.
+            # UPDATE: Because BG1 schedule is padded to 48, BG2's schedule list starts at index 48
             bg2_ptr_offset = 48
+            bg2_sched = sched_data[bg2_ptr_offset : bg2_ptr_offset + 42]
             
             for idx, actual_row in enumerate(bg2_sched):
+                # We map the actual row to the chronological fetch index in the padded row_ptr array
                 self._row_to_ptr_index_bg2[actual_row] = idx + bg2_ptr_offset
         else:
             print(f"Warning: {row_schedule_path} not found. Falling back to identity mapping.")
@@ -110,7 +110,16 @@ class LdpcEncoderGoldenModel:
     def _xor_vecs(self, v1, v2):
         return [a ^ b for a, b in zip(v1, v2)]
 
-    def encode(self, input_bits, Z, bg_idx=1):
+    def encode(self, input_bits, Z, bg_idx=1, version='3gpp'):
+        """
+        Encodes the input bits using the 5G NR LDPC algorithm.
+        
+        Args:
+            input_bits: List of ints (0 or 1).
+            Z: Lifting size.
+            bg_idx: Base graph index (1 or 2).
+            version: '3gpp' for strict TS 38.212 compliance, or 'petrovic' for textbook abstract shifts.
+        """
         if not self.row_ptr:
             raise RuntimeError("CSR memory arrays are empty. Call load_csr_data().")
 
@@ -156,23 +165,29 @@ class LdpcEncoderGoldenModel:
         for i in range(1, 4):
             sum_lambdas = self._xor_vecs(sum_lambdas, lambdas[i])
             
-        # Corrected P_A and P_B shifts statically from 3GPP TS 38.212
-        if bg_idx == 1:
-            # Extracted directly from bg1.csv (Row 0 Col 22, Row 1 Col 22)
-            pa_shifts = [1, 1, 1, 1, 1, 1, 0, 1] 
-            pb_shifts = [0, 0, 0, 0, 0, 0, 105, 0]
-        else:
-            # Extracted directly from bg2.csv (Row 0 Col 10, Row 2 Col 10)
-            pa_shifts = [0, 0, 0, 1, 0, 0, 0, 1]
-            pb_shifts = [1, 1, 1, 0, 1, 1, 1, 0]
+        # Determine P_A and P_B shifts based on the requested version architecture
+        if version == '3gpp':
+            if bg_idx == 1:
+                pa_shifts = [1, 1, 1, 1, 1, 1, 0, 1] 
+                pb_shifts = [0, 0, 0, 0, 0, 0, 105, 0]
+            else:
+                pa_shifts = [0, 0, 0, 1, 0, 0, 0, 1]
+                pb_shifts = [1, 1, 1, 0, 1, 1, 1, 0]
+                
+            pa_shift = pa_shifts[z_idx]
+            pb_shift = pb_shifts[z_idx]
             
-        pa_shift = pa_shifts[z_idx]
-        pb_shift = pb_shifts[z_idx]
+        elif version == 'petrovic':
+            # Textbook/Abstract architecture shifts (assumes standard WiMAX-like core matrices)
+            pa_shift = 0
+            pb_shift = 1
+        else:
+            raise ValueError("version must be either '3gpp' or 'petrovic'")
             
         # P_B^-1 * sum_lambdas translates to shifting left by (Z - pb_shift) 
         p_c1 = self._circ_shift(sum_lambdas, (Z - pb_shift) % Z)
         p_groups[0] = p_c1
-
+        
         # P_A * p_c1
         pa_pc1 = self._circ_shift(p_c1, pa_shift)
         

@@ -22,7 +22,8 @@ module csr_decoder #(
   output logic [3:0] gf2_en_o, // alternative to above's indicator
   output logic [3:0] parity_core_col_o,
   output logic [COL_WIDTH-1:0] col_curr_o, // current column index being processed
-  output logic rowgrp_changed_o // flags that a row group change has occured
+  output logic rowgrp_changed_o, // flags that a row group change has occured
+  output logic [3:0][ROW_WIDTH-1:0] actual_row_o
 );
 
 typedef enum logic { 
@@ -37,6 +38,7 @@ typedef struct packed {
   logic [COL_WIDTH-1:0] col_curr;
   logic [3:0] parity_core_col;
   logic [3:0] gf2_en;
+  logic [3:0][ROW_WIDTH-1:0] actual_row;
   logic [3:0][ZC_WIDTH-1:0] permutation;
 } ldpc_packet_t;
 
@@ -56,6 +58,7 @@ logic rowgrp_changed_n, rowgrp_changed_q;
 logic [COL_WIDTH-1:0] col_curr_n, col_curr_q;
 logic [3:0] parity_core_col_q;
 logic [3:0] gf2_en_q;
+logic [3:0][ROW_WIDTH-1:0] actual_row_q;
 logic [3:0][ZC_WIDTH-1:0] permutation;
 
 ldpc_packet_t ldpc_packet_i, ldpc_packet_o; 
@@ -63,6 +66,7 @@ assign ldpc_packet_i = '{
   col_curr: col_curr_q,
   parity_core_col: parity_core_col_q,
   gf2_en: gf2_en_q,
+  actual_row: actual_row_q,
   permutation: permutation
 };
 
@@ -84,6 +88,7 @@ fall_through_register #(
 assign col_curr_o = ldpc_packet_o.col_curr;
 assign parity_core_col_o = ldpc_packet_o.parity_core_col;
 assign gf2_en_o = ldpc_packet_o.gf2_en;
+assign actual_row_o = ldpc_packet_o.actual_row;
 assign permutation_o = ldpc_packet_o.permutation;
 
 assign rowgrp_changed_o = rowgrp_changed_q;
@@ -333,16 +338,31 @@ generate
   end
 endgenerate
 
+// Actual Row ROM for codeword generation order
+logic [3:0][ROW_WIDTH-1:0] actual_row_n;
+
+lutrom #(
+  .WORD_WIDTH(4*ROW_WIDTH),
+  .SIZE      (RPW_SIZE+1),
+  .NUM_PORTS (1),
+  .MEM_INIT  ("mem/row_schedule.mem")
+) row_rom (
+  .addr_i({rowgrp_base}),
+  .dout_o({>>{actual_row_n}})
+);
+
 // output registers
 always_ff @(posedge clk_i or negedge arst_ni) begin : output_ff
   if (!arst_ni) begin
     col_curr_q <= '0;
     gf2_en_q <= '0; 
     parity_core_col_q <= '0;
+    actual_row_q <= '0;
   end else if (!(state_q == VALID & ~ldpc_handshake)) begin
     col_curr_q <= col_curr_n;
     gf2_en_q <= row_en;
     parity_core_col_q <= is_parity_core_col;
+    actual_row_q <= actual_row_n;
   end
 end
 

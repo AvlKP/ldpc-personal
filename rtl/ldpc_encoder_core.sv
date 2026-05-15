@@ -51,8 +51,8 @@ always_comb begin
             data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)];            
     ZC_MEDIUM: for (int unsigned j = 0; j < 2; j++)
             {data_segment[j*2+1], data_segment[j*2]} = info_group_i[0 +: (ZC_MAX >> 1)];
-    ZC_LARGE: {data_segment} <= info_group_i;
-    default: {data_segment} <= '0;
+    ZC_LARGE: {data_segment} = info_group_i;
+    default: {data_segment} = '0;
     endcase  
 end
   
@@ -84,10 +84,10 @@ logic [1:0] pc_state_cnt_q;
 // TODO: check if this needs guarding when certain states
 always_comb begin
   case (zc_group)
-    ZC_SMALL: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 0);
-    ZC_MEDIUM: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 1);
-    ZC_LARGE: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 2);
-    default: row_cnt_n <= row_cnt_q;
+    ZC_SMALL: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 0);
+    ZC_MEDIUM: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 1);
+    ZC_LARGE: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 2);
+    default: row_cnt_n = row_cnt_q;
   endcase  
 end
 
@@ -149,23 +149,23 @@ always_comb begin
     IDLE:
       if (inbuff_valid_i & ~inbuff_clear_o 
         & ~outbuff_full_i & csr_valid_q)
-          state_n <= CALC_LAMBDA; // start
-      else state_n <= IDLE;
+          state_n = CALC_LAMBDA; // start
+      else state_n = IDLE;
     CALC_LAMBDA:
       if (lambda_to_pc)
-          state_n <= CALC_PC;
-      else state_n <= CALC_LAMBDA;
+          state_n = CALC_PC;
+      else state_n = CALC_LAMBDA;
     CALC_PC: 
       if (pc_to_pc)
-        state_n <= CALC_PC;
-      else state_n <= CALC_PA;
+        state_n = CALC_PC;
+      else state_n = CALC_PA;
     CALC_PA:
       // csr decoder will assert rowgrp_changed_q at +1 cycle after last permutation
       // last pa will be available by then
       if (row_cnt_n >= row_limit & rowgrp_changed_q) 
-        state_n <= IDLE;
-      else state_n <= CALC_PA;
-    default: state_n <= CALC_PA;
+        state_n = IDLE;
+      else state_n = CALC_PA;
+    default: state_n = CALC_PA;
     endcase
 end
 
@@ -353,21 +353,26 @@ logic info_valid;
 
 always_comb begin
   case (zc_group)
-    ZC_SMALL: for (int unsigned i = 0; i < 4; i++) begin
-      parity_core_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
-        parity_core[i][(ZC_MAX >> 2)-1:0];
-      
-      parity_additional_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
-        parity_additional[i][(ZC_MAX >> 2)-1:0];
+    ZC_SMALL: begin
+      for (int unsigned i = 0; i < 4; i++) begin
+        parity_core_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
+          parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
+        
+        parity_additional_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
+          parity_additional[i][(ZC_MAX >> 2)-1:0];
+      end
     end
-    ZC_MEDIUM: for (int unsigned i = 0; i < 2; i++) begin
-      parity_core_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] =
-        parity_core[2*merge_row_idx[i]+1][(ZC_MAX >> 1)-1:0];
+    
+    ZC_MEDIUM: begin
+      for (int unsigned i = 0; i < 2; i++) begin
+        parity_core_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] =
+          parity_core[merge_row_idx + i][ZC_MAX-1 -: (ZC_MAX >> 1)];
 
-      parity_additional_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] = 
-        {parity_additional[2*i+1][(ZC_MAX >> 2)-1:0],
-         parity_additional[2*i][(ZC_MAX >> 2)-1:0]};
-    end
+        parity_additional_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] = 
+          {parity_additional[2*i+1][(ZC_MAX >> 2)-1:0],
+          parity_additional[2*i][(ZC_MAX >> 2)-1:0]};
+      end
+    end 
     ZC_LARGE: begin
       parity_core_packed = parity_core[merge_row_idx];
 

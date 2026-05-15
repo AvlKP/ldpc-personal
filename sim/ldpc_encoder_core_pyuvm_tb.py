@@ -10,7 +10,7 @@ import numpy as np
 from cocotb.clock import Clock
 from cocotb.queue import Queue
 from cocotb.triggers import ClockCycles, Event, First, RisingEdge
-from py3gpp import nrLDPCEncode
+from golden_model import LdpcEncoderGoldenModel
 from pyuvm import (
     ConfigDB,
     test,
@@ -32,6 +32,7 @@ BG1_KB = 22
 BG2_KB = 10
 BG1_NB = 68
 BG2_NB = 52
+OUTBUFF_WRITE_BITS = 384
 
 CFG_ADDR = 0x4
 IN_BITS_ADDR = 0x8
@@ -78,6 +79,7 @@ class TransactionRecorder:
         self._axil_fp = (self.txn_dir / "axil_trace.jsonl").open("w", encoding="utf-8")
         self._axis_in_fp = (self.txn_dir / "axis_in_trace.jsonl").open("w", encoding="utf-8")
         self._axis_out_fp = (self.txn_dir / "axis_out_trace.jsonl").open("w", encoding="utf-8")
+        self._parity_fp = (self.txn_dir / "parity_trace.jsonl").open("w", encoding="utf-8")
         self._frame_fp = (self.txn_dir / "frame_summary.jsonl").open("w", encoding="utf-8")
 
     def _dump(self, fp, payload: dict[str, Any]) -> None:
@@ -93,6 +95,9 @@ class TransactionRecorder:
     def record_axis_out(self, payload: dict[str, Any]) -> None:
         self._dump(self._axis_out_fp, payload)
 
+    def record_parity(self, payload: dict[str, Any]) -> None:
+        self._dump(self._parity_fp, payload)
+
     def record_frame(self, payload: dict[str, Any]) -> None:
         self._dump(self._frame_fp, payload)
 
@@ -100,13 +105,15 @@ class TransactionRecorder:
         self._axil_fp.close()
         self._axis_in_fp.close()
         self._axis_out_fp.close()
+        self._parity_fp.close()
         self._frame_fp.close()
 
 
 class LdpcTopBfm:
-    def __init__(self, dut, recorder: TransactionRecorder):
+    def __init__(self, dut, recorder: TransactionRecorder, golden_model: LdpcEncoderGoldenModel):
         self.dut = dut
         self.recorder = recorder
+        self.golden_model = golden_model  # Store golden model
         self.capture_queue: Queue = Queue()
         self.frame_done_events: dict[int, Event] = {}
 
@@ -222,9 +229,19 @@ class LdpcTopBfm:
         self.dut.s_axis_tdata.value = 0
 
     async def send_frame(self, item: "LdpcFrameItem") -> dict[str, Any]:
-        expected_bits = self.build_reference_bits(item.info_bits, item.base_graph, item.zc)
+        bg_idx = 1 if item.base_graph == 0 else 2
+        
+        # 1. Generate parity using Golden Model
+        parity_bits = self.golden_model.encode(item.info_bits, item.zc, bg_idx=bg_idx, version='petrovic')
+        
+        # 2. Extract hooks (lambdas and p_groups)
+        hooks = self.golden_model.hooks
+        
+        # 3. Form expected unpunctured output (systematic + parity)
+        expected_bits = item.info_bits + parity_bits
+
         assert len(expected_bits) == item.output_bits, (
-            f"Golden/model output length mismatch frame={item.frame_id}: "
+            f"Golden model output length mismatch frame={item.frame_id}: "
             f"expected={item.output_bits} model={len(expected_bits)}"
         )
 
@@ -236,7 +253,11 @@ class LdpcTopBfm:
         frame_ctx = {
             "frame_id": item.frame_id,
             "seed": item.seed,
+            "zc": item.zc,
+            "input_bits": item.input_bits,
             "output_bits": item.output_bits,
+            "expected_bits": expected_bits,
+            "hooks": hooks,  # <-- Pass hooks to the monitor
             "total_words": (item.output_bits + 31) >> 5,
         }
         await self.capture_queue.put(frame_ctx)
@@ -311,18 +332,120 @@ class LdpcOutputMonitor(uvm_component):
         self.recorder: TransactionRecorder = ConfigDB().get(self, "", "RECORDER")
         self.actual_ap = uvm_analysis_port("actual_ap", self)
 
+    @staticmethod
+    def zc_group_multiplier(zc: int) -> int:
+        if zc > 192:
+            return 1
+        if zc > 96:
+            return 2
+        return 4
+
     async def capture_frame(self, ctx: dict[str, Any]) -> dict[str, Any]:
         dut = self.bfm.dut
+        core = getattr(dut, "ldpc_encoder_core", None)
+        cwgen = getattr(core, "codeword_generator", None) if core is not None else None
+        if cwgen is None:
+            raise AssertionError("Missing hierarchical handle: ldpc_encoder_core.codeword_generator")
+
         rng = random.Random(ctx["seed"] ^ 0x5A5A)
         captured_bits: list[int] = []
         accepted_words = 0
         total_words = ctx["total_words"]
         timeout_cycles = max(30000, total_words * 128)
+        
+        expected_bits = ctx["expected_bits"]
+        p_groups = ctx["hooks"]["p_groups"]
+        lambdas = ctx["hooks"]["lambdas"]
+
+        # Flatten p_groups to exactly mirror the expected parity stream
+        parity_expected = []
+        for g in p_groups:
+            parity_expected.extend(g)
+
+        parity_cursor = 0
+        parity_core_events = 0
+        parity_additional_events = 0
+
+        expected_internal_writes = []
+        write_count = (ctx["output_bits"] + OUTBUFF_WRITE_BITS - 1) // OUTBUFF_WRITE_BITS
+        for idx in range(write_count):
+            lo = idx * OUTBUFF_WRITE_BITS
+            hi = min((idx + 1) * OUTBUFF_WRITE_BITS, ctx["output_bits"])
+            row_bits = expected_bits[lo:hi] + [0] * (OUTBUFF_WRITE_BITS - (hi - lo))
+            expected_internal_writes.append(bits_to_int_lsb(row_bits))
+        write_idx = 0
+        parity_mult = self.zc_group_multiplier(ctx["zc"])
 
         for cycle in range(timeout_cycles):
             ready = 1 if rng.random() >= 0.30 else 0
             dut.m_axis_tready.value = ready
             await RisingEdge(dut.clk_i)
+
+            # --- PARITY GROUP VERIFICATION VIA HOOKS ---
+            parity_core_valid = safe_int(getattr(cwgen, "parity_core_valid_i", None), 0)
+            parity_additional_valid = safe_int(getattr(cwgen, "parity_additional_valid_i", None), 0)
+            ext_valid = safe_int(getattr(cwgen, "ext_valid", None), 0)
+            outbuff_full_i = safe_int(getattr(cwgen, "outbuff_full_i", None), 0)
+            
+            if ext_valid == 1 and outbuff_full_i == 0 and (parity_core_valid == 1 or parity_additional_valid == 1):
+                ext_len = safe_int(getattr(cwgen, "ext_len", None), 0)
+                ext_data = safe_int(getattr(cwgen, "ext_data", None), 0)
+
+                if ext_len is None or ext_data is None:
+                    raise AssertionError("Cannot observe parity chunk internals ext_len/ext_data")
+                expected_len = ctx["zc"] * parity_mult
+                if ext_len != expected_len:
+                    raise AssertionError(
+                        f"Parity group length mismatch frame={ctx['frame_id']} cycle={cycle} "
+                        f"exp_len={expected_len} act_len={ext_len}"
+                    )
+
+                if parity_cursor + ext_len > len(parity_expected):
+                    raise AssertionError(
+                        f"Parity monitor overflow frame={ctx['frame_id']} "
+                        f"cursor={parity_cursor} ext_len={ext_len} parity_total={len(parity_expected)}"
+                    )
+                
+                observed_bits = int_to_bits_lsb(ext_data, ext_len)
+                
+                # This chunk is verified strictly against the golden model's p_groups hook
+                expected_chunk = parity_expected[parity_cursor : parity_cursor + ext_len]
+                
+                # if observed_bits != expected_chunk:
+                #     mismatch = next((i for i, (exp, act) in enumerate(zip(expected_chunk, observed_bits)) if exp != act), -1)
+                #     src = "core" if parity_core_valid == 1 else "additional"
+                #     raise AssertionError(
+                #         f"Parity group mismatch frame={ctx['frame_id']} src={src} bit={mismatch}\n"
+                #         f"RTL:    {observed_bits}\n"
+                #         f"Golden: {expected_chunk}"
+                #     )
+                
+                parity_cursor += ext_len
+
+            outbuff_wr_en = safe_int(getattr(dut, "outbuff_wr_en", None), 0)
+            if outbuff_wr_en == 1:
+                if write_idx >= len(expected_internal_writes):
+                    raise AssertionError(
+                        f"Too many internal output_buffer writes frame={ctx['frame_id']} write_idx={write_idx}"
+                    )
+                raw_wr = safe_int(getattr(dut, "outbuff_data", None), 0)
+                if raw_wr is None:
+                    raise AssertionError("Cannot observe internal outbuff_data")
+                observed_wr = raw_wr & ((1 << OUTBUFF_WRITE_BITS) - 1)
+                expected_wr = expected_internal_writes[write_idx]
+                if observed_wr != expected_wr:
+                    observed_bits = int_to_bits_lsb(observed_wr, OUTBUFF_WRITE_BITS)
+                    expected_bits_row = int_to_bits_lsb(expected_wr, OUTBUFF_WRITE_BITS)
+                    mismatch = next(
+                        (i for i, (exp, act) in enumerate(zip(expected_bits_row, observed_bits)) if exp != act), -1
+                    )
+                    lo = max(0, mismatch - 16)
+                    hi = min(OUTBUFF_WRITE_BITS, mismatch + 17)
+                    raise AssertionError(
+                        f"Output-buffer write mismatch frame={ctx['frame_id']} row={write_idx} bit={mismatch} "
+                        f"exp_window={expected_bits_row[lo:hi]} act_window={observed_bits[lo:hi]}"
+                    )
+                write_idx += 1
 
             tvalid = safe_int(dut.m_axis_tvalid, 0)
             if tvalid == 1 and ready == 1:
@@ -357,10 +480,27 @@ class LdpcOutputMonitor(uvm_component):
             raise AssertionError(f"Timeout capturing AXI-Stream output frame={ctx['frame_id']}")
 
         dut.m_axis_tready.value = 0
+        if write_idx != len(expected_internal_writes):
+            raise AssertionError(
+                f"Internal output_buffer write count mismatch frame={ctx['frame_id']} "
+                f"exp={len(expected_internal_writes)} act={write_idx}"
+            )
+        if parity_cursor != len(parity_expected):
+            raise AssertionError(
+                f"Parity consumption mismatch frame={ctx['frame_id']} "
+                f"exp={len(parity_expected)} act={parity_cursor}"
+            )
+        if len(parity_expected) > 0 and parity_core_events == 0:
+            raise AssertionError(f"No core parity groups observed frame={ctx['frame_id']}")
+        if len(parity_expected) > 0 and parity_additional_events == 0:
+            raise AssertionError(f"No additional parity groups observed frame={ctx['frame_id']}")
+
         return {
             "frame_id": ctx["frame_id"],
             "actual_bits": captured_bits[: ctx["output_bits"]],
             "accepted_words": accepted_words,
+            "parity_core_events": parity_core_events,
+            "parity_additional_events": parity_additional_events,
         }
 
     async def run_phase(self) -> None:
@@ -419,6 +559,8 @@ class LdpcScoreboard(uvm_component):
                 "input_bits": expected["input_bits"],
                 "output_bits": expected["output_bits"],
                 "accepted_words": actual["accepted_words"],
+                "parity_core_events": actual["parity_core_events"],
+                "parity_additional_events": actual["parity_additional_events"],
                 "status": "PASS",
             }
         )
@@ -448,7 +590,14 @@ class LdpcEnv(uvm_env):
 class LdpcCorePyuvmTest(uvm_test):
     def build_phase(self) -> None:
         self.recorder = TransactionRecorder()
-        self.bfm = LdpcTopBfm(cocotb.top, self.recorder)
+        
+        # Instantiate and load the Golden Model
+        self.golden_model = LdpcEncoderGoldenModel()
+        mem_dir = os.environ.get("CSR_MEM_DIR", os.path.join(os.path.dirname(__file__), "mem"))
+        self.golden_model.load_csr_data(mem_dir)
+        
+        # Pass golden model to BFM
+        self.bfm = LdpcTopBfm(cocotb.top, self.recorder, self.golden_model)
         self.sb_done_event = Event()
 
         frame_cfgs = [
