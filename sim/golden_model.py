@@ -6,6 +6,7 @@ class LdpcEncoderGoldenModel:
         self.col_indices = []
         self.row_ptr = []
         self.values = []
+        self.values_sets = {}
 
     def _read_hex_file(self, filepath):
         """Reads a hex memory file and returns a list of integers."""
@@ -15,6 +16,22 @@ class LdpcEncoderGoldenModel:
                 line = line.strip()
                 if line and not line.startswith('//'):
                     data.append(int(line, 16))
+        return data
+
+    def _read_row_ptr_file(self, filepath):
+        """Reads the row_ptr memory file which contains four 9-bit values packed into 36 bits per line."""
+        data = []
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('//'):
+                    val = int(line, 16)
+                    # Unpack 4x 9-bit values (LSB to MSB)
+                    v0 = val & 0x1FF
+                    v1 = (val >> 9) & 0x1FF
+                    v2 = (val >> 18) & 0x1FF
+                    v3 = (val >> 27) & 0x1FF
+                    data.extend([v0, v1, v2, v3])
         return data
 
     def load_csr_data(self, mem_dir):
@@ -27,5 +44,10 @@ class LdpcEncoderGoldenModel:
             raise FileNotFoundError(f"Missing CSR memory files in {mem_dir}")
 
         self.col_indices = self._read_hex_file(col_indices_path)
-        self.row_ptr = self._read_hex_file(row_ptr_path)
+        self.row_ptr = self._read_row_ptr_file(row_ptr_path)
         self.values = self._read_hex_file(values_path)
+
+        for i in range(8):
+            val_path = os.path.join(mem_dir, f'values_{i}.mem')
+            if os.path.exists(val_path):
+                self.values_sets[i] = self._read_hex_file(val_path)
