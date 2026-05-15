@@ -7,6 +7,7 @@ class LdpcEncoderGoldenModel:
         self.row_ptr = []
         self.values = []
         self.values_sets = {}
+        self.hooks = {}
 
     def _read_hex_file(self, filepath):
         """Reads a hex memory file and returns a list of integers."""
@@ -75,6 +76,7 @@ class LdpcEncoderGoldenModel:
         bg_idx: Base graph index (1 or 2).
         Returns: The encoded parity bits as a list of ints.
         """
+        self.hooks = {'shifted_vectors': [], 'lambdas': [], 'p_groups': []}
         kb = 22 if bg_idx == 1 else 10
         mb = 46 if bg_idx == 1 else 42
         
@@ -105,6 +107,8 @@ class LdpcEncoderGoldenModel:
                     shift = self._get_shift_value(z_idx, csr_idx, Z)
                     shifted_vec = self._circ_shift(i_groups[col], shift)
                     lambdas[r] = self._xor_vecs(lambdas[r], shifted_vec)
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'vec': shifted_vec})
+        self.hooks['lambdas'] = [l.copy() for l in lambdas]
                     
         # Core parity bit calculation
         # p_c1 = sum(lambda_1 ... lambda_4) (shifted left by 1 since it's shifted right by 1 in PCM)
@@ -140,18 +144,23 @@ class LdpcEncoderGoldenModel:
                     # Information bit
                     shifted_vec = self._circ_shift(i_groups[col], shift)
                     p_r = self._xor_vecs(p_r, shifted_vec)
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'vec': shifted_vec})
                 elif col < kb + 4:
                     # Core parity bit
                     c_idx = col - kb
                     shifted_vec = self._circ_shift(p_groups[c_idx], shift)
                     p_r = self._xor_vecs(p_r, shifted_vec)
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'vec': shifted_vec})
                 # Note: Parity bit from identity matrix part is the parity bit itself, we are solving for it.
             
             p_groups[r] = p_r
             
+        self.hooks['p_groups'] = [g.copy() for g in p_groups]
+        
         # Flatten parity groups
         parity_bits = []
         for g in p_groups:
             parity_bits.extend(g)
             
         return parity_bits
+

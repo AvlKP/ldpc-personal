@@ -8,9 +8,6 @@ def test_core_encode():
     mem_dir = os.path.join(os.path.dirname(__file__), '..', 'rtl', 'mem')
     model.load_csr_data(mem_dir)
     
-    # We need to add the encode method to LdpcEncoderGoldenModel first
-    # So this test will initially fail.
-    
     # Let's say Z=4, BG=1
     Z = 4
     bg_idx = 1
@@ -22,3 +19,25 @@ def test_core_encode():
     encoded_data = model.encode(input_data, Z, bg_idx)
     
     assert encoded_data is not None
+    assert len(encoded_data) == (46 if bg_idx == 1 else 42) * Z
+
+def test_hooks():
+    """Test that intermediate data hooks are populated during encoding."""
+    model = LdpcEncoderGoldenModel()
+    mem_dir = os.path.join(os.path.dirname(__file__), '..', 'rtl', 'mem')
+    model.load_csr_data(mem_dir)
+    
+    Z = 4
+    bg_idx = 1
+    kb = 22
+    input_data = [1] * (kb * Z)
+    
+    model.encode(input_data, Z, bg_idx)
+    
+    assert 'shifted_vectors' in model.hooks
+    assert 'lambdas' in model.hooks
+    assert 'p_groups' in model.hooks
+    
+    assert len(model.hooks['shifted_vectors']) > 0
+    assert len(model.hooks['lambdas']) == 4
+    assert len(model.hooks['p_groups']) == 46
