@@ -27,9 +27,7 @@ module gf2_sum #(
             data_out_internal <= '0;
         end else begin
             if (clr) begin
-                for (int i = 0; i < NUM_CS; i++) begin
-                    data_out_internal[i] <= data_in_2d[i];
-                end
+                data_out_internal <= '0;
             end else begin
                 for (int i = 0; i < NUM_CS; i++) begin
                     if (en[i]) begin

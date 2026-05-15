@@ -20,7 +20,8 @@ module csr_decoder #(
 
   output logic [3:0][ZC_WIDTH-1:0] permutation_o, // will be -1 when col is unavailable
   output logic [3:0] gf2_en_o, // alternative to above's indicator
-  output logic [COL_WIDTH-1:0] col_curr_o, // current column index being prrocessed
+  output logic [3:0] parity_core_col_o,
+  output logic [COL_WIDTH-1:0] col_curr_o, // current column index being processed
   output logic rowgrp_changed_o // flags that a row group change has occured
 );
 
@@ -34,6 +35,7 @@ state_t state_q, next_state;
 // I/O stuff
 typedef struct packed {
   logic [COL_WIDTH-1:0] col_curr;
+  logic [3:0] parity_core_col;
   logic [3:0] gf2_en;
   logic [3:0][ZC_WIDTH-1:0] permutation;
 } ldpc_packet_t;
@@ -52,12 +54,14 @@ end
 
 logic rowgrp_changed_n, rowgrp_changed_q;
 logic [COL_WIDTH-1:0] col_curr_n, col_curr_q;
+logic [3:0] parity_core_col_q;
 logic [3:0] gf2_en_q;
 logic [3:0][ZC_WIDTH-1:0] permutation;
 
 ldpc_packet_t ldpc_packet_i, ldpc_packet_o; 
 assign ldpc_packet_i = '{
   col_curr: col_curr_q,
+  parity_core_col: parity_core_col_q,
   gf2_en: gf2_en_q,
   permutation: permutation
 };
@@ -78,6 +82,7 @@ fall_through_register #(
 );
 
 assign col_curr_o = ldpc_packet_o.col_curr;
+assign parity_core_col_o = ldpc_packet_o.parity_core_col;
 assign gf2_en_o = ldpc_packet_o.gf2_en;
 assign permutation_o = ldpc_packet_o.permutation;
 
@@ -159,20 +164,18 @@ logic [3:0][CSR_WIDTH-1:0] colval_addr_q, colval_addr_n;
 logic [3:0][COL_WIDTH-1:0] col_idx;
 
 logic [3:0] row_en;
+logic [3:0] is_parity_core_col;
+logic [3:0] is_valid_info_col;
 always_comb begin
-  if (rowgrp_base >= rowgrp_max) begin
-    row_en[3:2] = 2'b00;
-    for (int unsigned i = 0; i < 2; i++) begin
-      // enable when it is current col or a core parity bit
-      row_en[i] = ((col_idx[i] <= kb_max & col_curr_n == col_idx[i]) 
-                | (col_idx[i] > kb_max & ~row_changed[i]));
-    end
-  end else begin
-    for (int unsigned i = 0; i < 4; i++) begin
-      row_en[i] = ((col_idx[i] <= kb_max & col_curr_n == col_idx[i]) 
-                | (col_idx[i] > kb_max & ~row_changed[i]));
-    end
+  for (int unsigned i = 0; i < 4; i++) begin
+    is_parity_core_col[i] = (col_idx[i] > kb_max & ~row_changed[i]);
+    is_valid_info_col[i] = (col_idx[i] <= kb_max & col_curr_n == col_idx[i]); 
+
+    row_en[i] = is_parity_core_col[i] | is_valid_info_col[i];
   end
+
+  // ignore out of bounds value when reaching memory ends
+  if (rowgrp_base >= rowgrp_max) row_en[3:2] = 2'b00;
 end
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : colval_addressing
@@ -335,9 +338,11 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : output_ff
   if (!arst_ni) begin
     col_curr_q <= '0;
     gf2_en_q <= '0; 
+    parity_core_col_q <= '0;
   end else if (!(state_q == VALID & ~ldpc_handshake)) begin
     col_curr_q <= col_curr_n;
     gf2_en_q <= row_en;
+    parity_core_col_q <= is_parity_core_col;
   end
 end
 

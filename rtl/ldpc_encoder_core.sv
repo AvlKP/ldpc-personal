@@ -1,5 +1,9 @@
 import ldpc_pkg::*;
 
+// TODO:
+// 1. output buffer should be written according to zc_group, not once per row group no matter zc_group
+// 2. transition from IDLE to LAMBDA should not happen before input buffer clears the data
+
 module ldpc_encoder_core #(
   // Top-level parameters mirroring the sub-modules
   parameter int ZC_PER_CS = 96,
@@ -60,29 +64,15 @@ end
 // initial 4 row counter for CALC_LAMBDA
 logic [ROW_WIDTH-1:0] row_cnt_q, row_cnt_n;
 logic [ROW_WIDTH-1:0] row_limit;
-logic [ZC_WIDTH-1:0] kb_max;
+logic [KB_WIDTH-1:0] kb_max;
 logic rowgrp_changed_q, rowgrp_changed_qdly; // row group change signal
 logic csr_valid_q, csr_valid_qdly;
 logic csr_start;
 logic stall_en;
 
-assign kb_max = base_graph_i ? ZC_WIDTH'(KB_BG2-1) : ZC_WIDTH'(KB_BG1-1);
+assign kb_max = base_graph_i ? KB_WIDTH'(KB_BG2-1) : KB_WIDTH'(KB_BG1-1);
 assign row_limit = (base_graph_i)? 
     ROW_WIDTH'(BG2_ROW_N) : ROW_WIDTH'(BG1_ROW_N);
-
-always_comb begin
-  case (zc_group)
-    ZC_SMALL: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 0);
-    ZC_MEDIUM: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 1);
-    ZC_LARGE: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 2);
-    default: row_cnt_n <= row_cnt_q;
-  endcase  
-end
-
-always_ff @(posedge clk_i or negedge arst_ni) begin
-  if (!arst_ni) row_cnt_q <= '0;
-  else if (rowgrp_changed_q) row_cnt_q <= row_cnt_n;   
-end
 
 // FSM
 typedef enum logic [1:0] { 
@@ -93,30 +83,89 @@ typedef enum logic [1:0] {
 } state_t;
 
 state_t state_q, state_n;
+logic [1:0] pc_state_cnt_q;
 
-assign csr_start = rowgrp_changed_q 
-                | ((state_q == IDLE) & inbuff_valid_i);
+// TODO: check if this needs guarding when certain states
+always_comb begin
+  case (zc_group)
+    ZC_SMALL: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 0);
+    ZC_MEDIUM: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 1);
+    ZC_LARGE: row_cnt_n <= row_cnt_q + ROW_WIDTH'(1'b1 << 2);
+    default: row_cnt_n <= row_cnt_q;
+  endcase  
+end
+
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) begin
+    row_cnt_q <= '0;
+    inbuff_clear_o <= 0;
+  end
+  else if (state_q == IDLE) begin
+    row_cnt_q <= row_cnt_q;
+    inbuff_clear_o <= 0;
+  end
+  else if (rowgrp_changed_q) begin
+    if (row_cnt_n >= row_limit) begin
+      // transition to IDLE after processing is finished
+      row_cnt_q <= '0;
+      inbuff_clear_o = 1;
+    end else begin
+      row_cnt_q <= row_cnt_n;
+      inbuff_clear_o <= 0;
+    end
+  end    
+end
+
+// TODO: optimize this (new state?)
+// assign csr_start = ((rowgrp_changed_q & row_cnt_n < row_limit) 
+//                 | ((state_q == IDLE) & inbuff_valid_i))
+//                 & ~inbuff_clear_o;
+logic csr_start_init, csr_start_calc;
+
+assign csr_start_init = (state_q == IDLE) 
+                      & (inbuff_valid_i & ~inbuff_clear_o);
+assign csr_start_calc = (state_q != IDLE)
+                      & (rowgrp_changed_q & (row_cnt_n < row_limit));
+assign csr_start = csr_start_init | csr_start_calc;
+
+// initial start for CSR, not core
 assign idle_o = (state_q == IDLE);
+
+// some guy said it's best not to use state_n
+// so ...
+logic pc_to_pc, lambda_to_pc;
+
+assign lambda_to_pc = row_cnt_n >= ROW_WIDTH'(3'd4);
+assign pc_to_pc = pc_state_cnt_q < 2'(zc_group);
 
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
     state_q <= IDLE;
+    pc_state_cnt_q <= '0;
   end else begin
     state_q <= state_n;
+
+    if ((state_q == CALC_PC) & pc_to_pc)
+      pc_state_cnt_q <= pc_state_cnt_q + 1;
+    else pc_state_cnt_q <= 2'b00;
   end
 end
 
 always_comb begin
   unique case (state_q)
     IDLE:
-      if (inbuff_valid_i & ~outbuff_full_i & csr_valid_qdly)
+      if (inbuff_valid_i & ~inbuff_clear_o 
+        & ~outbuff_full_i & csr_valid_q)
           state_n <= CALC_LAMBDA; // start
       else state_n <= IDLE;
     CALC_LAMBDA:
-      if (row_cnt_n >= ROW_WIDTH'(3'd4))
+      if (lambda_to_pc)
           state_n <= CALC_PC;
       else state_n <= CALC_LAMBDA;
-    CALC_PC: state_n <= CALC_PA;
+    CALC_PC: 
+      if (pc_to_pc)
+        state_n <= CALC_PC;
+      else state_n <= CALC_PA;
     CALC_PA:
       // csr decoder will assert rowgrp_changed_q at +1 cycle after last permutation
       // last pa will be available by then
@@ -135,11 +184,11 @@ end
 logic [3:0][ZC_WIDTH-1:0] permutation_q, permutation_qdly;
 logic [COL_WIDTH-1:0] col_curr_q;
 logic [3:0] gf2_en_q, gf2_en_qdly;
+logic [NUM_CS-1:0] cs_pc_sel_q, cs_pc_sel_qdly;
 logic csr_ready;
 
 assign csr_ready = ~rowgrp_changed_q;
 assign info_group_sel_o = KB_WIDTH'(col_curr_q);
-assign inbuff_clear_o = cw_done_o;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
   if (!arst_ni) begin
@@ -147,10 +196,12 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
     gf2_en_qdly <= '0;
     csr_valid_qdly <= 0;
     rowgrp_changed_qdly <= 0;
+    cs_pc_sel_qdly <= '0;
   end else begin
     if (csr_valid_q) begin
       permutation_qdly <= permutation_q;
       gf2_en_qdly <= gf2_en_q;
+      cs_pc_sel_qdly <= cs_pc_sel_q;
     end else gf2_en_qdly <= '0;
 
     csr_valid_qdly <= csr_valid_q;
@@ -159,7 +210,9 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
 end
 
 logic [ROW_WIDTH-1:0] row_cnt_csr;
+
 assign row_cnt_csr = row_cnt_q;
+
 csr_decoder csr_decoder (
   .clk_i         (clk_i),
   .arst_ni       (arst_ni),
@@ -172,11 +225,13 @@ csr_decoder csr_decoder (
   .permutation_o (permutation_q),
   .gf2_en_o      (gf2_en_q),
   .col_curr_o    (col_curr_q),
+  .parity_core_col_o (cs_pc_sel_q),
   .rowgrp_changed_o  (rowgrp_changed_q)
 );
 
 logic [3:0][(ZC_MAX >> 2)-1:0] cs_data_in, cs_data_out;
 
+// TODO: check why cs_data_out is zeroed out at some places
 top_level_shifter #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */)
@@ -238,7 +293,8 @@ logic [3:0][ZC_MAX-1:0] parity_core;
 always_comb begin
   cpb_en = '0;
 
-  if (state_q == CALC_PC)
+  if (((state_q == CALC_LAMBDA) & lambda_to_pc)
+      | ((state_q == CALC_PC) & pc_to_pc))
     case (zc_group)
       ZC_SMALL: cpb_en = '1; 
       ZC_MEDIUM: cpb_en = 4'b0011 << (merge_d_cycle << 1);
@@ -262,18 +318,12 @@ core_parity_bit_calculator #(
 
 logic [3:0][(ZC_MAX >> 2)-1:0] parity_core_arranged;
 logic [IDX_WIDTH-1:0] parity_core_sel;
-logic [NUM_CS-1:0] cs_pc_sel;
 logic [$clog2(NUM_CS+1)-1:0] parity_core_sel_cnt;
 
 always_comb begin
   parity_core_sel_cnt = '0;
-  for (int unsigned i = 0; i < NUM_CS; i++) begin
-    cs_pc_sel[i] = permutation_qdly[i] > kb_max;
-
-    if (cs_pc_sel[i]) begin
-      parity_core_sel_cnt = parity_core_sel_cnt + 1'b1;
-    end
-  end
+  for (int unsigned i = 0; i < NUM_CS; i++) 
+    if (cs_pc_sel_qdly[i]) parity_core_sel_cnt = parity_core_sel_cnt + 1'b1;
 
   if (parity_core_sel_cnt >= NUM_CS) parity_core_sel = IDX_WIDTH'(NUM_CS-1);
   else parity_core_sel = IDX_WIDTH'(parity_core_sel_cnt);
@@ -291,7 +341,7 @@ pc_rearrange #(
 
 always_comb begin
   for (int unsigned i = 0; i < NUM_CS; i++) begin
-    if (cs_pc_sel[i]) 
+    if (cs_pc_sel_qdly[i]) 
       cs_data_in[NUM_CS-1-i] = parity_core_arranged[i];
     else 
       cs_data_in[NUM_CS-1-i] = data_segment[NUM_CS-1-i];
@@ -300,8 +350,10 @@ end
 
 logic parity_core_valid_q, parity_additional_valid_q;
 logic [3:0][ZC_MAX-1:0] parity_additional;
+logic info_valid;
 
 assign parity_additional = lambda;
+assign info_valid = (state_q == CALC_LAMBDA);
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
     parity_core_valid_q <= 0;
@@ -321,7 +373,9 @@ codeword_generator #(
   .expected_cw_bits_i       (output_bits_i),
   .zc_i                     (lifting_size_i),
   .info_group_i             (info_group_i),
-  .info_valid_i             (inbuff_valid_i),
+  .info_valid_i             (info_valid),
+  .kb_max_i                 (kb_max),
+  .curr_col_i               (col_curr_q),
   .parity_core_i            (parity_core),
   .parity_core_valid_i      (parity_core_valid_q),
   .parity_additional_i      (parity_additional),

@@ -15,6 +15,8 @@ module codeword_generator #(
     // Information bits (1 group per cycle = max 384 bits)
     input  logic [ZC_MAX-1:0]           info_group_i,
     input  logic                        info_valid_i,
+    input  logic [KB_WIDTH-1:0]         kb_max_i,
+    input  logic [$clog2(BG1_COL_N)-1:0] curr_col_i,
 
     // Core parity bits (max 4 groups = max 1536 bits)
     input  logic [3:0][ZC_MAX-1:0]      parity_core_i,
@@ -40,9 +42,20 @@ module codeword_generator #(
 );
 
     // Internal Registers
+    localparam int unsigned COL_WIDTH = $clog2(BG1_COL_N);
+
     logic [ADDR_WIDTH-1:0] current_addr;
     logic [15:0]           written_bits_cnt;
     logic [15:0]           incoming_bits;
+    logic [COL_WIDTH-1:0]  kb_max_ext;
+    logic                  info_group_pending;
+    logic                  info_group_accepted;
+    logic [BG1_COL_N-1:0]  info_group_seen_q;
+
+    assign kb_max_ext = COL_WIDTH'(kb_max_i);
+    assign info_group_pending = info_valid_i
+                              && (curr_col_i <= kb_max_ext)
+                              && !info_group_seen_q[curr_col_i];
 
     // -------------------------------------------------------------------------
     // 1. Bit Tracking & Write Logic (Combinational)
@@ -52,12 +65,14 @@ module codeword_generator #(
         outbuff_data_o  = '0; 
         outbuff_wr_en_o = 1'b0;
         incoming_bits   = '0;
+        info_group_accepted = 1'b0;
 
         if (!outbuff_full_i) begin
-            if (info_valid_i) begin
+            if (info_group_pending) begin
                 outbuff_data_o[ZC_MAX-1:0] = info_group_i;
                 outbuff_wr_en_o            = 1'b1;
                 incoming_bits              = {7'd0, zc_i};
+                info_group_accepted        = 1'b1;
             end 
             else if (parity_core_valid_i) begin
                 outbuff_wr_en_o = 1'b1;
@@ -114,7 +129,7 @@ module codeword_generator #(
     assign total_words_o = (expected_cw_bits_i + 16'd31) >> 5;
 
     // Core must stall if a valid output is pending but the buffer is locked
-    assign core_stall_o  = outbuff_full_i && (info_valid_i || parity_core_valid_i || parity_additional_valid_i);
+    assign core_stall_o  = outbuff_full_i && (info_group_pending || parity_core_valid_i || parity_additional_valid_i);
 
     // -------------------------------------------------------------------------
     // 3. Address Generation & Accumulator (Sequential)
@@ -123,14 +138,17 @@ module codeword_generator #(
         if (!rst_n) begin
             current_addr     <= '0;
             written_bits_cnt <= '0;
+            info_group_seen_q <= '0;
         end else begin
             if (cw_done_o) begin
                 // Reset pointers automatically for the next codeword frame
                 current_addr     <= '0;
                 written_bits_cnt <= '0;
+                info_group_seen_q <= '0;
             end else if (outbuff_wr_en_o) begin
                 current_addr     <= current_addr + 1'b1;
                 written_bits_cnt <= written_bits_cnt + incoming_bits;
+                if (info_group_accepted) info_group_seen_q[curr_col_i] <= 1'b1;
             end
         end
     end
