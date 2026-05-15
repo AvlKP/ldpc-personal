@@ -3,7 +3,7 @@
 ## Phase 1: Foundation and CSR Parsing
 - [x] Task: Set up the Python module structure (e.g., `sim/golden_model.py`). 3d61d01
 - [x] Task: Implement the logic to read and parse the CSR `.mem` files from `rtl/mem/`. 22ffbca
-- [~] Task: Write unit tests to verify the CSR parsing logic accurately reflects the matrices.
+- [x] Task: Write unit tests to verify the CSR parsing logic accurately reflects the matrices. 769c95a
 - [ ] Task: Conductor - User Manual Verification 'Phase 1: Foundation and CSR Parsing' (Protocol in workflow.md)
 
 ## Phase 2: Core Algorithm Implementation & Validation
