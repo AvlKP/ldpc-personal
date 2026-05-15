@@ -7,7 +7,7 @@
 - [x] Task: Conductor - User Manual Verification 'Phase 1: Foundation and CSR Parsing' (Protocol in workflow.md) cbb8a90
 
 ## Phase 2: Core Algorithm Implementation & Validation
-- [~] Task: Implement the core encoding algorithm based on the Petrović et al. (2021) architecture.
+- [x] Task: Implement the core encoding algorithm based on the Petrović et al. (2021) architecture. 247d177
 - [ ] Task: Implement step-by-step intermediate data extraction (hooks) for sub-operations like shift-network and base graph processing.
 - [ ] Task: Verify the golden algorithmic model's final encoding result against the `py3gpp` library to ensure standard compliance.
 - [ ] Task: Conductor - User Manual Verification 'Phase 2: Core Algorithm Implementation & Validation' (Protocol in workflow.md)
