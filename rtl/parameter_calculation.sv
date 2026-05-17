@@ -19,6 +19,8 @@ module parameter_calculation #(
     p_mod_d = '0;
     z_per_d = '0;
 
+    // BUG: CSR coefficients 'p' must be normalized (p % z) before calculating 'q'.
+    // Shifter underflow occurs if raw p >> z_per_d.
     // Perform calculations using d as a multiplexer select
     case (d)
       ZC_SMALL: begin

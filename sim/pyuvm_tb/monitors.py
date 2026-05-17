@@ -1,6 +1,7 @@
 import random
 import cocotb.utils
 from typing import Any
+from collections import deque
 from cocotb.triggers import RisingEdge, ReadOnly
 from pyuvm import uvm_monitor, uvm_analysis_port, ConfigDB, uvm_component
 from bfm import safe_int, int_to_bits_lsb, bits_to_int_lsb, LdpcTopBfm, TransactionRecorder
@@ -16,13 +17,19 @@ class LdpcInputBufferMonitor(uvm_monitor):
     async def run_phase(self):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
+        pending_kb_idx = None
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
-            if safe_int(core.state_q) == 1 and safe_int(core.inbuff_valid_i) == 1 and safe_int(core.inbuff_clear_o) == 0:
-                kb_idx = safe_int(core.info_group_sel_o)
+            
+            # Data from previous cycle's address selection is now valid on info_group_i
+            if pending_kb_idx is not None:
                 data_in = safe_int(core.info_group_i)
-                self.ap.write({'type': 'input', 'kb_idx': kb_idx, 'data': data_in})
+                self.ap.write({'type': 'input', 'kb_idx': pending_kb_idx, 'data': data_in})
+                pending_kb_idx = None
+
+            if safe_int(core.state_q) == 1 and safe_int(core.inbuff_valid_i) == 1 and safe_int(core.inbuff_clear_o) == 0:
+                pending_kb_idx = safe_int(core.info_group_sel_o)
 
 class LdpcShifterMonitor(uvm_monitor):
     """Monitors data entering and exiting the cyclic shifter."""
@@ -33,21 +40,34 @@ class LdpcShifterMonitor(uvm_monitor):
     async def run_phase(self):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
-        prev_col = 0
-        prev_rows = [0, 0, 0, 0]
+        metadata_queue = deque()
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
+            
+            # Latch metadata when CSR valid is high (start of pipeline)
+            if safe_int(core.csr_valid_q) == 1:
+                col = safe_int(core.col_curr_q)
+                act_rows = safe_int(core.actual_row_q)
+                metadata_queue.append({
+                    'col': col,
+                    'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)]
+                })
+
+            # Consume metadata when CSR valid delayed is high (end of pipeline)
             if safe_int(core.csr_valid_qdly) == 1:
+                meta = metadata_queue.popleft()
                 cs_in = safe_int(core.cs_data_in)
                 cs_out = safe_int(core.cs_data_out)
                 shift_val = safe_int(core.permutation_qdly)
-                self.ap.write({'type': 'shifter', 'in': cs_in, 'out': cs_out, 'shift': shift_val, 'col': prev_col, 'rows': prev_rows})
-            
-            if safe_int(core.csr_valid_q) == 1:
-                prev_col = safe_int(core.col_curr_q)
-                act_rows = safe_int(core.actual_row_q)
-                prev_rows = [(act_rows >> (i * 6)) & 0x3F for i in range(4)]
+                self.ap.write({
+                    'type': 'shifter', 
+                    'in': cs_in, 
+                    'out': cs_out, 
+                    'shift': shift_val, 
+                    'col': meta['col'], 
+                    'rows': meta['rows']
+                })
 
 class LdpcGf2Monitor(uvm_monitor):
     """Monitors the accumulated GF(2) sums."""
@@ -58,19 +78,30 @@ class LdpcGf2Monitor(uvm_monitor):
     async def run_phase(self):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
-        prev_col = 0
-        prev_rows = [0, 0, 0, 0]
+        metadata_queue = deque()
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
-            if safe_int(core.gf2_en_qdly) == 1:
-                row_sum = safe_int(core.row_sum)
-                self.ap.write({'type': 'gf2_sum', 'sum': row_sum, 'col': prev_col, 'rows': prev_rows})
             
+            # Latch metadata when GF2 enable is high
             if safe_int(core.gf2_en_q) == 1:
-                prev_col = safe_int(core.col_curr_q)
+                col = safe_int(core.col_curr_q)
                 act_rows = safe_int(core.actual_row_q)
-                prev_rows = [(act_rows >> (i * 6)) & 0x3F for i in range(4)]
+                metadata_queue.append({
+                    'col': col,
+                    'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)]
+                })
+
+            # Consume metadata when GF2 enable delayed is high
+            if safe_int(core.gf2_en_qdly) == 1:
+                meta = metadata_queue.popleft()
+                row_sum = safe_int(core.row_sum)
+                self.ap.write({
+                    'type': 'gf2_sum', 
+                    'sum': row_sum, 
+                    'col': meta['col'], 
+                    'rows': meta['rows']
+                })
 
 class LdpcLambdaMonitor(uvm_monitor):
     """Monitors the finalized lambda calculation before core parity generation."""

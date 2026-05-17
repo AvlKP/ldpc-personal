@@ -21,7 +21,7 @@ module top_level_shifter #(
     logic [NUM_CS*ZC_PER_CS-1:0]        dbp_fwd_out;
     logic [NUM_CS-1:0][ZC_PER_CS-1:0]   gr_in;
     logic [NUM_CS-1:0][ZC_PER_CS-1:0]   gr_out;
-    logic [NUM_CS-1:0]               use_q_plus;
+    logic [NUM_CS-1:0]                  use_q_plus;
     logic [NUM_CS-1:0][ZC_PER_CS-1:0]   shifter_out;
     logic [NUM_CS*ZC_PER_CS-1:0]        dbp_rev_in;
 
@@ -67,6 +67,7 @@ module top_level_shifter #(
         for (i = 0; i < NUM_CS; i++) begin : gen_shifters
             
             logic [6:0] actual_shift_amt;
+            // TODO: use_q_plus is declared but currently disconnected from group_reordering.
             // Select between q and q_plus for this specific shifter TODO get `use_q_plus` from group reordering
             assign actual_shift_amt = use_q_plus[i] ? q_plus[i] : q[i];
 

@@ -84,9 +84,9 @@ logic [1:0] pc_state_cnt_q;
 // TODO: check if this needs guarding when certain states
 always_comb begin
   case (zc_group)
-    ZC_SMALL: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 0);
+    ZC_SMALL: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 2);
     ZC_MEDIUM: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 1);
-    ZC_LARGE: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 2);
+    ZC_LARGE: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 0);
     default: row_cnt_n = row_cnt_q;
   endcase  
 end
