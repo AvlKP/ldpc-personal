@@ -27,4 +27,4 @@ LDPC_TOP_SRCS := \
 .PHONY: test_ldpc_encoder_core
 
 test_ldpc_encoder_core:
-	$(call run_test,ldpc_encoder_pyuvm,ldpc_encoder,ldpc_encoder_core_pyuvm_tb,$(LDPC_TOP_SRCS),)
+	$(call run_test,ldpc_encoder_pyuvm,ldpc_encoder,pyuvm_tb.test,$(LDPC_TOP_SRCS),)

@@ -123,7 +123,15 @@ class LdpcEncoderGoldenModel:
         if not self.row_ptr:
             raise RuntimeError("CSR memory arrays are empty. Call load_csr_data().")
 
-        self.hooks = {'shifted_vectors': [], 'lambdas': [], 'p_groups': []}
+        # Extended hooks for white-box debugging
+        self.hooks = {
+            'i_groups': [], 
+            'shifted_vectors': [], 
+            'gf2_sums': [], 
+            'lambdas': [], 
+            'p_groups': []
+        }
+
         kb = 22 if bg_idx == 1 else 10
         mb = 46 if bg_idx == 1 else 42
         
@@ -136,6 +144,8 @@ class LdpcEncoderGoldenModel:
         z_idx = z_idx_map[a]
         
         i_groups = [input_bits[i*Z:(i+1)*Z] for i in range(kb)]
+        self.hooks['i_groups'] = [g.copy() for g in i_groups] # Hook 1: Input alignment
+
         p_groups = [[0]*Z for _ in range(mb)]
         lambdas = [[0]*Z for _ in range(4)]
         
@@ -156,8 +166,14 @@ class LdpcEncoderGoldenModel:
                 if col < kb:
                     shift = self._get_shift_value(z_idx, csr_idx, Z)
                     shifted_vec = self._circ_shift(i_groups[col], shift)
-                    lambdas[r] = self._xor_vecs(lambdas[r], shifted_vec)
+                    # Hook 2: Shifter output (Row, Col, Shift, Result)
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'shift': shift, 'vec': shifted_vec})
                     
+                    lambdas[r] = self._xor_vecs(lambdas[r], shifted_vec)
+                    # Hook 3: GF(2) Accumulation
+                    self.hooks['gf2_sums'].append({'row': r, 'col': col, 'sum': lambdas[r].copy()})
+                    
+        # Hook 4: Merged Lambdas
         self.hooks['lambdas'] = [l.copy() for l in lambdas]
                     
         # 2. Core parity bit calculation
