@@ -89,6 +89,7 @@ class LdpcCorePyuvmTest(uvm_test):
         fh.setFormatter(SimTimeFormatter())
         
         self.env.scoreboard.logger.addHandler(fh)
+        self.env.internal_scoreboard.logger.addHandler(fh)
         self.logger.addHandler(fh)
         
         self.logger.info(f"Logging pyuvm output to {log_file}")

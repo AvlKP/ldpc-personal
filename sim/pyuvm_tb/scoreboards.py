@@ -5,18 +5,40 @@ from bfm import bits_to_int_lsb, int_to_bits_lsb, TransactionRecorder
 
 class LdpcInternalScoreboard(uvm_scoreboard):
     def build_phase(self):
-        self.input_export = uvm_analysis_port("input_export", self)
-        self.shifter_export = uvm_analysis_port("shifter_export", self)
-        self.gf2_export = uvm_analysis_port("gf2_export", self)
-        self.lambda_export = uvm_analysis_port("lambda_export", self)
-        
-        # FIFOs to hold transactions
-        self.input_fifo = []
-        self.shifter_fifo = []
-        self.gf2_fifo = []
+        self.input_fifo = uvm_tlm_analysis_fifo("input_fifo", self)
+        self.shifter_fifo = uvm_tlm_analysis_fifo("shifter_fifo", self)
+        self.gf2_fifo = uvm_tlm_analysis_fifo("gf2_fifo", self)
+        self.lambda_fifo = uvm_tlm_analysis_fifo("lambda_fifo", self)
         self.golden_model = ConfigDB().get(self, "", "GOLDEN_MODEL")
-        
-    def write_input_export(self, tr):
+
+    async def run_phase(self):
+        import cocotb
+        cocotb.start_soon(self.process_input())
+        cocotb.start_soon(self.process_shifter())
+        cocotb.start_soon(self.process_gf2())
+        cocotb.start_soon(self.process_lambda())
+
+    async def process_input(self):
+        while True:
+            tr = await self.input_fifo.get()
+            self.check_input(tr)
+
+    async def process_shifter(self):
+        while True:
+            tr = await self.shifter_fifo.get()
+            self.check_shifter(tr)
+
+    async def process_gf2(self):
+        while True:
+            tr = await self.gf2_fifo.get()
+            self.check_gf2(tr)
+
+    async def process_lambda(self):
+        while True:
+            tr = await self.lambda_fifo.get()
+            self.check_lambda(tr)
+
+    def check_input(self, tr):
         gm = self.golden_model
         if gm is None or tr['kb_idx'] >= len(gm.hooks.get('i_groups', [])):
             return
@@ -24,12 +46,13 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         expected_int = bits_to_int_lsb(expected_bits)
         
         if tr['data'] != expected_int:
-            self.logger.error(f"INPUT MISMATCH at KB={tr['kb_idx']}. RTL: {hex(tr['data'])}, GM: {hex(expected_int)}")
+            import cocotb.utils
+            sim_time = cocotb.utils.get_sim_time('ns')
+            self.logger.error(f"[{sim_time} ns] INPUT MISMATCH at KB={tr['kb_idx']}. RTL: {hex(tr['data'])}, GM: {hex(expected_int)}")
         else:
             self.logger.debug(f"Input KB={tr['kb_idx']} aligned correctly.")
 
-    def write_shifter_export(self, tr):
-        self.shifter_fifo.append(tr)
+    def check_shifter(self, tr):
         gm = self.golden_model
         if gm is None:
             return
@@ -48,10 +71,11 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             if expected_shift is not None:
                 actual_shift = (shift_val_packed >> (i * 9)) & 0x1FF
                 if actual_shift != expected_shift:
-                    self.logger.error(f"SHIFT MISMATCH at Row {row}, Col {col}. RTL: {actual_shift}, GM: {expected_shift}")
+                    import cocotb.utils
+                    sim_time = cocotb.utils.get_sim_time('ns')
+                    self.logger.error(f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. RTL: {actual_shift}, GM: {expected_shift}")
 
-    def write_gf2_export(self, tr):
-        self.gf2_fifo.append(tr)
+    def check_gf2(self, tr):
         gm = self.golden_model
         if gm is None:
             return
@@ -71,9 +95,11 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                 actual_sum = (sum_packed >> (i * 96)) & ((1 << 96) - 1)
                 expected_sum = bits_to_int_lsb(expected_sum_bits)
                 if actual_sum != expected_sum:
-                    self.logger.error(f"GF2 MISMATCH at Row {row}, Col {col}. RTL: {hex(actual_sum)}, GM: {hex(expected_sum)}")
+                    import cocotb.utils
+                    sim_time = cocotb.utils.get_sim_time('ns')
+                    self.logger.error(f"[{sim_time} ns] GF2 MISMATCH at Row {row}, Col {col}. RTL: {hex(actual_sum)}, GM: {hex(expected_sum)}")
 
-    def write_lambda_export(self, tr):
+    def check_lambda(self, tr):
         gm = self.golden_model
         if gm is None:
             return
@@ -84,7 +110,9 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         for i in range(4):
             expected_int = bits_to_int_lsb(expected_lambdas[i])
             if tr['lambdas'][i] != expected_int:
-                self.logger.error(f"LAMBDA MISMATCH at Row {i}. RTL: {hex(tr['lambdas'][i])}, GM: {hex(expected_int)}")
+                import cocotb.utils
+                sim_time = cocotb.utils.get_sim_time('ns')
+                self.logger.error(f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. RTL: {hex(tr['lambdas'][i])}, GM: {hex(expected_int)}")
 
 
 class LdpcScoreboard(uvm_scoreboard):
@@ -122,17 +150,21 @@ class LdpcScoreboard(uvm_scoreboard):
         # 1. Output bit comparison
         exp_bits = expected["expected_bits"]
         act_bits = actual["actual_bits"]
+        act_words = actual.get("actual_words", [])
+        
         if len(exp_bits) != len(act_bits):
             self.logger.error(f"Frame {frame_id} bit length mismatch. exp={len(exp_bits)} act={len(act_bits)}")
             has_error = True
         else:
             mismatch = next((idx for idx, (exp, act) in enumerate(zip(exp_bits, act_bits)) if exp != act), -1)
             if mismatch >= 0:
+                word_idx = mismatch // 32
+                time_ns = act_words[word_idx]["time_ns"] if word_idx < len(act_words) else "UNKNOWN"
                 lo = max(0, mismatch - 32)
                 hi = min(len(exp_bits), mismatch + 33)
                 exp_hex = hex(bits_to_int_lsb(exp_bits[lo:hi]))
                 act_hex = hex(bits_to_int_lsb(act_bits[lo:hi]))
-                self.logger.error(f"Frame {frame_id} mismatch at bit {mismatch}.\nExp window: {exp_bits[lo:hi]} (hex: {exp_hex})\nAct window: {act_bits[lo:hi]} (hex: {act_hex})")
+                self.logger.error(f"[{time_ns} ns] Frame {frame_id} mismatch at bit {mismatch}.\nExp window: {exp_bits[lo:hi]} (hex: {exp_hex})\nAct window: {act_bits[lo:hi]} (hex: {act_hex})")
                 has_error = True
 
         # 2. Parity chunk comparison
@@ -148,11 +180,11 @@ class LdpcScoreboard(uvm_scoreboard):
         actual_chunks = actual.get("actual_parity_chunks", [])
         for idx, chunk in enumerate(actual_chunks):
             if chunk["len"] != expected_len:
-                self.logger.error(f"Parity group length mismatch frame={frame_id} chunk={idx} exp_len={expected_len} act_len={chunk['len']}")
+                self.logger.error(f"[{chunk.get('time_ns', 'UNKNOWN')} ns] Parity group length mismatch frame={frame_id} chunk={idx} exp_len={expected_len} act_len={chunk['len']}")
                 has_error = True
             
             if parity_cursor + chunk["len"] > len(parity_expected):
-                self.logger.error(f"Parity monitor overflow frame={frame_id} cursor={parity_cursor} ext_len={chunk['len']} parity_total={len(parity_expected)}")
+                self.logger.error(f"[{chunk.get('time_ns', 'UNKNOWN')} ns] Parity monitor overflow frame={frame_id} cursor={parity_cursor} ext_len={chunk['len']} parity_total={len(parity_expected)}")
                 has_error = True
                 break
                 
@@ -163,7 +195,7 @@ class LdpcScoreboard(uvm_scoreboard):
                 mismatch = next((i for i, (exp, act) in enumerate(zip(expected_chunk, observed_bits)) if exp != act), -1)
                 exp_hex = hex(bits_to_int_lsb(expected_chunk))
                 act_hex = hex(bits_to_int_lsb(observed_bits))
-                self.logger.error(f"Parity group mismatch frame={frame_id} src={chunk['src']} bit={mismatch}\nRTL:    {observed_bits} (hex: {act_hex})\nGolden: {expected_chunk} (hex: {exp_hex})")
+                self.logger.error(f"[{chunk.get('time_ns', 'UNKNOWN')} ns] Parity group mismatch frame={frame_id} src={chunk['src']} bit={mismatch}\nRTL:    {observed_bits} (hex: {act_hex})\nGolden: {expected_chunk} (hex: {exp_hex})")
                 has_error = True
             
             parity_cursor += chunk["len"]
@@ -194,7 +226,8 @@ class LdpcScoreboard(uvm_scoreboard):
             self.logger.error(f"Internal output_buffer write count mismatch frame={frame_id} exp={len(expected_internal_writes)} act={len(actual_writes)}")
             has_error = True
             
-        for write_idx, (obs_wr, exp_wr) in enumerate(zip(actual_writes, expected_internal_writes)):
+        for write_idx, (obs_wr_dict, exp_wr) in enumerate(zip(actual_writes, expected_internal_writes)):
+            obs_wr = obs_wr_dict["data"]
             if obs_wr != exp_wr:
                 observed_bits = int_to_bits_lsb(obs_wr, OUTBUFF_WRITE_BITS)
                 expected_bits_row = int_to_bits_lsb(exp_wr, OUTBUFF_WRITE_BITS)
@@ -203,7 +236,7 @@ class LdpcScoreboard(uvm_scoreboard):
                 hi = min(OUTBUFF_WRITE_BITS, mismatch + 17)
                 exp_hex = hex(bits_to_int_lsb(expected_bits_row[lo:hi]))
                 act_hex = hex(bits_to_int_lsb(observed_bits[lo:hi]))
-                self.logger.error(f"Output-buffer write mismatch frame={frame_id} row={write_idx} bit={mismatch}\nExp window: {expected_bits_row[lo:hi]} (hex: {exp_hex})\nAct window: {observed_bits[lo:hi]} (hex: {act_hex})")
+                self.logger.error(f"[{obs_wr_dict.get('time_ns', 'UNKNOWN')} ns] Output-buffer write mismatch frame={frame_id} row={write_idx} bit={mismatch}\nExp window: {expected_bits_row[lo:hi]} (hex: {exp_hex})\nAct window: {observed_bits[lo:hi]} (hex: {act_hex})")
                 has_error = True
 
         # 4. TLAST check

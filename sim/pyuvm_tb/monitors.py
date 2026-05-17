@@ -1,4 +1,5 @@
 import random
+import cocotb.utils
 from typing import Any
 from cocotb.triggers import RisingEdge, ReadOnly
 from pyuvm import uvm_monitor, uvm_analysis_port, ConfigDB, uvm_component
@@ -102,6 +103,7 @@ class LdpcOutputMonitor(uvm_monitor):
 
         rng = random.Random(ctx["seed"] ^ 0x5A5A)
         captured_bits: list[int] = []
+        actual_words = []
         accepted_words = 0
         total_words = ctx["total_words"]
         timeout_cycles = max(30000, total_words * 128)
@@ -137,19 +139,29 @@ class LdpcOutputMonitor(uvm_monitor):
                         "len": ext_len,
                         "data": ext_data,
                         "src": "core" if parity_core_valid == 1 else "additional",
-                        "cycle": cycle
+                        "cycle": cycle,
+                        "time_ns": cocotb.utils.get_sim_time('ns')
                     })
 
             outbuff_wr_en = safe_int(getattr(dut, "outbuff_wr_en", None), 0)
             if outbuff_wr_en == 1:
                 raw_wr = safe_int(getattr(dut, "outbuff_data", None), 0)
-                actual_internal_writes.append(raw_wr & ((1 << OUTBUFF_WRITE_BITS) - 1))
+                actual_internal_writes.append({
+                    "data": raw_wr & ((1 << OUTBUFF_WRITE_BITS) - 1),
+                    "cycle": cycle,
+                    "time_ns": cocotb.utils.get_sim_time('ns')
+                })
 
             tvalid = safe_int(dut.m_axis_tvalid, 0)
             if tvalid == 1 and ready == 1:
                 tlast = safe_int(dut.m_axis_tlast, 0)
                 raw = safe_int(dut.m_axis_tdata, 0)
                 accepted_words += 1
+                
+                actual_words.append({
+                    "data": raw,
+                    "time_ns": cocotb.utils.get_sim_time('ns')
+                })
                 captured_bits.extend(int_to_bits_lsb(raw, 32))
 
                 self.recorder.record_axis_out(
@@ -170,6 +182,7 @@ class LdpcOutputMonitor(uvm_monitor):
         return {
             "frame_id": ctx["frame_id"],
             "actual_bits": captured_bits[: ctx["output_bits"]],
+            "actual_words": actual_words,
             "accepted_words": accepted_words,
             "parity_core_events": parity_core_events,
             "parity_additional_events": parity_additional_events,

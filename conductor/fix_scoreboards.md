@@ -1,29 +1,37 @@
-# Refactor pyUVM Scoreboard and Monitors for Best Practices
+# Fix Timing Logs and Internal Scoreboard
 
 ## Objective
-Fix the UVM component inheritance and assertion logic to adhere to UVM best practices:
-1. `LdpcOutputMonitor` and `LdpcScoreboard` should inherit from `uvm_monitor` and `uvm_scoreboard` respectively.
-2. `LdpcOutputMonitor` should be completely stripped of assertion (`assert`) checks. It should only capture data and push an `actual` dictionary into its `actual_ap`.
-3. `LdpcScoreboard` should take over the checking logic and use `self.logger.error()` instead of Python `assert`, allowing the simulation to continue and aggregate errors without hard-crashing.
+1. Make `LdpcInternalScoreboard` actually receive and process data by using `uvm_tlm_analysis_fifo` and `cocotb.start_soon` tasks instead of unconnected `uvm_analysis_port`s.
+2. Fix the log timing mismatch by having `LdpcOutputMonitor` record the `time_ns` (using `cocotb.utils.get_sim_time('ns')`) for each output word, parity chunk, and internal write. 
+3. Update `LdpcScoreboard` to use these recorded timestamps in its `logger.error` messages so the user knows exactly when the mismatch occurred, rather than seeing the time at the end of the frame.
 
 ## Key Files & Context
-- `sim/pyuvm_tb/monitors.py`
 - `sim/pyuvm_tb/scoreboards.py`
+- `sim/pyuvm_tb/monitors.py`
+- `sim/pyuvm_tb/agent_env.py`
 
 ## Implementation Steps
 1. **Update `monitors.py`**:
-   - Change `LdpcOutputMonitor(uvm_component)` to `LdpcOutputMonitor(uvm_monitor)`.
-   - Remove all `assert` logic from `LdpcOutputMonitor.capture_frame`.
-   - Store all observed `ext_data` (parity chunk writes) into an `actual_parity_chunks` list.
-   - Store all `outbuff_data` writes into an `actual_internal_writes` list.
-   - Return these lists in the `actual` dictionary along with `tlast` state.
+   - In `LdpcOutputMonitor`, import `cocotb.utils`.
+   - Update `actual_parity_chunks` to include `"time_ns": cocotb.utils.get_sim_time('ns')`.
+   - Update `actual_internal_writes` to store dicts `{"data": raw_wr & mask, "time_ns": cocotb.utils.get_sim_time('ns')}`.
+   - Update `captured_bits` handling to store `actual_words` as `{"data": raw, "time_ns": cocotb.utils.get_sim_time('ns')}`.
 
-2. **Update `scoreboards.py`**:
-   - Change `LdpcScoreboard(uvm_component)` to `LdpcScoreboard(uvm_scoreboard)`.
-   - In `compare()`, retrieve `actual_parity_chunks` and `actual_internal_writes` from the `actual` dictionary.
-   - Replicate the length and data comparisons previously in the monitor using `self.logger.error()` for failures.
-   - Replace the `assert` checks in the existing `LdpcScoreboard.compare` (for output bit matching) with `self.logger.error()`.
+2. **Update `scoreboards.py` (LdpcScoreboard)**:
+   - When checking output bits, correlate the bit mismatch index back to the 32-bit word index to get the exact `time_ns`.
+   - When checking parity chunks, extract `time_ns` from the chunk dictionary and include it in the log message: `f"[Time: {chunk['time_ns']} ns] Parity group mismatch..."`.
+   - Do the same for internal writes, using the recorded `time_ns`.
+
+3. **Update `scoreboards.py` (LdpcInternalScoreboard)**:
+   - Replace `uvm_analysis_port` instantiations with `uvm_tlm_analysis_fifo`.
+   - Add an `async def run_phase(self)` that spawns four `cocotb.start_soon()` loops to continuously pop from `input_fifo`, `shifter_fifo`, `gf2_fifo`, and `lambda_fifo`.
+   - Rename `write_input_export` to `check_input`, and similar for the others, and call them from the loops.
+   - In the check functions, include `cocotb.utils.get_sim_time('ns')` in the logs to be precise if they don't already match the current sim time (they should match since they pop immediately, but we can be explicit).
+
+4. **Update `agent_env.py`**:
+   - Change `.connect(self.internal_scoreboard.input_export)` to `.connect(self.internal_scoreboard.input_fifo.analysis_export)`. (Do this for all 4 internal monitors).
 
 ## Verification & Testing
 - Run `make test_ldpc_encoder_core` in the `sim` directory.
-- The simulation will still fail on the exact same mismatched parity bits, but it will fail gracefully via UVM `logger.error` output, aggregating errors instead of crashing immediately.
+- Verify that `pyuvm_test.log` contains detailed `LdpcInternalScoreboard` logs.
+- Verify that `LdpcScoreboard` mismatch logs show the exact simulation time of the mismatch inside the message text.

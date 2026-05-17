@@ -27,7 +27,7 @@ class LdpcEnv(uvm_env):
     def connect_phase(self) -> None:
         self.agent.driver.expected_ap.connect(self.scoreboard.expected_fifo.analysis_export)
         self.output_monitor.actual_ap.connect(self.scoreboard.actual_fifo.analysis_export)
-        self.inbuff_monitor.ap.connect(self.internal_scoreboard.input_export)
-        self.shifter_monitor.ap.connect(self.internal_scoreboard.shifter_export)
-        self.gf2_monitor.ap.connect(self.internal_scoreboard.gf2_export)
-        self.lambda_monitor.ap.connect(self.internal_scoreboard.lambda_export)
+        self.inbuff_monitor.ap.connect(self.internal_scoreboard.input_fifo.analysis_export)
+        self.shifter_monitor.ap.connect(self.internal_scoreboard.shifter_fifo.analysis_export)
+        self.gf2_monitor.ap.connect(self.internal_scoreboard.gf2_fifo.analysis_export)
+        self.lambda_monitor.ap.connect(self.internal_scoreboard.lambda_fifo.analysis_export)
