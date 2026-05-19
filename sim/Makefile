@@ -36,8 +36,10 @@ define run_test
 	@echo "Running Test: $(1)"
 	@echo "=========================================="
 	@mkdir -p sim_build/$(1)/mem
+	@mkdir -p $(SIM_DIR)/mem
 	@cp -f $(RTL_DIR)/mem/*.mem sim_build/$(1)/mem/ 2>/dev/null || true
 	@cp -f $(RTL_DIR)/mem/*.mem sim_build/$(1)/ 2>/dev/null || true
+	@cp -f $(RTL_DIR)/mem/*.mem $(SIM_DIR)/mem/ 2>/dev/null || true
 	$(MAKE) -f $(SIM_DIR)/Makefile sim \
 		TOPLEVEL=$(2) \
 		MODULE=$(3) \
