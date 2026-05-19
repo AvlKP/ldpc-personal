@@ -13,28 +13,33 @@ module barrel_shifter #(
 logic [ZC_PER_CS-1:0] data_mask;
 logic [ZC_PER_CS-1:0] masked_data_in;
 logic [ZC_PER_CS-1:0] rotated_val;
+logic [SHIFT_W-1:0]   shift_norm;
 
 always_comb begin
     // Default assignments strictly prevent latch inference
     data_mask      = '0;
     masked_data_in = '0;
     rotated_val    = '0;
+    shift_norm     = '0;
     data_out       = '0;
 
     if (shift_amt != '1) begin
+        // Normalize shift into [0, zc_in) to support p >= z inputs
+        shift_norm = shift_amt % zc_in;
+
         // Use explicit width replication for the all-ones mask
         data_mask = {ZC_PER_CS{1'b1}} << (SHIFT_W'(ZC_PER_CS) - $unsigned(zc_in));
-        
+
         masked_data_in = data_in & data_mask;
 
-        if (!direction) begin 
+        if (!direction) begin
             // Left circular shift (rotate)
-            rotated_val = (masked_data_in << shift_amt) | 
-                            (masked_data_in >> ($unsigned(zc_in) - shift_amt));
-        end else begin 
+            rotated_val = (masked_data_in << shift_norm) |
+                            (masked_data_in >> ($unsigned(zc_in) - shift_norm));
+        end else begin
             // Right circular shift (rotate)
-            rotated_val = (masked_data_in >> shift_amt) | 
-                            (masked_data_in << ($unsigned(zc_in) - shift_amt));
+            rotated_val = (masked_data_in >> shift_norm) |
+                            (masked_data_in << ($unsigned(zc_in) - shift_norm));
         end
 
         data_out = rotated_val & data_mask;

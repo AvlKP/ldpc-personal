@@ -13,36 +13,42 @@ module parameter_calculation #(
     output logic [NUM_CS-1:0][6:0] q_plus
 );
 
+  // p normalized to [0, z): supports CSR coefficients where p >= z
+  logic [NUM_CS-1:0][8:0] p_norm;
+
   always_comb begin
     // Default assignments strictly prevent latch inference
     q       = '0;
     p_mod_d = '0;
     z_per_d = '0;
 
-    // BUG: CSR coefficients 'p' must be normalized (p % z) before calculating 'q'.
-    // Shifter underflow occurs if raw p >> z_per_d.
-    // Perform calculations using d as a multiplexer select
+    // Normalize p: subtract z when p >= z, preserving the null marker (9'h1FF).
+    // z is always divisible by d in each Zc group, so p_mod_d is unchanged by this.
+    for (int i = 0; i < NUM_CS; i++) begin
+      p_norm[i] = (p[i] != 9'h1FF) ? (p[i] % z) : p[i];
+    end
+
     case (d)
       ZC_SMALL: begin
         for (int i = 0; i < NUM_CS; i++) begin
-          q[i] = p[i][6:0];
+          q[i] = p_norm[i][6:0];
         end
         p_mod_d = '0;
         z_per_d = z[6:0];
       end
       ZC_MEDIUM: begin
         for (int i = 0; i < NUM_CS/2; i++) begin
-          q[i*2]         = p[i*2+1][7:1];
-          q[i*2+1]       = p[i*2+1][7:1];
-          p_mod_d[i*2]   = {1'b0, p[i*2+1][0]};
-          p_mod_d[i*2+1] = {1'b0, p[i*2+1][0]};
+          q[i*2]         = p_norm[i*2+1][7:1];
+          q[i*2+1]       = p_norm[i*2+1][7:1];
+          p_mod_d[i*2]   = {1'b0, p_norm[i*2+1][0]};
+          p_mod_d[i*2+1] = {1'b0, p_norm[i*2+1][0]};
         end
         z_per_d = z[7:1];
       end
       ZC_LARGE: begin
         for (int i = 0; i < NUM_CS; i++) begin
-          q[i]       = p[NUM_CS-1][8:2];
-          p_mod_d[i] = p[NUM_CS-1][1:0];
+          q[i]       = p_norm[NUM_CS-1][8:2];
+          p_mod_d[i] = p_norm[NUM_CS-1][1:0];
         end
         z_per_d = z[8:2];
       end
