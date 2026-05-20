@@ -91,7 +91,10 @@ class LdpcCorePyuvmTest(uvm_test):
         self.env.scoreboard.logger.addHandler(fh)
         self.env.internal_scoreboard.logger.addHandler(fh)
         self.logger.addHandler(fh)
-        
+
+        self.env.scoreboard.logger.setLevel(logging.DEBUG)
+        self.env.internal_scoreboard.logger.setLevel(logging.DEBUG)
+
         self.logger.info(f"Logging pyuvm output to {log_file}")
 
     async def run_phase(self) -> None:

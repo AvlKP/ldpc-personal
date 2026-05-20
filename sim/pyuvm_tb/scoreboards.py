@@ -74,6 +74,8 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                     import cocotb.utils
                     sim_time = cocotb.utils.get_sim_time('ns')
                     self.logger.error(f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. RTL: {actual_shift}, GM: {expected_shift}")
+                else:
+                    self.logger.debug(f"SHIFT OK at Row {row}, Col {col}: {actual_shift}")
 
     def check_gf2(self, tr):
         gm = self.golden_model
@@ -98,6 +100,8 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                     import cocotb.utils
                     sim_time = cocotb.utils.get_sim_time('ns')
                     self.logger.error(f"[{sim_time} ns] GF2 MISMATCH at Row {row}, Col {col}. RTL: {hex(actual_sum)}, GM: {hex(expected_sum)}")
+                else:
+                    self.logger.debug(f"GF2 OK at Row {row}, Col {col}: {hex(actual_sum)}")
 
     def check_lambda(self, tr):
         gm = self.golden_model
@@ -113,6 +117,8 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                 import cocotb.utils
                 sim_time = cocotb.utils.get_sim_time('ns')
                 self.logger.error(f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. RTL: {hex(tr['lambdas'][i])}, GM: {hex(expected_int)}")
+            else:
+                self.logger.debug(f"LAMBDA OK at Row {i}: {hex(tr['lambdas'][i])}")
 
 
 class LdpcScoreboard(uvm_scoreboard):
