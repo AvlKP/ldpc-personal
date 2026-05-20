@@ -15,6 +15,13 @@ Z_VALUES_BG1 = [8, 14, 26, 384]
 Z_VALUES_BG2 = [10, 16, 24, 256]
 
 # --- Helper Functions ---
+OUTPUT_FILE = "golden_model_output.txt"
+
+def bits_to_hex(bits):
+    n = int(''.join(str(b) for b in bits), 2) if bits else 0
+    hex_digits = (len(bits) + 3) // 4
+    return f"0x{n:0{hex_digits}x}"
+
 def generate_test_vectors(Z, kb):
     """Generates random, all-zeros, and all-ones test vectors."""
     K = kb * Z
@@ -87,10 +94,16 @@ def test_bg1_encoding(encoder_model, Z):
         # 1. Run py3gpp Math Reference
         cw_full = _encode_thangaraj(bm, Z, input_bits)
         ref_parity = cw_full[kb * Z :].astype(int).tolist() # Slice pure parity
-        
+
         # 2. Run Golden Model
-        dut_parity = encoder_model.encode(input_bits.tolist(), Z, bg_idx=bg_idx)
-        
+        dut_parity = encoder_model.encode(input_bits.tolist(), Z, bg_idx=bg_idx, version='petrovic')
+
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"\n[BG1 Z={Z} {pattern_name}]\n")
+            f.write(f"  input_bits  : {bits_to_hex(input_bits.tolist())}\n")
+            f.write(f"  py3gpp parity ({len(ref_parity)}b): {bits_to_hex(ref_parity)}\n")
+            f.write(f"  golden parity ({len(dut_parity)}b): {bits_to_hex(dut_parity)}\n")
+
         # 3. Assert
         assert len(dut_parity) == len(ref_parity), f"Length mismatch Z={Z}"
         assert dut_parity == ref_parity, f"BG1 Z={Z} [{pattern_name}]: Data mismatch."
@@ -101,17 +114,23 @@ def test_bg2_encoding(encoder_model, Z):
     kb = 10
     vectors = generate_test_vectors(Z, kb)
     i_ls = get_i_ls(Z)
-    
+
     bm = _load_basegraph(i_ls, bgn=bg_idx)
-    
+
     for pattern_name, input_bits in vectors.items():
         # 1. Run py3gpp Math Reference
         cw_full = _encode_thangaraj(bm, Z, input_bits)
         ref_parity = cw_full[kb * Z :].astype(int).tolist()
-        
+
         # 2. Run Golden Model
         dut_parity = encoder_model.encode(input_bits.tolist(), Z, bg_idx=bg_idx)
-        
+
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(f"\n[BG2 Z={Z} {pattern_name}]\n")
+            f.write(f"  input_bits  : {bits_to_hex(input_bits.tolist())}\n")
+            f.write(f"  py3gpp parity ({len(ref_parity)}b): {bits_to_hex(ref_parity)}\n")
+            f.write(f"  golden parity ({len(dut_parity)}b): {bits_to_hex(dut_parity)}\n")
+
         # 3. Assert
         assert len(dut_parity) == len(ref_parity), f"Length mismatch Z={Z}"
         assert dut_parity == ref_parity, f"BG2 Z={Z} [{pattern_name}]: Data mismatch."

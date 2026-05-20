@@ -48,9 +48,9 @@ logic [3:0][(ZC_MAX >> 2)-1:0] data_segment;
 always_comb begin
     case (zc_group)
     ZC_SMALL: for (int unsigned j = 0; j < 4; j++)
-            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)];            
+            data_segment[j] = info_group_i[ZC_MAX-1 -: (ZC_MAX >> 2)];
     ZC_MEDIUM: for (int unsigned j = 0; j < 2; j++)
-            {data_segment[j*2+1], data_segment[j*2]} = info_group_i[0 +: (ZC_MAX >> 1)];
+            {data_segment[j*2+1], data_segment[j*2]} = info_group_i[ZC_MAX-1 -: (ZC_MAX >> 1)];
     ZC_LARGE: {data_segment} = info_group_i;
     default: {data_segment} = '0;
     endcase  

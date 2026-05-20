@@ -56,26 +56,50 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         gm = self.golden_model
         if gm is None:
             return
-            
+
         col = tr['col']
         shift_val_packed = tr['shift']
-        
+        cs_in_packed = tr['in']
+        cs_out_packed = tr['out']
+
+        CS_BITS = 96  # ZC_PER_CS
+
         for i in range(4):
             row = tr['rows'][i]
             expected_shift = None
+            expected_vec = None
             for hook in gm.hooks.get('shifted_vectors', []):
                 if hook['row'] == row and hook['col'] == col:
                     expected_shift = hook['shift']
+                    expected_vec = hook['vec']
                     break
-            
+
             if expected_shift is not None:
                 actual_shift = (shift_val_packed >> (i * 9)) & 0x1FF
+                actual_in = (cs_in_packed >> (i * CS_BITS)) & ((1 << CS_BITS) - 1)
+                actual_out = (cs_out_packed >> (i * CS_BITS)) & ((1 << CS_BITS) - 1)
+                expected_in = bits_to_int_lsb(gm.hooks['i_groups'][col])
+                expected_out = bits_to_int_lsb(expected_vec)
+
                 if actual_shift != expected_shift:
                     import cocotb.utils
                     sim_time = cocotb.utils.get_sim_time('ns')
-                    self.logger.error(f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. RTL: {actual_shift}, GM: {expected_shift}")
+                    self.logger.error(
+                        f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. "
+                        f"RTL shift: {actual_shift}, GM shift: {expected_shift}\n"
+                        f"  RTL  in: 0x{actual_in:024x}\n"
+                        f"  GM   in: 0x{expected_in:024x}\n"
+                        f"  RTL out: 0x{actual_out:024x}\n"
+                        f"  GM  out: 0x{expected_out:024x}"
+                    )
                 else:
-                    self.logger.debug(f"SHIFT OK at Row {row}, Col {col}: {actual_shift}")
+                    self.logger.debug(
+                        f"SHIFT OK at Row {row}, Col {col}: shift={actual_shift}\n"
+                        f"  RTL  in: 0x{actual_in:024x}\n"
+                        f"  GM   in: 0x{expected_in:024x}\n"
+                        f"  RTL out: 0x{actual_out:024x}\n"
+                        f"  GM  out: 0x{expected_out:024x}"
+                    )
 
     def check_gf2(self, tr):
         gm = self.golden_model
@@ -110,15 +134,25 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         expected_lambdas = gm.hooks.get('lambdas', [])
         if not expected_lambdas:
             return
-        
+
+        LAMBDA_BITS = 384  # 4 * ZC_PER_CS, full RTL lambda width per row
+
         for i in range(4):
+            Z = len(expected_lambdas[i])
             expected_int = bits_to_int_lsb(expected_lambdas[i])
-            if tr['lambdas'][i] != expected_int:
+            # RTL packs the active Z bits in the MSBs of the 384-bit lambda slot
+            actual_int = (tr['lambdas'][i] >> (LAMBDA_BITS - Z)) & ((1 << Z) - 1)
+            hex_width = (Z + 3) // 4
+
+            if actual_int != expected_int:
                 import cocotb.utils
                 sim_time = cocotb.utils.get_sim_time('ns')
-                self.logger.error(f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. RTL: {hex(tr['lambdas'][i])}, GM: {hex(expected_int)}")
+                self.logger.error(
+                    f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. "
+                    f"RTL: 0x{actual_int:0{hex_width}x}, GM: 0x{expected_int:0{hex_width}x}"
+                )
             else:
-                self.logger.debug(f"LAMBDA OK at Row {i}: {hex(tr['lambdas'][i])}")
+                self.logger.debug(f"LAMBDA OK at Row {i}: 0x{actual_int:0{hex_width}x}")
 
 
 class LdpcScoreboard(uvm_scoreboard):

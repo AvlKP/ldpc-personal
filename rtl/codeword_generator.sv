@@ -53,7 +53,6 @@ module codeword_generator #(
 
     // Bit Extraction Signals
     logic [ZC_MAX-1:0]      active_parity;
-    logic [ZC_MAX-1:0]      zc_mask;
     logic [OUT_WIDTH-1:0]   ext_data;
     logic [15:0]            ext_len;
     logic                   ext_valid;
@@ -79,57 +78,54 @@ module codeword_generator #(
     // -------------------------------------------------------------------------
     assign active_parity = parity_core_valid_i ? parity_core_i : parity_additional_i;
     
-    // Create a dynamic mask based on Zc to strip garbage/padding bits
-    assign zc_mask = (ZC_MAX'(1) << zc_i) - 1'b1;
-
     always_comb begin
-        ext_data            = '0; 
+        ext_data            = '0;
         ext_len             = '0;
         ext_valid           = 1'b0;
         info_group_accepted = 1'b0;
 
         if (state == ST_ACCUMULATE && !outbuff_full_i) begin
             if (info_group_pending) begin
-                // Info bits are 1 group per cycle, residing in the lower bits
-                ext_data[ZC_MAX-1:0] = info_group_i & zc_mask;
+                // info_group_i is already MSB-packed: valid Z bits in [ZC_MAX-1:ZC_MAX-Z].
+                ext_data[ZC_MAX-1:0] = info_group_i;
                 ext_len              = {7'd0, zc_i};
                 ext_valid            = 1'b1;
                 info_group_accepted  = 1'b1;
-            end 
+            end
             else if (parity_core_valid_i || parity_additional_valid_i) begin
                 ext_valid = 1'b1;
                 case (parity_groups_i)
-                    ZC_SMALL: begin 
-                        // 4 Groups, Chunk size = 96
+                    ZC_SMALL: begin
+                        // 4 chunks of 96, each MSB-packed within its 96-bit slot.
+                        // Lift each chunk to the top of a 384-bit value, then
+                        // OR them together so the 4*Z valid bits are compacted
+                        // into ext_data[ZC_MAX-1 : ZC_MAX-4*Z].
                         logic [ZC_MAX-1:0] g0, g1, g2, g3;
-                        g0 = active_parity[95:0]    & zc_mask;
-                        g1 = active_parity[191:96]  & zc_mask;
-                        g2 = active_parity[287:192] & zc_mask;
-                        g3 = active_parity[383:288] & zc_mask;
-                        
-                        // Shift valid bits tightly together, skipping the 96-bit chunk boundaries
-                        ext_data[ZC_MAX-1:0] = (g3 << (3*zc_i)) | (g2 << (2*zc_i)) | (g1 << zc_i) | g0;
+                        g3 = {active_parity[383:288], 288'b0};
+                        g2 = {active_parity[287:192], 288'b0};
+                        g1 = {active_parity[191:96],  288'b0};
+                        g0 = {active_parity[95:0],    288'b0};
+                        ext_data[ZC_MAX-1:0] = g3 | (g2 >> zc_i) | (g1 >> (2*zc_i)) | (g0 >> (3*zc_i));
                         ext_len              = {5'd0, zc_i, 2'b00}; // zc_i * 4
                     end
-                    
-                    ZC_MEDIUM: begin 
-                        // 2 Groups, Chunk size = 192
+
+                    ZC_MEDIUM: begin
+                        // 2 chunks of 192, each MSB-packed within its 192-bit slot.
                         logic [ZC_MAX-1:0] g0, g1;
-                        g0 = active_parity[191:0]   & zc_mask;
-                        g1 = active_parity[383:192] & zc_mask;
-                        
-                        ext_data[ZC_MAX-1:0] = (g1 << zc_i) | g0;
+                        g1 = {active_parity[383:192], 192'b0};
+                        g0 = {active_parity[191:0],   192'b0};
+                        ext_data[ZC_MAX-1:0] = g1 | (g0 >> zc_i);
                         ext_len              = {6'd0, zc_i, 1'b0}; // zc_i * 2
                     end
-                    
-                    ZC_LARGE: begin 
-                        // 1 Group, Chunk size = 384
-                        ext_data[ZC_MAX-1:0] = active_parity[383:0] & zc_mask;
-                        ext_len              = {7'd0, zc_i}; // zc_i * 1
+
+                    ZC_LARGE: begin
+                        // Single 384-bit MSB-packed word, pass through.
+                        ext_data[ZC_MAX-1:0] = active_parity;
+                        ext_len              = {7'd0, zc_i};
                     end
-                    
+
                     default: begin
-                        ext_data[ZC_MAX-1:0] = active_parity[383:0] & zc_mask;
+                        ext_data[ZC_MAX-1:0] = active_parity;
                         ext_len              = {7'd0, zc_i};
                     end
                 endcase
@@ -150,7 +146,10 @@ module codeword_generator #(
 
     always_comb begin
         next_pack_cnt = pack_cnt + ext_len;
-        next_pack_reg = pack_reg | ( ((OUT_WIDTH*2)'(ext_data)) << pack_cnt );
+        // pack_reg accumulates from the top (MSB). Place ext_data MSB-aligned in
+        // the 768-bit working value, then right-shift it to sit just below the
+        // bits already accumulated.
+        next_pack_reg = pack_reg | ({ext_data, {OUT_WIDTH{1'b0}}} >> pack_cnt);
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -178,9 +177,11 @@ module codeword_generator #(
                         if (next_pack_cnt >= OUT_WIDTH) begin
                             outbuff_wr_en_o <= 1'b1;
                             outbuff_addr_o  <= current_addr;
-                            outbuff_data_o  <= next_pack_reg[OUT_WIDTH-1:0];
-                            
-                            pack_reg        <= next_pack_reg >> OUT_WIDTH;
+                            // Top 384 bits are full — emit them MSB-first.
+                            outbuff_data_o  <= next_pack_reg[(OUT_WIDTH*2)-1 -: OUT_WIDTH];
+
+                            // Shift the leftover bits back to the top of pack_reg.
+                            pack_reg        <= next_pack_reg << OUT_WIDTH;
                             pack_cnt        <= next_pack_cnt - OUT_WIDTH;
                             current_addr    <= current_addr + 1'b1;
 
@@ -210,7 +211,8 @@ module codeword_generator #(
                 ST_FLUSH: begin
                     outbuff_wr_en_o      <= 1'b1;
                     outbuff_addr_o       <= current_addr;
-                    outbuff_data_o       <= pack_reg[OUT_WIDTH-1:0];
+                    // Final partial word: valid bits live at the top of pack_reg.
+                    outbuff_data_o       <= pack_reg[(OUT_WIDTH*2)-1 -: OUT_WIDTH];
                     cw_done_o            <= 1'b1;
                     
                     state                <= ST_ACCUMULATE;

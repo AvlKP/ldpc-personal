@@ -278,7 +278,8 @@ always_ff @(posedge clk_i) begin : out_selector
     //   2'b11: info_group_o <= r_data[r_swap_q];
     //   default: info_group_o <= '0;
     // endcase
-    info_group_o <= r_data[r_swap_q];
+    // Left-align the Zc active bits into the MSB of the ZC_MAX-wide slot
+    info_group_o <= r_data[r_swap_q] << (ZC_MAX - ram_zc_q[r_swap_q]);
     lifting_size_o <= ram_zc_q[r_swap_q];
     input_bits_o <= ram_input_bits_q[r_swap_q];
     output_bits_o <= ram_output_bits_q[r_swap_q];
