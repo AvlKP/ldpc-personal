@@ -184,7 +184,7 @@ class LdpcTopBfm:
 
     async def send_frame(self, item) -> dict[str, Any]:
         bg_idx = 1 if item.base_graph == 0 else 2
-        parity_bits = self.golden_model.encode(item.info_bits, item.zc, bg_idx=bg_idx, version='petrovic')
+        parity_bits = self.golden_model.encode(item.info_bits, item.zc, bg_idx=bg_idx, version='3gpp')
         hooks = self.golden_model.hooks
         expected_bits = item.info_bits + parity_bits
 
