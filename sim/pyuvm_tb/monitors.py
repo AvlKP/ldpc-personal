@@ -59,7 +59,7 @@ class LdpcShifterMonitor(uvm_monitor):
                 meta = metadata_queue.popleft()
                 cs_in = safe_int(core.cs_data_in)
                 cs_out = safe_int(core.cs_data_out)
-                shift_val = safe_int(core.permutation_qdly)
+                shift_val = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
                 self.ap.write({
                     'type': 'shifter', 
                     'in': cs_in, 

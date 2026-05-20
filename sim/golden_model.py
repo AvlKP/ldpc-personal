@@ -37,6 +37,18 @@ class LdpcEncoderGoldenModel:
                     data.extend([v0, v1, v2, v3])
         return data
 
+    def _read_row_schedule_file(self, filepath):
+        """Reads the row_schedule memory file which contains four 6-bit row indices packed into 24 bits per line."""
+        data = []
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('//'):
+                    val = int(line, 16)
+                    for i in range(4):
+                        data.append((val >> (i * 6)) & 0x3F)
+        return data
+
     def load_csr_data(self, mem_dir):
         """Loads CSR data from .mem files in the given directory."""
         col_indices_path = os.path.join(mem_dir, 'col_indices.mem')
@@ -61,8 +73,8 @@ class LdpcEncoderGoldenModel:
 
         # Load optimized schedule from .mem file
         if os.path.exists(row_schedule_path):
-            # UPDATE: Use the 4-per-word unpacker since schedule now mimics row_ptr format
-            sched_data = self._read_row_ptr_file(row_schedule_path)
+            # row_schedule.mem is 4x 6-bit row indices per word (matches RTL WORD_WIDTH=4*ROW_WIDTH)
+            sched_data = self._read_row_schedule_file(row_schedule_path)
             
             # BG1 has 46 valid rows, padded to 48.
             bg1_sched = sched_data[:46]
