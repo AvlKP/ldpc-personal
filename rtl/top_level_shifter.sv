@@ -77,7 +77,7 @@ module top_level_shifter #(
                 .data_in   (gr_out[i]),
                 .zc_in     (z_per_d),
                 .shift_amt (actual_shift_amt),
-                .direction (1'b0),
+                .direction (1'b1),
                 .data_out  (shifter_out[i])
             );
         end
