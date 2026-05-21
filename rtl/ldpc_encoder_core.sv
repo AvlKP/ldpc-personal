@@ -3,11 +3,7 @@ import ldpc_pkg::*;
 module ldpc_encoder_core #(
   // Top-level parameters mirroring the sub-modules
   parameter int ZC_PER_CS = 96,
-  parameter int NUM_CS = 4,
-
-  localparam int unsigned ROW_WIDTH = $clog2(BG1_ROW_N),
-  localparam int unsigned COL_WIDTH = $clog2(BG1_COL_N)
-
+  parameter int NUM_CS = 4
 ) (
   input logic clk_i,
   input logic arst_ni,
@@ -26,12 +22,10 @@ module ldpc_encoder_core #(
   output logic [KB_WIDTH-1:0] info_group_sel_o,
   input logic [ZC_MAX-1:0] info_group_i,
 
-  input logic outbuff_full_i,
-  output logic [6:0] outbuff_addr_o,
-  output logic outbuff_wr_en_o,
-  output logic [ZC_MAX-1:0] outbuff_data_o,
-  output logic cw_done_o, // Pulses on final write
-  output logic [10:0] total_words_o // Passed to buffer for AXI TLAST
+  output logic codeword_valid_o,
+  input logic [COL_WIDTH-1:0] r_addr_i,
+  output logic [ZC_MAX-1:0] r_data_o,
+  input logic codeword_done_i
 );
 
 localparam int unsigned IDX_WIDTH = $clog2(NUM_CS);
@@ -56,19 +50,24 @@ always_comb begin
     endcase  
 end
   
+logic cw_ready;
+logic cw_last_col;
+
 // Row counters
 // initial 4 row counter for CALC_LAMBDA
 logic [ROW_WIDTH-1:0] row_cnt_q, row_cnt_n;
 logic [ROW_WIDTH-1:0] row_limit;
-logic [KB_WIDTH-1:0] kb_max;
+// logic [KB_WIDTH-1:0] kb_max;
 logic rowgrp_changed_q, rowgrp_changed_qdly; // row group change signal
 logic csr_valid_q, csr_valid_qdly;
 logic csr_start;
-logic stall_en;
+// logic stall_en;
 
-assign kb_max = base_graph_i ? KB_WIDTH'(KB_BG2-1) : KB_WIDTH'(KB_BG1-1);
+// assign kb_max = base_graph_i ? KB_WIDTH'(KB_BG2-1) : KB_WIDTH'(KB_BG1-1);
 assign row_limit = (base_graph_i)? 
     ROW_WIDTH'(BG2_ROW_N) : ROW_WIDTH'(BG1_ROW_N);
+
+assign cw_last_col = (row_cnt_n >= row_limit) & rowgrp_changed_qdly;
 
 // FSM
 typedef enum logic [1:0] { 
@@ -100,7 +99,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
     row_cnt_q <= row_cnt_q;
     inbuff_clear_o <= 0;
   end
-  else if (rowgrp_changed_q) begin
+  else if (rowgrp_changed_q & ~rowgrp_changed_qdly) begin
     if (row_cnt_n >= row_limit) begin
       // transition to IDLE after processing is finished
       row_cnt_q <= '0;
@@ -118,7 +117,7 @@ logic csr_start_init, csr_start_calc;
 assign csr_start_init = (state_q == IDLE) 
                       & (inbuff_valid_i & ~inbuff_clear_o);
 assign csr_start_calc = (state_q != IDLE)
-                      & (rowgrp_changed_q & (row_cnt_n < row_limit));
+                      & (rowgrp_changed_qdly & (row_cnt_n < row_limit));
 assign csr_start = csr_start_init | csr_start_calc;
 
 // initial start for CSR, not core
@@ -148,7 +147,7 @@ always_comb begin
   unique case (state_q)
     IDLE:
       if (inbuff_valid_i & ~inbuff_clear_o 
-        & ~outbuff_full_i & csr_valid_q)
+        & cw_ready & csr_valid_q)
           state_n = CALC_LAMBDA; // start
       else state_n = IDLE;
     CALC_LAMBDA:
@@ -179,6 +178,7 @@ logic [COL_WIDTH-1:0] col_curr_q;
 logic [3:0] gf2_en_q, gf2_en_qdly;
 logic [NUM_CS-1:0] cs_pc_sel_q, cs_pc_sel_qdly;
 logic [3:0][ROW_WIDTH-1:0] actual_row_q;
+logic [3:0][ROW_WIDTH-1:0] actual_row_qdly;
 logic csr_ready;
 
 assign csr_ready = ~rowgrp_changed_q;
@@ -191,11 +191,13 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
     csr_valid_qdly <= 0;
     rowgrp_changed_qdly <= 0;
     cs_pc_sel_qdly <= '0;
+    actual_row_qdly <= '0;
   end else begin
     if (csr_valid_q) begin
       permutation_qdly <= permutation_q;
       gf2_en_qdly <= gf2_en_q;
       cs_pc_sel_qdly <= cs_pc_sel_q;
+      actual_row_qdly <= actual_row_q;
     end else gf2_en_qdly <= '0;
 
     csr_valid_qdly <= csr_valid_q;
@@ -226,7 +228,6 @@ csr_decoder csr_decoder (
 
 logic [3:0][(ZC_MAX >> 2)-1:0] cs_data_in, cs_data_out;
 
-// TODO: check why cs_data_out is zeroed out at some places
 top_level_shifter #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */)
@@ -347,7 +348,7 @@ always_comb begin
   end
 end
 
-logic [ZC_MAX-1:0] parity_core_packed, parity_additional_packed;
+logic [3:0][(ZC_MAX >> 2)-1:0] parity_core_packed;
 logic parity_core_valid, parity_additional_valid;
 logic info_valid;
 
@@ -355,37 +356,19 @@ always_comb begin
   case (zc_group)
     ZC_SMALL: begin
       for (int unsigned i = 0; i < 4; i++) begin
-        parity_core_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
-          parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
-        
-        parity_additional_packed[(ZC_MAX >> 2)*i +: (ZC_MAX >> 2)] = 
-          parity_additional[i][(ZC_MAX >> 2)-1:0];
+        parity_core_packed[i] = parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
       end
     end
     
     ZC_MEDIUM: begin
       for (int unsigned i = 0; i < 2; i++) begin
-        parity_core_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] =
+        {parity_core_packed[2*i+1], 
+         parity_core_packed[2*i]} = 
           parity_core[merge_row_idx + i][ZC_MAX-1 -: (ZC_MAX >> 1)];
-
-        parity_additional_packed[(ZC_MAX >> 1)*i +: (ZC_MAX >> 1)] = 
-          {parity_additional[2*i+1][(ZC_MAX >> 2)-1:0],
-          parity_additional[2*i][(ZC_MAX >> 2)-1:0]};
       end
     end 
-    ZC_LARGE: begin
-      parity_core_packed = parity_core[merge_row_idx];
-
-      parity_additional_packed =
-        {parity_additional[3], 
-        parity_additional[2],
-        parity_additional[1],
-        parity_additional[0]};
-    end
-    default: begin
-      parity_core_packed = '0;
-      parity_additional_packed = '0;
-    end
+    ZC_LARGE: {parity_core_packed} = parity_core[merge_row_idx];
+    default: parity_core_packed = '0;
   endcase
 end
 
@@ -393,29 +376,30 @@ assign info_valid = (state_q == CALC_LAMBDA);
 assign parity_core_valid = (state_q == CALC_PC);
 assign parity_additional_valid = (state_q == CALC_PA) & rowgrp_changed_qdly;
 
-codeword_generator #(
-  .ZC_MAX    (ZC_MAX /* default 384 */),
-  .ADDR_WIDTH(7 /* default 7 */)
- ) codeword_generator (
-  .clk                      (clk_i),
-  .rst_n                    (arst_ni),
-  .expected_cw_bits_i       (output_bits_i),
-  .zc_i                     (lifting_size_i),
-  .info_group_i             (info_group_i),
-  .info_valid_i             (info_valid),
-  .kb_max_i                 (kb_max),
-  .curr_col_i               (col_curr_q),
-  .parity_core_i            (parity_core_packed),
-  .parity_core_valid_i      (parity_core_valid),
-  .parity_additional_i      (parity_additional_packed),
-  .parity_additional_valid_i(parity_additional_valid),
-  .parity_groups_i          (zc_group),
-  .outbuff_full_i           (outbuff_full_i),
-  .core_stall_o             (stall_en),
-  .outbuff_data_o           (outbuff_data_o),
-  .outbuff_addr_o           (outbuff_addr_o),
-  .outbuff_wr_en_o          (outbuff_wr_en_o),
-  .cw_done_o                (cw_done_o),
-  .total_words_o            (total_words_o)
+logic [3:0][ROW_WIDTH:0] parity_additional_idx;
+always_comb begin
+  for (int unsigned i = 0; i < 4; i++) begin
+    parity_additional_idx[i] = {1'b0, actual_row_qdly[i]};
+  end
+end
+
+codeword_generator codeword_generator (
+  .clk_i                (clk_i),
+  .arst_ni              (arst_ni),
+  .zc_group_i           (zc_group),
+  .info_valid_i         (info_valid),
+  .info_data_i          (data_segment),
+  .core_parity_valid_i  (parity_core_valid),
+  .core_parity_data_i   (parity_core_packed),
+  .add_parity_valid_i   (parity_additional_valid),
+  .add_parity_idx_i     (parity_additional_idx),
+  .add_parity_data_i    (parity_additional),
+  // .base_graph_i         (base_graph_i),
+  .input_last_subblock_i(cw_last_col),
+  .upstream_ready_o     (cw_ready),
+  .codeword_valid_o     (codeword_valid_o),
+  .r_addr_i             (r_addr_i),
+  .r_data_o             (r_data_o),
+  .codeword_done_i      (codeword_done_i)
 );
 endmodule
