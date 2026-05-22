@@ -76,8 +76,10 @@ module codeword_generator #(
     // -------------------------------------------------------------------------
     // 1. Padding Removal & Chunk Packing (Combinational)
     // -------------------------------------------------------------------------
-    assign active_parity = parity_core_valid_i ? parity_core_i : parity_additional_i;
-    
+    // active_parity is only used for the multi-chunk parity_core path now;
+    // parity_additional arrives one row at a time from the reorder buffer.
+    assign active_parity = parity_core_i;
+
     always_comb begin
         ext_data            = '0;
         ext_len             = '0;
@@ -92,7 +94,7 @@ module codeword_generator #(
                 ext_valid            = 1'b1;
                 info_group_accepted  = 1'b1;
             end
-            else if (parity_core_valid_i || parity_additional_valid_i) begin
+            else if (parity_core_valid_i) begin
                 ext_valid = 1'b1;
                 case (parity_groups_i)
                     ZC_SMALL: begin
@@ -130,6 +132,13 @@ module codeword_generator #(
                     end
                 endcase
             end
+            else if (parity_additional_valid_i) begin
+                // Single row from the reorder buffer: Z bits MSB-packed in
+                // [ZC_MAX-1:ZC_MAX-Z], regardless of zc_group.
+                ext_data[ZC_MAX-1:0] = parity_additional_i;
+                ext_len              = {7'd0, zc_i};
+                ext_valid            = 1'b1;
+            end
         end
     end
 
@@ -143,6 +152,13 @@ module codeword_generator #(
     assign is_last_input = ext_valid && ((total_processed_bits + ext_len) >= expected_cw_bits_i);
     assign core_stall_o  = outbuff_full_i || (state == ST_FLUSH);
     assign total_words_o = (expected_cw_bits_i + 16'd31) >> 5;
+
+    // 1-cycle delayed curr_col_i, used when marking info_group_seen_q.
+    logic [COL_WIDTH-1:0] curr_col_q;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) curr_col_q <= '0;
+        else        curr_col_q <= curr_col_i;
+    end
 
     always_comb begin
         next_pack_cnt = pack_cnt + ext_len;
@@ -172,7 +188,7 @@ module codeword_generator #(
                 ST_ACCUMULATE: begin
                     if (ext_valid) begin
                         total_processed_bits <= total_processed_bits + ext_len;
-                        if (info_group_accepted) info_group_seen_q[curr_col_i] <= 1'b1;
+                        if (info_group_accepted) info_group_seen_q[curr_col_q] <= 1'b1;
 
                         if (next_pack_cnt >= OUT_WIDTH) begin
                             outbuff_wr_en_o <= 1'b1;

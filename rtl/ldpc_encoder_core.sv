@@ -58,12 +58,12 @@ end
   
 // Row counters
 // initial 4 row counter for CALC_LAMBDA
-logic [ROW_WIDTH-1:0] row_cnt_q, row_cnt_n;
+logic [ROW_WIDTH-1:0] row_cnt_q, row_cnt_n, row_cnt_n_q;
 logic [ROW_WIDTH-1:0] row_limit;
 logic [KB_WIDTH-1:0] kb_max;
 logic rowgrp_changed_q, rowgrp_changed_qdly; // row group change signal
 logic csr_valid_q, csr_valid_qdly;
-logic csr_start;
+logic csr_start, csr_start_q;
 logic stall_en;
 
 assign kb_max = base_graph_i ? KB_WIDTH'(KB_BG2-1) : KB_WIDTH'(KB_BG1-1);
@@ -88,7 +88,13 @@ always_comb begin
     ZC_MEDIUM: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 1);
     ZC_LARGE: row_cnt_n = row_cnt_q + ROW_WIDTH'(1'b1 << 0);
     default: row_cnt_n = row_cnt_q;
-  endcase  
+  endcase
+end
+
+// 1-cycle delayed row_cnt_n, used for the CALC_PA -> IDLE transition.
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) row_cnt_n_q <= '0;
+  else          row_cnt_n_q <= row_cnt_n;
 end
 
 always_ff @(posedge clk_i or negedge arst_ni) begin
@@ -100,7 +106,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
     row_cnt_q <= row_cnt_q;
     inbuff_clear_o <= 0;
   end
-  else if (rowgrp_changed_q) begin
+  else if (rowgrp_changed_q & ~rowgrp_changed_qdly) begin
     if (row_cnt_n >= row_limit) begin
       // transition to IDLE after processing is finished
       row_cnt_q <= '0;
@@ -109,7 +115,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
       row_cnt_q <= row_cnt_n;
       inbuff_clear_o <= 0;
     end
-  end    
+  end
 end
 
 // TODO: optimize this (new state?)
@@ -120,6 +126,11 @@ assign csr_start_init = (state_q == IDLE)
 assign csr_start_calc = (state_q != IDLE)
                       & (rowgrp_changed_q & (row_cnt_n < row_limit));
 assign csr_start = csr_start_init | csr_start_calc;
+
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) csr_start_q <= 0;
+  else          csr_start_q <= csr_start;
+end
 
 // initial start for CSR, not core
 assign idle_o = (state_q == IDLE);
@@ -162,7 +173,7 @@ always_comb begin
     CALC_PA:
       // csr decoder will assert rowgrp_changed_q at +1 cycle after last permutation
       // last pa will be available by then
-      if (row_cnt_n >= row_limit & rowgrp_changed_q) 
+      if (row_cnt_n_q >= row_limit & rowgrp_changed_q)
         state_n = IDLE;
       else state_n = CALC_PA;
     default: state_n = CALC_PA;
@@ -179,6 +190,14 @@ logic [COL_WIDTH-1:0] col_curr_q;
 logic [3:0] gf2_en_q, gf2_en_qdly;
 logic [NUM_CS-1:0] cs_pc_sel_q, cs_pc_sel_qdly;
 logic [3:0][ROW_WIDTH-1:0] actual_row_q;
+// 1-cycle delayed view of actual_row_q to align with parity_additional_valid
+// (which fires on rowgrp_changed_qdly, i.e. one cycle after csr_decoder has
+// already advanced past the rowgrp that produced the parity).
+logic [3:0][ROW_WIDTH-1:0] actual_row_qdly;
+// 1-cycle delayed row_cnt_q. The lower 2 bits tell the reorder buffer which
+// sub-cycle within the rowgrp this parity_additional event belongs to (so it
+// can select which of the 4 actual_row entries are active for ZC_MEDIUM/LARGE).
+logic [ROW_WIDTH-1:0] row_cnt_qdly;
 logic csr_ready;
 
 assign csr_ready = ~rowgrp_changed_q;
@@ -191,6 +210,8 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
     csr_valid_qdly <= 0;
     rowgrp_changed_qdly <= 0;
     cs_pc_sel_qdly <= '0;
+    actual_row_qdly <= '0;
+    row_cnt_qdly <= '0;
   end else begin
     if (csr_valid_q) begin
       permutation_qdly <= permutation_q;
@@ -200,7 +221,9 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
 
     csr_valid_qdly <= csr_valid_q;
     rowgrp_changed_qdly <= rowgrp_changed_q;
-  end 
+    actual_row_qdly <= actual_row_q;
+    row_cnt_qdly <= row_cnt_q;
+  end
 end
 
 logic [ROW_WIDTH-1:0] row_cnt_csr;
@@ -212,7 +235,7 @@ csr_decoder csr_decoder (
   .arst_ni       (arst_ni),
   .ldpc_ready_i  (csr_ready),
   .ldpc_valid_o  (csr_valid_q),
-  .start_i       (csr_start),
+  .start_i       (csr_start_q),
   .base_graph_i  (base_graph_i),
   .lifting_size_i(lifting_size_i),
   .row_i         (row_cnt_csr),
@@ -391,7 +414,34 @@ end
 
 assign info_valid = (state_q == CALC_LAMBDA);
 assign parity_core_valid = (state_q == CALC_PC);
-assign parity_additional_valid = (state_q == CALC_PA) & rowgrp_changed_qdly;
+assign parity_additional_valid = (state_q == CALC_PA || state_q == IDLE) & rowgrp_changed_qdly & rowgrp_changed_q; // Make it only 1 cycle
+
+// Petrović row-schedule rearrangement makes additional parity bits arrive in
+// an order different from the natural 5G NR row order. Reorder them by
+// actual_row before handing to codeword_generator. actual_row_qdly[0] is the
+// starting row index of the current row group (rows 0..3 are core parity, so
+// additional parity always starts at row 4).
+logic [ZC_MAX-1:0] parity_additional_ordered;
+logic              parity_additional_ordered_valid;
+
+parity_additional_reorder #(
+  .N_BUF(48)
+) parity_additional_reorder_inst (
+  .clk_i        (clk_i),
+  .arst_ni      (arst_ni),
+  // Don't flush when the encoder returns to IDLE — the reorder buffer keeps
+  // draining buffered rows during IDLE and self-wraps once expected_row_q
+  // reaches row_limit, so it is ready for the next codeword.
+  .flush_i      (1'b0),
+  .base_graph_i (base_graph_i),
+  .zc_group_i   (zc_group),
+  .sub_cycle_i  (row_cnt_qdly[1:0]),
+  .valid_i      (parity_additional_valid),
+  .data_i       (parity_additional_packed),
+  .actual_row_i (actual_row_qdly),
+  .valid_o      (parity_additional_ordered_valid),
+  .data_o       (parity_additional_ordered)
+);
 
 codeword_generator #(
   .ZC_MAX    (ZC_MAX /* default 384 */),
@@ -407,8 +457,8 @@ codeword_generator #(
   .curr_col_i               (col_curr_q),
   .parity_core_i            (parity_core_packed),
   .parity_core_valid_i      (parity_core_valid),
-  .parity_additional_i      (parity_additional_packed),
-  .parity_additional_valid_i(parity_additional_valid),
+  .parity_additional_i      (parity_additional_ordered),
+  .parity_additional_valid_i(parity_additional_ordered_valid),
   .parity_groups_i          (zc_group),
   .outbuff_full_i           (outbuff_full_i),
   .core_stall_o             (stall_en),
