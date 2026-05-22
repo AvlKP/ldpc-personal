@@ -25,7 +25,11 @@ module ldpc_encoder_core #(
   output logic codeword_valid_o,
   input logic [COL_WIDTH-1:0] r_addr_i,
   output logic [ZC_MAX-1:0] r_data_o,
-  input logic codeword_done_i
+  input logic codeword_done_i,
+
+  output logic [ZC_WIDTH-1:0] lifting_size_o,
+  output zc_group_t zc_group_o,
+  output logic base_graph_o
 );
 
 localparam int unsigned IDX_WIDTH = $clog2(NUM_CS);
@@ -117,7 +121,7 @@ logic csr_start_init, csr_start_calc;
 assign csr_start_init = (state_q == IDLE) 
                       & (inbuff_valid_i & ~inbuff_clear_o);
 assign csr_start_calc = (state_q != IDLE)
-                      & (rowgrp_changed_qdly & (row_cnt_n < row_limit));
+                      & (rowgrp_changed_qdly & (row_cnt_q < row_limit));
 assign csr_start = csr_start_init | csr_start_calc;
 
 // initial start for CSR, not core
@@ -161,7 +165,7 @@ always_comb begin
     CALC_PA:
       // csr decoder will assert rowgrp_changed_q at +1 cycle after last permutation
       // last pa will be available by then
-      if (row_cnt_n >= row_limit & rowgrp_changed_q) 
+      if (row_cnt_n >= row_limit & (rowgrp_changed_q & ~rowgrp_changed_qdly)) 
         state_n = IDLE;
       else state_n = CALC_PA;
     default: state_n = CALC_PA;
@@ -279,7 +283,7 @@ merge_select_lambda #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */)
  ) merge_select_lambda (
-  .d       (zc_group),
+  .zc_group (zc_group),
   .d_cycle (merge_d_cycle),
   .data_in (row_sum),
   .data_out(lambda)
@@ -356,18 +360,18 @@ always_comb begin
   case (zc_group)
     ZC_SMALL: begin
       for (int unsigned i = 0; i < 4; i++) begin
-        parity_core_packed[i] = parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
+        parity_core_packed[3-i] = parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
       end
     end
     
     ZC_MEDIUM: begin
       for (int unsigned i = 0; i < 2; i++) begin
-        {parity_core_packed[2*i+1], 
-         parity_core_packed[2*i]} = 
+        {parity_core_packed[3 - 2*i], 
+         parity_core_packed[2 - 2*i]} = 
           parity_core[merge_row_idx + i][ZC_MAX-1 -: (ZC_MAX >> 1)];
       end
     end 
-    ZC_LARGE: {parity_core_packed} = parity_core[merge_row_idx];
+    ZC_LARGE: {parity_core_packed[0], parity_core_packed[1], parity_core_packed[2], parity_core_packed[3]} = parity_core[merge_row_idx];
     default: parity_core_packed = '0;
   endcase
 end
@@ -394,12 +398,16 @@ codeword_generator codeword_generator (
   .add_parity_valid_i   (parity_additional_valid),
   .add_parity_idx_i     (parity_additional_idx),
   .add_parity_data_i    (parity_additional),
-  // .base_graph_i         (base_graph_i),
+  .base_graph_i         (base_graph_i),
+  .lifting_size_i       (lifting_size_i),
   .input_last_subblock_i(cw_last_col),
   .upstream_ready_o     (cw_ready),
   .codeword_valid_o     (codeword_valid_o),
   .r_addr_i             (r_addr_i),
   .r_data_o             (r_data_o),
-  .codeword_done_i      (codeword_done_i)
+  .codeword_done_i      (codeword_done_i),
+  .base_graph_o         (base_graph_o),
+  .lifting_size_o       (lifting_size_o),
+  .zc_group_o           (zc_group_o)
 );
 endmodule

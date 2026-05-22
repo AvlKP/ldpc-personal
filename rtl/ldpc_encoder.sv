@@ -149,10 +149,14 @@ logic core_done;
 logic core_idle;
 logic [10:0] core_word_cnt;
 
-logic outbuff_full;
-logic outbuff_wr_en;
-logic [6:0] outbuff_addr;
-logic [ZC_MAX-1:0] outbuff_data;
+logic [ZC_WIDTH-1:0] outbuff_lifting_size;
+logic outbuff_base_graph;
+zc_group_t outbuff_zc_group;
+
+logic cw_valid;
+logic [COL_WIDTH-1:0] cw_r_addr;
+logic [ZC_MAX-1:0] cw_r_data;
+logic outbuff_done;
 
 // ==== AXI Stream input ====
 input_buffer input_buffer (
@@ -177,24 +181,23 @@ input_buffer input_buffer (
 
 // ==== AXI Stream output ====
 output_buffer #(
-  .ZC_MAX    (ZC_MAX /* default 384 */),
-  .ADDR_WIDTH(7)
+  .DATA_WIDTH(32)
  ) output_buffer (
-  .clk           (clk_i),
-  .rst_n         (arst_ni),
-  .wr_data_i     (outbuff_data),
-  .wr_addr_i     (outbuff_addr),
-  .wr_en_i       (outbuff_wr_en),
-  .cw_done_i     (core_done),
-  .total_words_i (core_word_cnt),
-  .outbuff_full_o(outbuff_full),
-  .m_axis_tdata  (m_axis_tdata),
-  .m_axis_tlast  (m_axis_tlast),
-  .m_axis_tvalid (m_axis_tvalid),
-  .m_axis_tready (m_axis_tready)
+  .clk_i           (clk_i),
+  .arst_ni         (arst_ni),
+  .base_graph_i    (outbuff_base_graph),
+  .lifting_size_i  (outbuff_lifting_size),
+  .zc_group_i      (outbuff_zc_group),
+  .codeword_valid_i(cw_valid),
+  .codeword_done_o (outbuff_done),
+  .r_addr_o        (cw_r_addr),
+  .r_data_i        (cw_r_data),
+  .m_axis_tdata    (m_axis_tdata),
+  .m_axis_tvalid   (m_axis_tvalid),
+  .m_axis_tready   (m_axis_tready),
+  .m_axis_tlast    (m_axis_tlast)
 );
 
-// ==== LDPC Core ====
 ldpc_encoder_core #(
   .ZC_PER_CS(96),
   .NUM_CS   (4)
@@ -210,12 +213,13 @@ ldpc_encoder_core #(
   .inbuff_valid_i  (core_valid),
   .info_group_sel_o(core_kb),
   .info_group_i    (core_data_in),
-  .outbuff_full_i  (outbuff_full),
-  .outbuff_addr_o  (outbuff_addr),
-  .outbuff_wr_en_o (outbuff_wr_en),
-  .outbuff_data_o  (outbuff_data),
-  .cw_done_o       (core_done),
-  .total_words_o   (core_word_cnt)
+  .codeword_valid_o(cw_valid),
+  .r_addr_i        (cw_r_addr),
+  .r_data_o        (cw_r_data),
+  .codeword_done_i (outbuff_done),
+  .lifting_size_o  (outbuff_lifting_size),
+  .zc_group_o      (outbuff_zc_group),
+  .base_graph_o    (outbuff_base_graph)
 );
 
 endmodule

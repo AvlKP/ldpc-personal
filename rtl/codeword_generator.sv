@@ -1,227 +1,260 @@
 import ldpc_pkg::*;
 
-module codeword_generator #(
-    parameter int ZC_MAX     = 384,
-    parameter int ADDR_WIDTH = 7
-)(
-    input  logic                        clk,
-    input  logic                        rst_n,
+module codeword_generator (
+    input logic clk_i,
+    input logic arst_ni,
 
-    // Top-Level Configuration
-    input  logic [15:0]                 expected_cw_bits_i,
-    input  logic [8:0]                  zc_i,
+    // Upstream Encoder Core Interface
+    input logic [ZC_WIDTH-1:0] lifting_size_i,
+    input zc_group_t zc_group_i,
+    input logic base_graph_i,
 
-    // LDPC Core Interfaces
-    // Information bits (1 group per cycle = max 384 bits)
-    input  logic [ZC_MAX-1:0]           info_group_i,
-    input  logic                        info_valid_i,
-    input  logic [KB_WIDTH-1:0]         kb_max_i,
-    input  logic [$clog2(BG1_COL_N)-1:0] curr_col_i,
+    input logic info_valid_i,
+    input logic [3:0][(ZC_MAX >> 2)-1:0] info_data_i,
 
-    // Core parity bits (Single 384-bit datapath partitioned into chunks)
-    input  logic [ZC_MAX-1:0]           parity_core_i,
-    input  logic                        parity_core_valid_i,
+    input logic core_parity_valid_i,
+    input logic [3:0][(ZC_MAX >> 2)-1:0] core_parity_data_i,
 
-    // Additional parity bits (Single 384-bit datapath partitioned into chunks)
-    input  logic [ZC_MAX-1:0]           parity_additional_i,
-    input  logic                        parity_additional_valid_i,
+    input logic add_parity_valid_i,
+    input logic [3:0][COL_WIDTH-1:0] add_parity_idx_i, 
+    input logic [3:0][(ZC_MAX >> 2)-1:0] add_parity_data_i,
 
-    // Parity Group Selector (ZC_SMALL: 4 groups, ZC_MEDIUM: 2 groups, ZC_LARGE: 1 group)
-    input  zc_group_t                   parity_groups_i,
+    input logic input_last_subblock_i,
+    output logic upstream_ready_o,
 
-    // Flow Control
-    input  logic                        outbuff_full_i,
-    output logic                        core_stall_o,
-    
-    // Output Buffer Interface
-    output logic [ZC_MAX-1:0]    outbuff_data_o,
-    output logic [ADDR_WIDTH-1:0]       outbuff_addr_o,
-    output logic                        outbuff_wr_en_o,
-    output logic                        cw_done_o,
-    output logic [10:0]                 total_words_o
+    // Inter-Module Interface to Output Buffer
+    output logic codeword_valid_o,
+    input logic [COL_WIDTH-1:0] r_addr_i,
+    output logic [ZC_MAX-1:0] r_data_o,
+    input logic codeword_done_i,
+
+    output logic [ZC_WIDTH-1:0] lifting_size_o,
+    output zc_group_t zc_group_o,
+    output logic base_graph_o
 );
 
-    localparam int unsigned COL_WIDTH = $clog2(BG1_COL_N);
-    localparam int OUT_WIDTH          = ZC_MAX; // 384 bits
+    // 4 Horizontally Separated Memory Sub-Banks (Depth: 256, Width: 96)
+    (* ram_style = "block" *) logic [(ZC_MAX >> 2)-1:0] ram [0:3][0:255];
 
-    // Internal Registers & Signals
-    logic [ADDR_WIDTH-1:0]  current_addr;
-    logic [15:0]            total_processed_bits;
-    logic [COL_WIDTH-1:0]   kb_max_ext;
-    logic                   info_group_pending;
-    logic [BG1_COL_N-1:0]   info_group_seen_q;
+    // Control and Interlock Boundary Tracking Registers
+    logic       w_swap_q, r_swap_q;
+    logic [1:0] bank_full_q;
+    logic [COL_WIDTH-1:0] w_seq_addr_q, w_seq_addr_n;
 
-    // Bit Extraction Signals
-    logic [ZC_MAX-1:0]      active_parity;
-    logic [ZC_MAX-1:0]      zc_mask;
-    logic [OUT_WIDTH-1:0]   ext_data;
-    logic [15:0]            ext_len;
-    logic                   ext_valid;
-    logic                   info_group_accepted;
+    // Structural Addressing and Muxing Vectors
+    logic [3:0][COL_WIDTH:0] w_addr;
+    logic [3:0][(ZC_MAX >> 2)-1:0] w_data_mux;
+    logic [3:0] w_en;                                      // Independent write enables per sub-bank
+    logic       input_stroke;
 
-    // Dynamic Packer Registers
-    logic [(OUT_WIDTH*2)-1:0] pack_reg;
-    logic [11:0]              pack_cnt; 
-    
-    typedef enum logic {
-        ST_ACCUMULATE,
-        ST_FLUSH
-    } state_t;
-    state_t state;
+    // Configuration double buffering registers
+    logic [1:0] base_graph_q;
+    logic [1:0][ZC_WIDTH-1:0] lifting_size_q;
+    zc_group_t [1:0] zc_group_q;
 
-    assign kb_max_ext = COL_WIDTH'(kb_max_i);
-    assign info_group_pending = info_valid_i 
-                              && (curr_col_i <= kb_max_ext) 
-                              && !info_group_seen_q[curr_col_i];
+    // Phase Boundary Alignment Evaluation Wires
+    logic [COL_WIDTH-1:0] core_parity_base_row;
+    logic [COL_WIDTH-1:0] add_parity_base_row;
+    logic [2:0] packing_factor;
+    logic [COL_WIDTH-1:0] core_parity_start_idx;
+    logic [COL_WIDTH-1:0] active_w_seq_addr;
+    logic [3:0][COL_WIDTH-1:0] rel_idx;
 
-    // -------------------------------------------------------------------------
-    // 1. Padding Removal & Chunk Packing (Combinational)
-    // -------------------------------------------------------------------------
-    assign active_parity = parity_core_valid_i ? parity_core_i : parity_additional_i;
-    
-    // Create a dynamic mask based on Zc to strip garbage/padding bits
-    assign zc_mask = (ZC_MAX'(1) << zc_i) - 1'b1;
+    assign input_stroke     = (info_valid_i | core_parity_valid_i | add_parity_valid_i) & upstream_ready_o;
+    assign upstream_ready_o = (w_swap_q == 1'b0) ? !bank_full_q[0] : !bank_full_q[1];
+    assign codeword_valid_o = (r_swap_q == 1'b0) ? bank_full_q[0] : bank_full_q[1];
 
+    //--------------------------------------------------------------------------
+    // Offsets & Phase Base Row and Stride Calculations
+    //--------------------------------------------------------------------------
     always_comb begin
-        ext_data            = '0; 
-        ext_len             = '0;
-        ext_valid           = 1'b0;
-        info_group_accepted = 1'b0;
+        unique case (zc_group_i)
+            ZC_SMALL: begin
+                core_parity_base_row = base_graph_i ? 7'd3 : 7'd6;   // ceil(10/4)=3, ceil(22/4)=6
+                add_parity_base_row  = core_parity_base_row + 7'd1; // Core parity takes exactly 1 row
+                packing_factor       = 3'd4;
+            end
+            ZC_MEDIUM: begin
+                core_parity_base_row = base_graph_i ? 7'd5 : 7'd11;  // ceil(10/2)=5, ceil(22/2)=11
+                add_parity_base_row  = core_parity_base_row + 7'd2; // Core parity takes exactly 2 rows
+                packing_factor       = 3'd2;
+            end
+            ZC_LARGE: begin
+                core_parity_base_row = base_graph_i ? 7'd10 : 7'd22; // 10/1=10, 22/1=22
+                add_parity_base_row  = core_parity_base_row + 7'd4; // Core parity takes exactly 4 rows
+                packing_factor       = 3'd1;
+            end
+            default: begin
+                core_parity_base_row = 7'd6;
+                add_parity_base_row  = 7'd7;
+                packing_factor       = 3'd4;
+            end
+        endcase
+        
+        // Calculate the absolute starting index to force a row alignment jump
+        core_parity_start_idx = core_parity_base_row * packing_factor;
+        
+        // Intercept unaligned transitions instantly during the current write cycle
+        active_w_seq_addr = (core_parity_valid_i && (w_seq_addr_q < core_parity_start_idx)) ? 
+                            core_parity_start_idx : w_seq_addr_q;
+    end
 
-        if (state == ST_ACCUMULATE && !outbuff_full_i) begin
-            if (info_group_pending) begin
-                // Info bits are 1 group per cycle, residing in the lower bits
-                ext_data[ZC_MAX-1:0] = info_group_i & zc_mask;
-                ext_len              = {7'd0, zc_i};
-                ext_valid            = 1'b1;
-                info_group_accepted  = 1'b1;
-            end 
-            else if (parity_core_valid_i || parity_additional_valid_i) begin
-                ext_valid = 1'b1;
-                case (parity_groups_i)
-                    ZC_SMALL: begin 
-                        // 4 Groups, Chunk size = 96
-                        logic [ZC_MAX-1:0] g0, g1, g2, g3;
-                        g0 = active_parity[95:0]    & zc_mask;
-                        g1 = active_parity[191:96]  & zc_mask;
-                        g2 = active_parity[287:192] & zc_mask;
-                        g3 = active_parity[383:288] & zc_mask;
-                        
-                        // Shift valid bits tightly together, skipping the 96-bit chunk boundaries
-                        ext_data[ZC_MAX-1:0] = (g3 << (3*zc_i)) | (g2 << (2*zc_i)) | (g1 << zc_i) | g0;
-                        ext_len              = {5'd0, zc_i, 2'b00}; // zc_i * 4
-                    end
-                    
-                    ZC_MEDIUM: begin 
-                        // 2 Groups, Chunk size = 192
-                        logic [ZC_MAX-1:0] g0, g1;
-                        g0 = active_parity[191:0]   & zc_mask;
-                        g1 = active_parity[383:192] & zc_mask;
-                        
-                        ext_data[ZC_MAX-1:0] = (g1 << zc_i) | g0;
-                        ext_len              = {6'd0, zc_i, 1'b0}; // zc_i * 2
-                    end
-                    
-                    ZC_LARGE: begin 
-                        // 1 Group, Chunk size = 384
-                        ext_data[ZC_MAX-1:0] = active_parity[383:0] & zc_mask;
-                        ext_len              = {7'd0, zc_i}; // zc_i * 1
-                    end
-                    
-                    default: begin
-                        ext_data[ZC_MAX-1:0] = active_parity[383:0] & zc_mask;
-                        ext_len              = {7'd0, zc_i};
-                    end
-                endcase
+    //--------------------------------------------------------------------------
+    // Sequential Ingestion Address Pointer Evolution
+    //--------------------------------------------------------------------------
+    always_comb begin
+        w_seq_addr_n = w_seq_addr_q;
+        if (upstream_ready_o) begin
+            if (info_valid_i) begin
+                if (input_last_subblock_i) w_seq_addr_n = '0;
+                else                       w_seq_addr_n = w_seq_addr_q + COL_WIDTH'(1);
+            end else if (core_parity_valid_i) begin
+                // Force step-pointer forward past the padding gap if entering unaligned
+                if (w_seq_addr_q < core_parity_start_idx) begin
+                    w_seq_addr_n = core_parity_start_idx + COL_WIDTH'(packing_factor);
+                end else if (input_last_subblock_i) begin
+                    w_seq_addr_n = '0;
+                end else begin
+                    w_seq_addr_n = w_seq_addr_q + COL_WIDTH'(packing_factor);
+                end
+            end else if (add_parity_valid_i & input_last_subblock_i) begin
+                w_seq_addr_n = '0;
             end
         end
     end
 
-    // -------------------------------------------------------------------------
-    // 2. Dynamic Continuous Packer FSM (Sequential)
-    // -------------------------------------------------------------------------
-    logic [(OUT_WIDTH*2)-1:0] next_pack_reg;
-    logic [12:0]              next_pack_cnt; 
-    logic                     is_last_input;
-
-    assign is_last_input = ext_valid && ((total_processed_bits + ext_len) >= expected_cw_bits_i);
-    assign core_stall_o  = outbuff_full_i || (state == ST_FLUSH);
-    assign total_words_o = (expected_cw_bits_i + 16'd31) >> 5;
-
+    //--------------------------------------------------------------------------
+    // Address Steering Matrix & Sub-Bank Write Enable Decoding
+    //--------------------------------------------------------------------------
     always_comb begin
-        next_pack_cnt = pack_cnt + ext_len;
-        next_pack_reg = pack_reg | ( ((OUT_WIDTH*2)'(ext_data)) << pack_cnt );
-    end
+        w_en       = '0;
+        w_data_mux = core_parity_data_i;
+        for (int unsigned i = 0; i < 4; i++) begin
+            w_addr[i]  = {w_swap_q, active_w_seq_addr}; 
+            rel_idx[i] = add_parity_idx_i[i] - COL_WIDTH'(4);
+        end
 
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            state                <= ST_ACCUMULATE;
-            current_addr         <= '0;
-            total_processed_bits <= '0;
-            info_group_seen_q    <= '0;
-            pack_reg             <= '0;
-            pack_cnt             <= '0;
-            outbuff_wr_en_o      <= 1'b0;
-            outbuff_addr_o       <= '0;
-            outbuff_data_o       <= '0;
-            cw_done_o            <= 1'b0;
-        end else begin
-            outbuff_wr_en_o <= 1'b0;
-            cw_done_o       <= 1'b0;
-
-            case (state)
-                ST_ACCUMULATE: begin
-                    if (ext_valid) begin
-                        total_processed_bits <= total_processed_bits + ext_len;
-                        if (info_group_accepted) info_group_seen_q[curr_col_i] <= 1'b1;
-
-                        if (next_pack_cnt >= OUT_WIDTH) begin
-                            outbuff_wr_en_o <= 1'b1;
-                            outbuff_addr_o  <= current_addr;
-                            outbuff_data_o  <= next_pack_reg[OUT_WIDTH-1:0];
-                            
-                            pack_reg        <= next_pack_reg >> OUT_WIDTH;
-                            pack_cnt        <= next_pack_cnt - OUT_WIDTH;
-                            current_addr    <= current_addr + 1'b1;
-
-                            if (is_last_input) begin
-                                if ((next_pack_cnt - OUT_WIDTH) > 0) begin
-                                    state <= ST_FLUSH;
-                                end else begin
-                                    cw_done_o            <= 1'b1;
-                                    current_addr         <= '0;
-                                    total_processed_bits <= '0;
-                                    info_group_seen_q    <= '0;
-                                    pack_reg             <= '0;
-                                    pack_cnt             <= '0;
-                                end
-                            end
-                        end else begin
-                            pack_reg <= next_pack_reg;
-                            pack_cnt <= next_pack_cnt;
-
-                            if (is_last_input) begin
-                                state <= ST_FLUSH;
-                            end
-                        end
+        // Phase A: Systematic/Info Ingestion (Arrives 1-by-1)
+        if (info_valid_i) begin
+            w_data_mux = info_data_i;
+            unique case (zc_group_i)
+                ZC_SMALL: begin
+                    w_en[active_w_seq_addr[1:0]] = upstream_ready_o;
+                    for (int unsigned i = 0; i < 4; i++) begin
+                        w_addr[i] = {w_swap_q, 2'b00, active_w_seq_addr[COL_WIDTH-1:2]};
                     end
                 end
+                ZC_MEDIUM: begin
+                    if (active_w_seq_addr[0] == 1'b0) w_en[1:0] = {2{upstream_ready_o}};
+                    else                              w_en[3:2] = {2{upstream_ready_o}};
+                    for (int unsigned i = 0; i < 4; i++) begin
+                        w_addr[i] = {w_swap_q, 1'b0, active_w_seq_addr[COL_WIDTH-1:1]};
+                    end
+                end
+                ZC_LARGE: begin
+                    w_en = {4{upstream_ready_o}};
+                    for (int unsigned i = 0; i < 4; i++) begin
+                        w_addr[i] = {w_swap_q, active_w_seq_addr};
+                    end
+                end
+            endcase
 
-                ST_FLUSH: begin
-                    outbuff_wr_en_o      <= 1'b1;
-                    outbuff_addr_o       <= current_addr;
-                    outbuff_data_o       <= pack_reg[OUT_WIDTH-1:0];
-                    cw_done_o            <= 1'b1;
-                    
-                    state                <= ST_ACCUMULATE;
-                    current_addr         <= '0;
-                    total_processed_bits <= '0;
-                    info_group_seen_q    <= '0;
-                    pack_reg             <= '0;
-                    pack_cnt             <= '0;
+        // Phase B: Core Parity Ingestion (Row Aligned, Groups of 4/2/1)
+        end else if (core_parity_valid_i) begin
+            w_data_mux = core_parity_data_i;
+            w_en       = {4{upstream_ready_o}};
+            unique case (zc_group_i)
+                ZC_SMALL:  for (int unsigned i = 0; i < 4; i++) w_addr[i] = {w_swap_q, 2'b00, active_w_seq_addr[COL_WIDTH-1:2]};
+                ZC_MEDIUM: for (int unsigned i = 0; i < 4; i++) w_addr[i] = {w_swap_q, 1'b0,  active_w_seq_addr[COL_WIDTH-1:1]};
+                ZC_LARGE:  for (int unsigned i = 0; i < 4; i++) w_addr[i] = {w_swap_q,        active_w_seq_addr};
+            endcase
+
+        // Phase C: Additional Parity Ingestion (Out-of-order, appended past Parity blocks)
+        end else if (add_parity_valid_i) begin
+            w_data_mux = add_parity_data_i;
+            w_en       = {4{upstream_ready_o}};
+            
+            unique case (zc_group_i)
+                ZC_SMALL: begin
+                    for (int unsigned i = 0; i < 4; i++) begin
+                        w_addr[i] = {w_swap_q, add_parity_base_row + (rel_idx[i] >> 2)};
+                    end
+                end
+                ZC_MEDIUM: begin
+                    w_addr[0] = {w_swap_q, add_parity_base_row + (rel_idx[0] >> 1)};
+                    w_addr[1] = {w_swap_q, add_parity_base_row + (rel_idx[0] >> 1)};
+                    w_addr[2] = {w_swap_q, add_parity_base_row + (rel_idx[1] >> 1)};
+                    w_addr[3] = {w_swap_q, add_parity_base_row + (rel_idx[1] >> 1)};
+                end
+                ZC_LARGE: begin
+                    for (int unsigned i = 0; i < 4; i++) begin
+                        w_addr[i] = {w_swap_q, add_parity_base_row + rel_idx[0]};
+                    end
                 end
             endcase
         end
     end
+
+    //--------------------------------------------------------------------------
+    // Sub-Bank Physical Hardware Memory Writing
+    //--------------------------------------------------------------------------
+    always_ff @(posedge clk_i) begin
+        for (int unsigned i = 0; i < 4; i++) begin
+            if (w_en[i]) begin
+                ram[i][w_addr[i]] <= w_data_mux[i];
+            end
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // Read Port Structural Mapping
+    //--------------------------------------------------------------------------
+    logic [COL_WIDTH:0] r_addr;
+    assign r_addr = {r_swap_q, r_addr_i};
+
+    always_ff @(posedge clk_i) begin
+        for (int unsigned i = 0; i < 4; i++) begin
+            r_data_o[i*(ZC_MAX >> 2) +: (ZC_MAX >> 2)] <= ram[i][r_addr];
+        end
+    end
+
+    //--------------------------------------------------------------------------
+    // Control Boundaries and Swap State Machinery
+    //--------------------------------------------------------------------------
+    always_ff @(posedge clk_i or negedge arst_ni) begin
+        if (!arst_ni) begin
+            r_swap_q       <= 1'b0;
+            w_swap_q       <= 1'b0;
+            bank_full_q    <= 2'b00;
+            w_seq_addr_q   <= '0;
+            base_graph_q   <= '0;
+            lifting_size_q <= '0;
+            zc_group_q     <= '0;
+        end else begin
+            w_seq_addr_q <= w_seq_addr_n;
+
+            if (input_stroke & input_last_subblock_i) begin
+                w_swap_q              <= ~w_swap_q;
+                bank_full_q[w_swap_q] <= 1'b1;
+
+                base_graph_q[w_swap_q]   <= base_graph_i;
+                lifting_size_q[w_swap_q] <= lifting_size_i;
+                zc_group_q[w_swap_q]     <= zc_group_i;
+            end
+
+            if (codeword_done_i) begin
+                r_swap_q              <= ~r_swap_q;
+                bank_full_q[r_swap_q] <= 1'b0;
+
+                base_graph_q[r_swap_q]   <= '0;
+                lifting_size_q[r_swap_q] <= '0;
+                zc_group_q[r_swap_q]     <= ZC_SMALL;
+            end
+        end
+    end
+
+    assign lifting_size_o = lifting_size_q[r_swap_q];
+    assign base_graph_o   = base_graph_q[r_swap_q];
+    assign zc_group_o     = zc_group_q[r_swap_q];
 
 endmodule

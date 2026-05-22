@@ -1,8 +1,6 @@
 import ldpc_pkg::*;
 
 module csr_decoder #(
-  localparam int unsigned ROW_WIDTH = $clog2(BG1_ROW_N),
-  localparam int unsigned COL_WIDTH = $clog2(BG1_COL_N),
   // + 2 for each BG row pointer format first entry (0)
   localparam int unsigned RP_SIZE = BG1_ROW_N + BG2_ROW_N + 2,
   localparam int unsigned BASEP_WIDTH = 9

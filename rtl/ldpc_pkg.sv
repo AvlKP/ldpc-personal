@@ -24,6 +24,9 @@ package ldpc_pkg;
   parameter int unsigned RG_BG1 = 12;
   parameter int unsigned RG_BG2 = 11;
 
+  parameter int unsigned COL_WIDTH = $clog2(BG1_COL_N);
+  parameter int unsigned ROW_WIDTH = $clog2(BG1_ROW_N);
+
   parameter int unsigned NUM_CS = 4;
   parameter int unsigned BG1_H = 46;
   parameter int unsigned BG1_W = 68;

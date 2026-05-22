@@ -112,13 +112,15 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             return
         
         for i in range(4):
+            Z = len(expected_lambdas[i])
             expected_int = bits_to_int_lsb(expected_lambdas[i])
-            if tr['lambdas'][i] != expected_int:
+            actual_int = (tr['lambdas'][i] >> (384 - Z)) & ((1 << Z) - 1)
+            if actual_int != expected_int:
                 import cocotb.utils
                 sim_time = cocotb.utils.get_sim_time('ns')
-                self.logger.error(f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. RTL: {hex(tr['lambdas'][i])}, GM: {hex(expected_int)}")
+                self.logger.error(f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. RTL: {hex(actual_int)}, GM: {hex(expected_int)}")
             else:
-                self.logger.debug(f"LAMBDA OK at Row {i}: {hex(tr['lambdas'][i])}")
+                self.logger.debug(f"LAMBDA OK at Row {i}: {hex(actual_int)}")
 
 
 class LdpcScoreboard(uvm_scoreboard):
@@ -166,11 +168,11 @@ class LdpcScoreboard(uvm_scoreboard):
             if mismatch >= 0:
                 word_idx = mismatch // 32
                 time_ns = act_words[word_idx]["time_ns"] if word_idx < len(act_words) else "UNKNOWN"
-                lo = max(0, mismatch - 32)
-                hi = min(len(exp_bits), mismatch + 33)
+                lo = word_idx * 32
+                hi = min(len(exp_bits), (word_idx + 1) * 32)
                 exp_hex = hex(bits_to_int_lsb(exp_bits[lo:hi]))
                 act_hex = hex(bits_to_int_lsb(act_bits[lo:hi]))
-                self.logger.error(f"[{time_ns} ns] Frame {frame_id} mismatch at bit {mismatch}.\nExp window: {exp_bits[lo:hi]} (hex: {exp_hex})\nAct window: {act_bits[lo:hi]} (hex: {act_hex})")
+                self.logger.error(f"[{time_ns} ns] Frame {frame_id} mismatch at bit {mismatch} (word {word_idx}).\nExp window: {exp_bits[lo:hi]} (hex: {exp_hex})\nAct window: {act_bits[lo:hi]} (hex: {act_hex})")
                 has_error = True
 
         # 2. Parity chunk comparison
