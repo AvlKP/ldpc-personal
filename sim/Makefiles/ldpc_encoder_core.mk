@@ -14,6 +14,7 @@ LDPC_TOP_SRCS := \
 	$(RTL_DIR)/input_buffer.sv \
 	$(RTL_DIR)/ldpc_encoder.sv \
 	$(RTL_DIR)/ldpc_encoder_core.sv \
+	$(RTL_DIR)/parity_additional_reorder.sv \
 	$(RTL_DIR)/lutram.sv \
 	$(RTL_DIR)/lutrom.sv \
 	$(RTL_DIR)/merge_sel_lambda.sv \
