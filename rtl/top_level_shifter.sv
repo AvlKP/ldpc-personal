@@ -7,6 +7,7 @@ module top_level_shifter #(
     input  logic [NUM_CS*ZC_PER_CS-1:0] data_in,
     input  logic [8:0]               z,
     input  logic [NUM_CS-1:0][8:0]               p,
+    input  logic [1:0]               merge_d_cycle,
     output logic [NUM_CS*ZC_PER_CS-1:0] data_out,
     input  zc_group_t d
 );
@@ -29,13 +30,14 @@ module top_level_shifter #(
         .ZC_PER_CS(ZC_PER_CS),
         .NUM_CS(NUM_CS)
     ) param_calc_inst (
-        .z       (z),
-        .p       (p),
-        .d       (d),
-        .p_mod_d (p_mod_d),
-        .z_per_d (z_per_d),
-        .q       (q),
-        .q_plus  (q_plus)
+        .z             (z),
+        .p             (p),
+        .d             (d),
+        .merge_d_cycle (merge_d_cycle),
+        .p_mod_d       (p_mod_d),
+        .z_per_d       (z_per_d),
+        .q             (q),
+        .q_plus        (q_plus)
     );
 
     direct_bit_permutation #(

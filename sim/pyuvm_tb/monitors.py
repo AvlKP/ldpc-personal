@@ -1,5 +1,6 @@
 import random
 import cocotb.utils
+from enum import IntEnum, auto
 from typing import Any
 from collections import deque
 from cocotb.triggers import RisingEdge, ReadOnly
@@ -7,6 +8,23 @@ from pyuvm import uvm_monitor, uvm_analysis_port, ConfigDB, uvm_component
 from bfm import safe_int, int_to_bits_lsb, bits_to_int_lsb, LdpcTopBfm, TransactionRecorder
 
 OUTBUFF_WRITE_BITS = 384
+
+
+class CoreState(IntEnum):
+    """Mirror of the state_t enum in rtl/ldpc_encoder_core.sv.
+
+    SystemVerilog and Python IntEnum both number members 0, 1, 2, ... in
+    declaration order, so KEEP THIS LIST IN THE SAME ORDER AS THE RTL ENUM.
+    IDLE is pinned to 0 to match the RTL's default encoding; the trailing
+    auto() members continue 1, 2, 3, ... When the RTL FSM gains/loses/reorders
+    a state, mirror it here once and every monitor that compares core.state_q
+    stays correct (instead of scattering magic numbers).
+    """
+    IDLE = 0
+    LOAD = auto()         # 1
+    CALC_LAMBDA = auto()  # 2
+    CALC_PC = auto()      # 3
+    CALC_PA = auto()      # 4
 
 class LdpcInputBufferMonitor(uvm_monitor):
     """Monitors the aligned input segments being fed into the core."""
@@ -28,7 +46,7 @@ class LdpcInputBufferMonitor(uvm_monitor):
                 self.ap.write({'type': 'input', 'kb_idx': pending_kb_idx, 'data': data_in})
                 pending_kb_idx = None
 
-            if safe_int(core.state_q) == 1 and safe_int(core.inbuff_valid_i) == 1 and safe_int(core.inbuff_clear_o) == 0:
+            if safe_int(core.state_q) == CoreState.CALC_LAMBDA and safe_int(core.inbuff_valid_i) == 1 and safe_int(core.inbuff_clear_o) == 0:
                 pending_kb_idx = safe_int(core.info_group_sel_o)
 
 class LdpcShifterMonitor(uvm_monitor):
@@ -112,14 +130,44 @@ class LdpcLambdaMonitor(uvm_monitor):
     async def run_phase(self):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
+
+        # Lambda is produced incrementally across the CALC_LAMBDA state, one
+        # row-group per merge_d_cycle step (e.g. ZC_MEDIUM yields rows 3,2 at
+        # d_cycle=2, then 1,0 at d_cycle=1; ZC_LARGE yields one row per cycle).
+        # Sampling only at the end of CALC_LAMBDA misses the earlier groups, so
+        # instead capture each row the moment the RTL latches it into the core
+        # parity calc: cpb_en pulses with exactly the lanes being completed, and
+        # lane L always carries absolute row L. We assemble the 4 rows in their
+        # absolute-row slots and emit one transaction per frame when the lambda
+        # phase ends.
+        lambda_acc = [0, 0, 0, 0]
+        captured = False
+        prev_in_lambda = False
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
-            # CALC_LAMBDA (1) transitioning to CALC_PC (2)
-            if safe_int(core.state_q) == 1 and safe_int(core.lambda_to_pc) == 1:
+            in_lambda = safe_int(core.state_q) == CoreState.CALC_LAMBDA
+
+            # Fresh frame: clear the accumulator on entry to CALC_LAMBDA.
+            if in_lambda and not prev_in_lambda:
+                lambda_acc = [0, 0, 0, 0]
+                captured = False
+
+            # cpb_en[L] high => lambda lane L holds the just-finished row L.
+            cpb_en = safe_int(core.cpb_en)
+            if in_lambda and cpb_en != 0:
                 lam_val = safe_int(getattr(core, "lambda"))
-                lambdas = [(lam_val >> (i * 384)) & ((1 << 384) - 1) for i in range(4)]
-                self.ap.write({'type': 'lambda', 'lambdas': lambdas})
+                for L in range(4):
+                    if (cpb_en >> L) & 1:
+                        lambda_acc[L] = (lam_val >> (L * 384)) & ((1 << 384) - 1)
+                        captured = True
+
+            # Leaving CALC_LAMBDA: all groups have been latched; emit the set.
+            if prev_in_lambda and not in_lambda and captured:
+                self.ap.write({'type': 'lambda', 'lambdas': list(lambda_acc)})
+                captured = False
+
+            prev_in_lambda = in_lambda
 
 class LdpcOutputMonitor(uvm_monitor):
     def build_phase(self) -> None:
