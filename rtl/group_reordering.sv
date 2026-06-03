@@ -26,13 +26,20 @@ module group_reordering #(
                 // Handled by default assignments
             end
             ZC_MEDIUM: begin
+                // Each 192-bit row occupies a lane PAIR {2j, 2j+1}; the two
+                // pairs are independent rows. Rotate by p_mod (0/1) WITHIN each
+                // pair only -- rotating across all four lanes (the old
+                // (i - p_mod*2) form) cross-mixed the two rows.
                 for (int i = 0; i < NUM_CS; i++) begin
-                    mux_sel[i] = MUX_SEL_WIDTH'((i - (p_mod_d[i] * 2)) & (NUM_CS - 1));
+                    mux_sel[i] = MUX_SEL_WIDTH'((i & (NUM_CS - 2)) | ((i + int'(p_mod_d[i])) & 1));
                 end
             end
             ZC_LARGE: begin
+                // All four lanes form one row: rotate by p_mod across the group.
+                // Source lane is (i + p_mod) so the lane whose source wraps past
+                // the top takes the q+1 shift (see use_q_plus below).
                 for (int i = 0; i < NUM_CS; i++) begin
-                    mux_sel[i] = MUX_SEL_WIDTH'((i - p_mod_d[i]) & (NUM_CS - 1));
+                    mux_sel[i] = MUX_SEL_WIDTH'((i + int'(p_mod_d[i])) & (NUM_CS - 1));
                 end
             end
             default: begin
@@ -44,7 +51,11 @@ module group_reordering #(
     always_comb begin : output_mux
         for (int i = 0; i < NUM_CS; i++) begin
             data_out[i]   = data_in[mux_sel[i]];
-            use_q_plus[i] = (mux_sel[i] > MUX_SEL_WIDTH'(i)); // Evaluates to 1 when true, 0 when false
+            // The lane whose source index wrapped past the top of its group
+            // takes the q+1 shift. With source = (i + p_mod), a wrap makes the
+            // selected source index LESS than i, so test mux_sel[i] < i.
+            // (The previous '>' selected q+1 on the wrong lane.)
+            use_q_plus[i] = (int'(mux_sel[i]) < i);
         end
     end
 
