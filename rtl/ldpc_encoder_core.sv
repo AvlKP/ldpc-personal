@@ -102,6 +102,17 @@ typedef enum logic [2:0] {
 state_t state_q, state_n;
 logic [1:0] pc_state_cnt_q;
 
+// High from the 2nd LOAD cycle onward: the config has had one cycle in LOAD to
+// settle onto lifting_size_i/base_graph_i, so it's safe to latch it and start
+// the CSR decoder. (The new frame's config arrives ~1 cycle into LOAD, after
+// the IDLE->LOAD edge, so capturing on that edge sampled the OLD value.)
+logic cfg_settled;
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni)             cfg_settled <= 1'b0;
+  else if (state_q == LOAD) cfg_settled <= 1'b1;
+  else                      cfg_settled <= 1'b0;
+end
+
 // Capture frame config ONCE, at the instant we commit to a new frame
 // (IDLE -> LOAD). The register must NOT track the config wires during IDLE:
 // the codeword generator may still be draining the previous frame's core
@@ -113,7 +124,10 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
     base_graph_q   <= '0;
     lifting_size_q <= '0;
-  end else if ((state_q == IDLE) & (state_n == LOAD)) begin
+  end else if (state_q == LOAD) begin
+    // Latch config DURING LOAD (not on the IDLE->LOAD edge): the new frame's
+    // config has settled onto the wires by then. Still never changes during
+    // IDLE, so the codeword generator's previous-frame drain is undisturbed.
     base_graph_q   <= base_graph_i;
     lifting_size_q <= lifting_size_i;
   end
@@ -155,7 +169,7 @@ logic csr_start_init, csr_start_calc;
 
 // Kick the CSR decoder off in LOAD, once base_graph_q / lifting_size_q have
 // been registered. (Previously this fired in IDLE off the raw config wires.)
-assign csr_start_init = (state_q == LOAD);
+assign csr_start_init = (state_q == LOAD) & cfg_settled;
 assign csr_start_calc = (state_q != IDLE) & (state_q != LOAD)
                       & (rowgrp_changed_qdly & (row_cnt_q < row_limit));
 assign csr_start = csr_start_init | csr_start_calc;
@@ -200,9 +214,9 @@ always_comb begin
           state_n = LOAD;
       else state_n = IDLE;
     LOAD:
-      // Config is now stable and the CSR decoder has been started; wait for
-      // its first valid output, then begin lambda accumulation.
-      if (csr_valid_q)
+      // Stay until config has settled (cfg_settled) AND the CSR decoder, which
+      // is started only after that, has produced its first valid output.
+      if (csr_valid_q & cfg_settled)
           state_n = CALC_LAMBDA;
       else state_n = LOAD;
     CALC_LAMBDA:
