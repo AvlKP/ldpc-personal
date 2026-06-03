@@ -53,13 +53,17 @@ end
 logic [3:0][(ZC_MAX >> 2)-1:0] data_segment;
 always_comb begin
     case (zc_group)
+    // info_group_i is LSB-packed (active bits in [Zc-1:0]), but the cyclic
+    // shifter masks the TOP zc_in bits ([95:96-Zc]) of each 96-bit lane. For
+    // ZC_SMALL (no fold) MSB-align each lane by Zc so the active bits land in
+    // the masked region; otherwise the shift result is 0 for Zc < 96.
     ZC_SMALL: for (int unsigned j = 0; j < 4; j++)
-            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)];            
+            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)] << ((ZC_MAX >> 2) - lifting_size_q);
     ZC_MEDIUM: for (int unsigned j = 0; j < 2; j++)
             {data_segment[j*2+1], data_segment[j*2]} = info_group_i[0 +: (ZC_MAX >> 1)];
     ZC_LARGE: {data_segment} = info_group_i;
     default: {data_segment} = '0;
-    endcase  
+    endcase
 end
   
 logic cw_ready;
@@ -225,7 +229,8 @@ end
 
 // need to delay output by 1 clock to sync with input bits arrival
 logic [3:0][ZC_WIDTH-1:0] permutation_q, permutation_qdly;
-logic [COL_WIDTH-1:0] col_curr_q;
+logic [3:0][COL_WIDTH-1:0] col_idx_q, col_idx_qdly;
+logic [COL_WIDTH-1:0] col_curr_q, col_curr_qdly;
 logic [3:0] gf2_en_q, gf2_en_qdly;
 logic [NUM_CS-1:0] cs_pc_sel_q, cs_pc_sel_qdly;
 logic [3:0][ROW_WIDTH-1:0] actual_row_q;
@@ -243,12 +248,15 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
     rowgrp_changed_qdly <= 0;
     cs_pc_sel_qdly <= '0;
     actual_row_qdly <= '0;
+    col_curr_qdly <= '0;
   end else begin
     if (csr_valid_q) begin
       permutation_qdly <= permutation_q;
       gf2_en_qdly <= gf2_en_q;
       cs_pc_sel_qdly <= cs_pc_sel_q;
       actual_row_qdly <= actual_row_q;
+      col_idx_qdly <= col_idx_q;
+      col_curr_qdly <= col_curr_q;
     end else gf2_en_qdly <= '0;
 
     csr_valid_qdly <= csr_valid_q;
@@ -272,6 +280,7 @@ csr_decoder csr_decoder (
   .permutation_o (permutation_q),
   .gf2_en_o      (gf2_en_q),
   .actual_row_o  (actual_row_q),
+  .col_idx_o     (col_idx_q),
   .col_curr_o    (col_curr_q),
   .parity_core_col_o (cs_pc_sel_q),
   .rowgrp_changed_o  (rowgrp_changed_q)
@@ -405,16 +414,33 @@ core_parity_bit_calculator #(
 );
 
 logic [3:0][(ZC_MAX >> 2)-1:0] parity_core_arranged;
-logic [IDX_WIDTH-1:0] parity_core_sel;
-logic [$clog2(NUM_CS+1)-1:0] parity_core_sel_cnt;
+logic [3:0][IDX_WIDTH-1:0] parity_core_sel;
+
+// Which core-parity column is being fed back this cycle: c_idx = col_curr - KB.
+// col_curr_qdly aligns with cs_pc_sel_qdly / permutation_qdly (the column the
+// shifter is processing). Only meaningful when cs_pc_sel_qdly != 0.
+logic [COL_WIDTH-1:0] kb_cols;
+logic [3:0][1:0]      pc_col_idx;
+assign kb_cols    = base_graph_q ? COL_WIDTH'(KB_BG2) : COL_WIDTH'(KB_BG1);
 
 always_comb begin
-  parity_core_sel_cnt = '0;
-  for (int unsigned i = 0; i < NUM_CS; i++) 
-    if (cs_pc_sel_qdly[i]) parity_core_sel_cnt = parity_core_sel_cnt + 1'b1;
+  for (int i = 0; i < 4; i++) begin
+    pc_col_idx[i] = 2'(col_idx_qdly[i] - kb_cols);
+  end
+end
 
-  if (parity_core_sel_cnt >= NUM_CS) parity_core_sel = IDX_WIDTH'(NUM_CS-1);
-  else parity_core_sel = IDX_WIDTH'(parity_core_sel_cnt);
+// Map the core-parity column index to the parity_core lane that holds its p_c.
+// core_parity_bit_calculator stores p_c1=parity_core[3], p_c2=[0], p_c3=[1],
+// p_c4=[2]; column KB+c feeds p_c(c+1), so c=0->3, 1->0, 2->1, 3->2.
+always_comb begin
+  for (int i = 0; i < 4; i++) begin
+    case (pc_col_idx[i])
+      2'd0:    parity_core_sel[i] = IDX_WIDTH'(3); // p_c1
+      2'd1:    parity_core_sel[i] = IDX_WIDTH'(0); // p_c2
+      2'd2:    parity_core_sel[i] = IDX_WIDTH'(1); // p_c3
+      default: parity_core_sel[i] = IDX_WIDTH'(2); // p_c4 (c_idx==3)
+    endcase
+  end
 end
 
 pc_rearrange #(
@@ -428,11 +454,11 @@ pc_rearrange #(
 );
 
 always_comb begin
-  for (int unsigned i = 0; i < NUM_CS; i++) begin
-    if (cs_pc_sel_qdly[i]) 
-      cs_data_in[NUM_CS-1-i] = parity_core_arranged[i];
-    else 
-      cs_data_in[NUM_CS-1-i] = data_segment[NUM_CS-1-i];
+  for (int k = 0; k < NUM_CS; k++) begin
+    if (cs_pc_sel_qdly[k])
+      cs_data_in[k] = parity_core_arranged[k];
+    else
+      cs_data_in[k] = data_segment[k];
   end
 end
 

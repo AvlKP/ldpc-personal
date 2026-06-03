@@ -4,7 +4,7 @@ module pc_rearrange #(
   parameter int ZC_PER_CS = 96,
   parameter int NUM_CS = 4
 )(
-    input logic [$clog2(NUM_CS)-1:0] pc_sel,
+    input logic [NUM_CS-1:0][$clog2(NUM_CS)-1:0] pc_sel,
     input zc_group_t d,
     input logic [NUM_CS-1:0][ZC_MAX-1:0] pc_in,
     output logic [NUM_CS-1:0][ZC_PER_CS-1:0] pc_out
@@ -14,17 +14,17 @@ module pc_rearrange #(
     case (d)
       ZC_SMALL:
         for (int i = 0; i < NUM_CS; i++) begin
-          pc_out[i] = pc_in[pc_sel][ZC_MAX-1 -: ZC_PER_CS];
+          pc_out[i] = pc_in[pc_sel[i]][ZC_MAX-1 -: ZC_PER_CS];
         end
       ZC_MEDIUM: begin
-        pc_out[3] = pc_in[pc_sel][unsigned'(ZC_MAX)-1 -: ZC_PER_CS];
-        pc_out[2] = pc_in[pc_sel][unsigned'(ZC_MAX)-1-unsigned'(ZC_PER_CS) -: ZC_PER_CS];
-        pc_out[1] = pc_in[pc_sel][unsigned'(ZC_MAX)-1 -: ZC_PER_CS];
-        pc_out[0] = pc_in[pc_sel][unsigned'(ZC_MAX)-1-unsigned'(ZC_PER_CS) -: ZC_PER_CS];
+        pc_out[3] = pc_in[pc_sel[2]][unsigned'(ZC_MAX)-1 -: ZC_PER_CS];
+        pc_out[2] = pc_in[pc_sel[2]][unsigned'(ZC_MAX)-1-unsigned'(ZC_PER_CS) -: ZC_PER_CS];
+        pc_out[1] = pc_in[pc_sel[0]][unsigned'(ZC_MAX)-1 -: ZC_PER_CS];
+        pc_out[0] = pc_in[pc_sel[0]][unsigned'(ZC_MAX)-1-unsigned'(ZC_PER_CS) -: ZC_PER_CS];
       end
       ZC_LARGE:
         for (int i = 0; i < NUM_CS; i++) begin
-          pc_out[NUM_CS-1-i] = pc_in[pc_sel][unsigned'(ZC_MAX)-1-unsigned'(i*ZC_PER_CS) -: ZC_PER_CS];
+          pc_out[NUM_CS-1-i] = pc_in[pc_sel[0]][unsigned'(ZC_MAX)-1-unsigned'(i*ZC_PER_CS) -: ZC_PER_CS];
         end
       default: begin
         pc_out = '0;

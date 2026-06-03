@@ -83,6 +83,13 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         return deques
 
     def check_shifter(self, tr):
+        # The RTL cyclic shifter is 4 lanes x 96b. For MEDIUM/LARGE one Z-bit
+        # (192/384) shifted vector is FOLDED across 2/4 lanes, and
+        # group_reordering permutes which lanes carry which row between the
+        # shift-value side and the output side. So the per-lane shift VALUE
+        # (the permutation p) still matches per lane, but the OUTPUT must be
+        # reassembled into Z-bit vectors and matched by VALUE against the GM
+        # shifted_vec (a per-lane "lane i == row i" compare cannot work).
         import cocotb.utils
         gm = self.golden_model
         if gm is None:
@@ -90,110 +97,85 @@ class LdpcInternalScoreboard(uvm_scoreboard):
 
         col = tr['col']
         shift_val_packed = tr['shift']
-        rtl_in_packed = tr['in']
         rtl_out_packed = tr['out']
         pc_sel = tr.get('pc_sel', [0, 0, 0, 0])
+        gf2_en = tr.get('gf2_en', 0xF)
+        mask96 = (1 << 96) - 1
+        out_lanes = [(rtl_out_packed >> (i * 96)) & mask96 for i in range(4)]
+        t = cocotb.utils.get_sim_time('ns')
 
-        # Lazily build E-column hook deques (rebuilt per frame when hooks change)
+        # Lazily (re)build per-row E-column hook deques each frame.
         if not hasattr(self, '_shift_e_deques') or self._shift_e_hooks_id != id(gm.hooks.get('shifted_vectors', [])):
-            sv_hooks = gm.hooks.get('shifted_vectors', [])
-            self._shift_e_hooks_id = id(sv_hooks)
+            self._shift_e_hooks_id = id(gm.hooks.get('shifted_vectors', []))
             self._shift_e_deques = self._build_e_col_deques('shifted_vectors')
 
+        # GM shifted_vec terms processed at this column (D and E entries both
+        # land at col_curr == tr['col']). Z determines the fold width.
+        sv_here = [h for h in gm.hooks.get('shifted_vectors', []) if h['col'] == col]
+        Z = len(sv_here[0]['vec']) if sv_here else 96
+        lanes_per_row = max(1, (Z + 95) // 96)
+
+        # --- 1. Per-lane SHIFT VALUE (permutation) check, plus the SMALL vec ---
         for i in range(4):
+            # Skip lanes that aren't accumulated this cycle: their shifter output
+            # is stale and never summed, and (for E columns) they must not pop a
+            # GM E-column hook.
+            if not ((gf2_en >> i) & 1):
+                continue
             row = tr['rows'][i]
             actual_shift = (shift_val_packed >> (i * 9)) & 0x1FF
-            rtl_in_lane = (rtl_in_packed >> (i * 96)) & ((1 << 96) - 1)
-            rtl_out_lane = (rtl_out_packed >> (i * 96)) & ((1 << 96) - 1)
-
+            rtl_out_lane = out_lanes[i]
             if pc_sel[i] == 1:
-                # E column lane: pop next E-column hook for this row
-                expected_hook = None
                 row_deque = self._shift_e_deques.get(row)
-                if row_deque:
-                    expected_hook = row_deque.popleft()
-
-                if expected_hook is not None:
-                    e_col = expected_hook['col']
-                    expected_shift = expected_hook['shift']
-                    expected_vec = expected_hook.get('vec', None)
-                    gm_vec_int = bits_to_int_lsb(expected_vec) if expected_vec else None
-                    expected_in_vec = expected_hook.get('in_vec', None)
-                    gm_in_vec_int = bits_to_int_lsb(expected_in_vec) if expected_in_vec else None
-
-                    if actual_shift != expected_shift:
-                        sim_time = cocotb.utils.get_sim_time('ns')
-                        self.logger.error(
-                            f"[{sim_time} ns] SHIFT(E) MISMATCH at Row {row}, Col {e_col} (pc_sel). "
-                            f"RTL shift: {actual_shift}, GM shift: {expected_shift}\n"
-                            f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                            f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
-                            f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
-                            f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
-                    else:
-                        out_match = (gm_vec_int is not None and rtl_out_lane == gm_vec_int)
-                        tag = "SHIFT(E) OK" if out_match else "SHIFT(E) VAL OK / VEC MISMATCH"
-                        if out_match:
-                            self.logger.debug(
-                                f"{tag} at Row {row}, Col {e_col} (pc_sel): shift={actual_shift}\n"
-                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
-                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
-                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
-                        else:
-                            self.logger.error(
-                                f"[{cocotb.utils.get_sim_time('ns')} ns] {tag} at Row {row}, Col {e_col} (pc_sel): shift={actual_shift}\n"
-                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
-                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
-                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
-                else:
-                    # No GM hook available, log RTL-only
-                    self.logger.debug(
-                        f"SHIFT(E) RTL-ONLY at Row {row}, lane {i} (pc_sel, no GM hook): shift={actual_shift}\n"
-                        f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                        f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}")
+                hook = row_deque.popleft() if row_deque else None
+                kind = "SHIFT(E)"
             else:
-                # D column lane: match by (row, col) as before
-                expected_hook = None
-                for hook in gm.hooks.get('shifted_vectors', []):
-                    if hook['row'] == row and hook['col'] == col:
-                        expected_hook = hook
-                        break
+                hook = next((h for h in gm.hooks.get('shifted_vectors', [])
+                             if h['row'] == row and h['col'] == col), None)
+                kind = "SHIFT"
+            if hook is None:
+                continue
+            hcol = hook['col']
+            if actual_shift != hook['shift']:
+                self.logger.error(f"[{t} ns] {kind} VAL MISMATCH at Row {row}, Col {hcol}: RTL {actual_shift}, GM {hook['shift']}")
+            elif lanes_per_row == 1:
+                # SMALL: lane i IS row i's shifted vector, but it's MSB-packed
+                # in the 96b lane ([95:96-Z]); only the top Z bits are valid
+                # (low 96-Z are padding). Extract them before comparing.
+                gm_vec = bits_to_int_lsb(hook['vec'])
+                rtl_val = rtl_out_lane >> (96 - Z)
+                if rtl_val == gm_vec:
+                    self.logger.debug(f"{kind} OK at Row {row}, Col {hcol}: shift={actual_shift}, vec={hex(rtl_val)}")
+                else:
+                    self.logger.error(f"[{t} ns] {kind} VEC MISMATCH at Row {row}, Col {hcol}: shift={actual_shift}\n  RTL: {hex(rtl_val)}\n  GM:  {hex(gm_vec)}")
+            else:
+                self.logger.debug(f"{kind} VAL OK at Row {row}, Col {hcol}: shift={actual_shift}")
 
-                if expected_hook is not None:
-                    expected_shift = expected_hook['shift']
-                    expected_vec = expected_hook.get('vec', None)
-                    gm_vec_int = bits_to_int_lsb(expected_vec) if expected_vec else None
-                    expected_in_vec = expected_hook.get('in_vec', None)
-                    gm_in_vec_int = bits_to_int_lsb(expected_in_vec) if expected_in_vec else None
+        # --- 2. Reassembled OUTPUT vector check for the folded modes ---
+        if lanes_per_row == 1 or not sv_here:
+            return
+        gm_by_val = {}
+        for h in sv_here:
+            gm_by_val.setdefault(bits_to_int_lsb(h['vec']), h)
 
-                    if actual_shift != expected_shift:
-                        sim_time = cocotb.utils.get_sim_time('ns')
-                        self.logger.error(
-                            f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. "
-                            f"RTL shift: {actual_shift}, GM shift: {expected_shift}\n"
-                            f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                            f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
-                            f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
-                            f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
-                    else:
-                        out_match = (gm_vec_int is not None and rtl_out_lane == gm_vec_int)
-                        tag = "SHIFT OK" if out_match else "SHIFT VAL OK / VEC MISMATCH"
-                        if out_match:
-                            self.logger.debug(
-                                f"{tag} at Row {row}, Col {col}: shift={actual_shift}\n"
-                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
-                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
-                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
-                        else:
-                            self.logger.error(
-                                f"[{cocotb.utils.get_sim_time('ns')} ns] {tag} at Row {row}, Col {col}: shift={actual_shift}\n"
-                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
-                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
-                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
-                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
+        # Fold-groups of physical lanes: MEDIUM has two 192b rows {0,1},{2,3};
+        # LARGE has one 384b row {0,1,2,3}. A group is only meaningful if ALL its
+        # lanes are accumulated (gf2_en set) -- otherwise those lanes hold stale
+        # shifter output that is never summed, so skip the group entirely.
+        groups = [(0, 1), (2, 3)] if lanes_per_row == 2 else [(0, 1, 2, 3)]
+        for lanes in groups:
+            if not all((gf2_en >> l) & 1 for l in lanes):
+                continue  # group not accumulated this cycle
+            rv = 0
+            for pos, l in enumerate(lanes):
+                rv |= out_lanes[l] << (pos * 96)
+            h = gm_by_val.get(rv)
+            if h is not None:
+                self.logger.debug(f"SHIFT VEC OK at Row {h['row']}, Col {col}: {hex(rv)}")
+            else:
+                self.logger.error(
+                    f"[{t} ns] SHIFT VEC MISMATCH at Col {col}: reassembled RTL {hex(rv)} "
+                    f"matches no GM shifted_vec {[hex(v) for v in gm_by_val]}")
 
     def check_gf2(self, tr):
         # Disabled as requested by user - comparison is currently incorrect
@@ -324,7 +306,8 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             #                   lanes {2,3}->actual_row[2*(d_cycle-1)+1]
             #   LARGE : 1 row,  all lanes -> actual_row[merge_d_cycle]
             if Z <= 96:
-                cand = [(rows[k], lanes[k] & mask) for k in range(4)]
+                # Each sub-lane is MSB-packed in 96b ([95:96-Z]); take top Z.
+                cand = [(rows[k], (lanes[k] >> (96 - Z)) & mask) for k in range(4)]
             elif Z <= 192:
                 base = 2 * (mdc - 1)
                 cand = [(rows[base],     (lanes[0] | (lanes[1] << 96)) & mask),

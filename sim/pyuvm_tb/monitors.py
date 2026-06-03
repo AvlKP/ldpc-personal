@@ -80,14 +80,19 @@ class LdpcShifterMonitor(uvm_monitor):
                 cs_in = safe_int(core.cs_data_in)
                 cs_out = safe_int(core.cs_data_out)
                 shift_val = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
+                # gf2_en_eff is the actual gf2_sum accumulate enable for this
+                # cs_data_out; lanes with it low are never summed, so the
+                # scoreboard must skip those fold-groups.
+                gf2_en = safe_int(core.gf2_en_eff)
                 self.ap.write({
-                    'type': 'shifter', 
-                    'in': cs_in, 
-                    'out': cs_out, 
-                    'shift': shift_val, 
-                    'col': meta['col'], 
+                    'type': 'shifter',
+                    'in': cs_in,
+                    'out': cs_out,
+                    'shift': shift_val,
+                    'col': meta['col'],
                     'rows': meta['rows'],
-                    'pc_sel': meta['pc_sel']
+                    'pc_sel': meta['pc_sel'],
+                    'gf2_en': gf2_en
                 })
 
 class LdpcGf2Monitor(uvm_monitor):
