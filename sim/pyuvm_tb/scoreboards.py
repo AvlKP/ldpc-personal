@@ -45,13 +45,29 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             tr = await self.parity_fifo.get()
             self.check_parity(tr)
 
-    def check_input(self, tr):
+    def _frame_hooks(self, tr):
+        """Return the golden hooks snapshot for THIS transaction's RTL frame.
+
+        Each monitor tags transactions with the RTL frame index (counted from
+        idle_o). The golden model keeps a per-frame snapshot list, so we never
+        compare against a different frame's data even though the live
+        golden_model.hooks is overwritten by later, already-encoded frames.
+        """
         gm = self.golden_model
-        if gm is None or tr['kb_idx'] >= len(gm.hooks.get('i_groups', [])):
+        if gm is None:
+            return None
+        fid = tr.get('frame_id', -1)
+        if fid < 0 or fid >= len(gm.frame_hooks):
+            return None
+        return gm.frame_hooks[fid]
+
+    def check_input(self, tr):
+        hooks = self._frame_hooks(tr)
+        if hooks is None or tr['kb_idx'] >= len(hooks.get('i_groups', [])):
             return
-        expected_bits = gm.hooks['i_groups'][tr['kb_idx']]
+        expected_bits = hooks['i_groups'][tr['kb_idx']]
         expected_int = bits_to_int_lsb(expected_bits)
-        
+
         if tr['data'] != expected_int:
             import cocotb.utils
             sim_time = cocotb.utils.get_sim_time('ns')
@@ -59,20 +75,15 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         else:
             self.logger.debug(f"Input KB={tr['kb_idx']} aligned correctly.")
 
-    def _build_e_col_deques(self, hook_key):
-        """Build per-row ordered deques of E-column (col >= kb) hooks.
-
-        The golden model and RTL iterate CSR entries in the same order,
-        so popping from these deques matches E-column events 1:1.
-        Rebuilt lazily whenever the golden model changes (new frame).
+    def _build_e_col_deques(self, hooks_dict, hook_key):
+        """Build per-row ordered deques of E-column (col >= kb) hooks for one
+        frame's hooks snapshot. The golden model and RTL iterate CSR entries in
+        the same order, so popping these matches E-column events 1:1.
         """
         from collections import deque
-        gm = self.golden_model
-        if gm is None:
-            return {}
         # kb = number of information groups; E columns have col >= kb
-        kb = len(gm.hooks.get('i_groups', []))
-        hooks = gm.hooks.get(hook_key, [])
+        kb = len(hooks_dict.get('i_groups', []))
+        hooks = hooks_dict.get(hook_key, [])
         deques = {}
         for hook in hooks:
             if hook['col'] >= kb:
@@ -91,8 +102,8 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         # reassembled into Z-bit vectors and matched by VALUE against the GM
         # shifted_vec (a per-lane "lane i == row i" compare cannot work).
         import cocotb.utils
-        gm = self.golden_model
-        if gm is None:
+        hooks = self._frame_hooks(tr)
+        if hooks is None:
             return
 
         col = tr['col']
@@ -104,14 +115,16 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         out_lanes = [(rtl_out_packed >> (i * 96)) & mask96 for i in range(4)]
         t = cocotb.utils.get_sim_time('ns')
 
-        # Lazily (re)build per-row E-column hook deques each frame.
-        if not hasattr(self, '_shift_e_deques') or self._shift_e_hooks_id != id(gm.hooks.get('shifted_vectors', [])):
-            self._shift_e_hooks_id = id(gm.hooks.get('shifted_vectors', []))
-            self._shift_e_deques = self._build_e_col_deques('shifted_vectors')
+        # E-column hook deques are stateful (popped in order), so rebuild them
+        # whenever the RTL frame changes (transactions arrive in frame order).
+        fid = tr.get('frame_id', -1)
+        if getattr(self, '_shift_e_frame', None) != fid:
+            self._shift_e_frame = fid
+            self._shift_e_deques = self._build_e_col_deques(hooks, 'shifted_vectors')
 
         # GM shifted_vec terms processed at this column (D and E entries both
         # land at col_curr == tr['col']). Z determines the fold width.
-        sv_here = [h for h in gm.hooks.get('shifted_vectors', []) if h['col'] == col]
+        sv_here = [h for h in hooks.get('shifted_vectors', []) if h['col'] == col]
         Z = len(sv_here[0]['vec']) if sv_here else 96
         lanes_per_row = max(1, (Z + 95) // 96)
 
@@ -130,7 +143,7 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                 hook = row_deque.popleft() if row_deque else None
                 kind = "SHIFT(E)"
             else:
-                hook = next((h for h in gm.hooks.get('shifted_vectors', [])
+                hook = next((h for h in hooks.get('shifted_vectors', [])
                              if h['row'] == row and h['col'] == col), None)
                 kind = "SHIFT"
             if hook is None:
@@ -247,10 +260,10 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                             f"  GM  gf2_acc:      {hex(expected_sum)}")
 
     def check_lambda(self, tr):
-        gm = self.golden_model
-        if gm is None:
+        hooks = self._frame_hooks(tr)
+        if hooks is None:
             return
-        expected_lambdas = gm.hooks.get('lambdas', [])
+        expected_lambdas = hooks.get('lambdas', [])
         if not expected_lambdas:
             return
         
@@ -271,10 +284,10 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         # RTL/GM style as the lambda check. p_groups[0..3] are core parity
         # (p_c1..p_c4); p_groups[4..] are additional parity.
         import cocotb.utils
-        gm = self.golden_model
-        if gm is None:
+        hooks = self._frame_hooks(tr)
+        if hooks is None:
             return
-        pg = gm.hooks.get('p_groups', [])
+        pg = hooks.get('p_groups', [])
         if not pg:
             return
         Z = len(pg[0])
