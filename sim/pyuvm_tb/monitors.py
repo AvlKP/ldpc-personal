@@ -67,9 +67,11 @@ class LdpcShifterMonitor(uvm_monitor):
             if safe_int(core.csr_valid_q) == 1:
                 col = safe_int(core.col_curr_q)
                 act_rows = safe_int(core.actual_row_q)
+                pc_sel = safe_int(core.cs_pc_sel_q)
                 metadata_queue.append({
                     'col': col,
-                    'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)]
+                    'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)],
+                    'pc_sel': [(pc_sel >> i) & 1 for i in range(4)]
                 })
 
             # Consume metadata when CSR valid delayed is high (end of pipeline)
@@ -84,7 +86,8 @@ class LdpcShifterMonitor(uvm_monitor):
                     'out': cs_out, 
                     'shift': shift_val, 
                     'col': meta['col'], 
-                    'rows': meta['rows']
+                    'rows': meta['rows'],
+                    'pc_sel': meta['pc_sel']
                 })
 
 class LdpcGf2Monitor(uvm_monitor):
@@ -101,24 +104,27 @@ class LdpcGf2Monitor(uvm_monitor):
             await RisingEdge(core.clk_i)
             await ReadOnly()
             
-            # Latch metadata when GF2 enable is high
-            if safe_int(core.gf2_en_q) == 1:
+            # Latch metadata when any GF2 enable lane is high (4-bit vector)
+            if safe_int(core.gf2_en_q) != 0:
                 col = safe_int(core.col_curr_q)
                 act_rows = safe_int(core.actual_row_q)
+                pc_sel = safe_int(core.cs_pc_sel_q)
                 metadata_queue.append({
                     'col': col,
-                    'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)]
+                    'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)],
+                    'pc_sel': [(pc_sel >> i) & 1 for i in range(4)]
                 })
 
-            # Consume metadata when GF2 enable delayed is high
-            if safe_int(core.gf2_en_qdly) == 1:
+            # Consume metadata when any GF2 enable delayed lane is high
+            if safe_int(core.gf2_en_qdly) != 0:
                 meta = metadata_queue.popleft()
                 row_sum = safe_int(core.row_sum)
                 self.ap.write({
                     'type': 'gf2_sum', 
                     'sum': row_sum, 
                     'col': meta['col'], 
-                    'rows': meta['rows']
+                    'rows': meta['rows'],
+                    'pc_sel': meta['pc_sel']
                 })
 
 class LdpcLambdaMonitor(uvm_monitor):
@@ -207,12 +213,15 @@ class LdpcParityMonitor(uvm_monitor):
                 self.ap.write({'type': 'parity_core', 'lanes': list(core_lanes)})
 
             # Additional parity: capture once per pulse (the pulse can be >1 cyc).
+            # merge_d_cycle selects which actual_row(s) the lanes carry this
+            # sub-step (MEDIUM/LARGE process a row-group over several sub-steps).
             if add_valid and not prev_add_valid:
                 pa = safe_int(getattr(core, "parity_additional"), 0)
                 ar = safe_int(getattr(core, "actual_row_qdly"), 0)
+                mdc = safe_int(getattr(core, "merge_d_cycle"), 0)
                 lanes = [(pa >> (k * 96)) & ((1 << 96) - 1) for k in range(4)]
                 rows = [(ar >> (k * 6)) & 0x3F for k in range(4)]
-                self.ap.write({'type': 'parity_add', 'lanes': lanes, 'rows': rows})
+                self.ap.write({'type': 'parity_add', 'lanes': lanes, 'rows': rows, 'd_cycle': mdc})
 
             prev_core_valid = core_valid
             prev_add_valid = add_valid

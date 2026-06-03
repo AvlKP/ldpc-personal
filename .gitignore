@@ -15,3 +15,6 @@ notebooks/*.txt
 notebooks/*.mem
 **/vivado/
 rtl/deprecated/
+sim/pyuvm_tb/__pycache__/agent_env.cpython-311.pyc
+sim/pyuvm_tb/__pycache__/monitors.cpython-311.pyc
+sim/pyuvm_tb/__pycache__/scoreboards.cpython-311.pyc

@@ -59,56 +59,210 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         else:
             self.logger.debug(f"Input KB={tr['kb_idx']} aligned correctly.")
 
+    def _build_e_col_deques(self, hook_key):
+        """Build per-row ordered deques of E-column (col >= kb) hooks.
+
+        The golden model and RTL iterate CSR entries in the same order,
+        so popping from these deques matches E-column events 1:1.
+        Rebuilt lazily whenever the golden model changes (new frame).
+        """
+        from collections import deque
+        gm = self.golden_model
+        if gm is None:
+            return {}
+        # kb = number of information groups; E columns have col >= kb
+        kb = len(gm.hooks.get('i_groups', []))
+        hooks = gm.hooks.get(hook_key, [])
+        deques = {}
+        for hook in hooks:
+            if hook['col'] >= kb:
+                row = hook['row']
+                if row not in deques:
+                    deques[row] = deque()
+                deques[row].append(hook)
+        return deques
+
     def check_shifter(self, tr):
+        import cocotb.utils
         gm = self.golden_model
         if gm is None:
             return
-            
+
         col = tr['col']
         shift_val_packed = tr['shift']
-        
+        rtl_in_packed = tr['in']
+        rtl_out_packed = tr['out']
+        pc_sel = tr.get('pc_sel', [0, 0, 0, 0])
+
+        # Lazily build E-column hook deques (rebuilt per frame when hooks change)
+        if not hasattr(self, '_shift_e_deques') or self._shift_e_hooks_id != id(gm.hooks.get('shifted_vectors', [])):
+            sv_hooks = gm.hooks.get('shifted_vectors', [])
+            self._shift_e_hooks_id = id(sv_hooks)
+            self._shift_e_deques = self._build_e_col_deques('shifted_vectors')
+
         for i in range(4):
             row = tr['rows'][i]
-            expected_shift = None
-            for hook in gm.hooks.get('shifted_vectors', []):
-                if hook['row'] == row and hook['col'] == col:
-                    expected_shift = hook['shift']
-                    break
-            
-            if expected_shift is not None:
-                actual_shift = (shift_val_packed >> (i * 9)) & 0x1FF
-                if actual_shift != expected_shift:
-                    import cocotb.utils
-                    sim_time = cocotb.utils.get_sim_time('ns')
-                    self.logger.error(f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. RTL: {actual_shift}, GM: {expected_shift}")
+            actual_shift = (shift_val_packed >> (i * 9)) & 0x1FF
+            rtl_in_lane = (rtl_in_packed >> (i * 96)) & ((1 << 96) - 1)
+            rtl_out_lane = (rtl_out_packed >> (i * 96)) & ((1 << 96) - 1)
+
+            if pc_sel[i] == 1:
+                # E column lane: pop next E-column hook for this row
+                expected_hook = None
+                row_deque = self._shift_e_deques.get(row)
+                if row_deque:
+                    expected_hook = row_deque.popleft()
+
+                if expected_hook is not None:
+                    e_col = expected_hook['col']
+                    expected_shift = expected_hook['shift']
+                    expected_vec = expected_hook.get('vec', None)
+                    gm_vec_int = bits_to_int_lsb(expected_vec) if expected_vec else None
+                    expected_in_vec = expected_hook.get('in_vec', None)
+                    gm_in_vec_int = bits_to_int_lsb(expected_in_vec) if expected_in_vec else None
+
+                    if actual_shift != expected_shift:
+                        sim_time = cocotb.utils.get_sim_time('ns')
+                        self.logger.error(
+                            f"[{sim_time} ns] SHIFT(E) MISMATCH at Row {row}, Col {e_col} (pc_sel). "
+                            f"RTL shift: {actual_shift}, GM shift: {expected_shift}\n"
+                            f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                            f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
+                            f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
+                            f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
+                    else:
+                        out_match = (gm_vec_int is not None and rtl_out_lane == gm_vec_int)
+                        tag = "SHIFT(E) OK" if out_match else "SHIFT(E) VAL OK / VEC MISMATCH"
+                        if out_match:
+                            self.logger.debug(
+                                f"{tag} at Row {row}, Col {e_col} (pc_sel): shift={actual_shift}\n"
+                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
+                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
+                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
+                        else:
+                            self.logger.error(
+                                f"[{cocotb.utils.get_sim_time('ns')} ns] {tag} at Row {row}, Col {e_col} (pc_sel): shift={actual_shift}\n"
+                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
+                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
+                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
                 else:
-                    self.logger.debug(f"SHIFT OK at Row {row}, Col {col}: {actual_shift}")
+                    # No GM hook available, log RTL-only
+                    self.logger.debug(
+                        f"SHIFT(E) RTL-ONLY at Row {row}, lane {i} (pc_sel, no GM hook): shift={actual_shift}\n"
+                        f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                        f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}")
+            else:
+                # D column lane: match by (row, col) as before
+                expected_hook = None
+                for hook in gm.hooks.get('shifted_vectors', []):
+                    if hook['row'] == row and hook['col'] == col:
+                        expected_hook = hook
+                        break
+
+                if expected_hook is not None:
+                    expected_shift = expected_hook['shift']
+                    expected_vec = expected_hook.get('vec', None)
+                    gm_vec_int = bits_to_int_lsb(expected_vec) if expected_vec else None
+                    expected_in_vec = expected_hook.get('in_vec', None)
+                    gm_in_vec_int = bits_to_int_lsb(expected_in_vec) if expected_in_vec else None
+
+                    if actual_shift != expected_shift:
+                        sim_time = cocotb.utils.get_sim_time('ns')
+                        self.logger.error(
+                            f"[{sim_time} ns] SHIFT MISMATCH at Row {row}, Col {col}. "
+                            f"RTL shift: {actual_shift}, GM shift: {expected_shift}\n"
+                            f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                            f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
+                            f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
+                            f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
+                    else:
+                        out_match = (gm_vec_int is not None and rtl_out_lane == gm_vec_int)
+                        tag = "SHIFT OK" if out_match else "SHIFT VAL OK / VEC MISMATCH"
+                        if out_match:
+                            self.logger.debug(
+                                f"{tag} at Row {row}, Col {col}: shift={actual_shift}\n"
+                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
+                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
+                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
+                        else:
+                            self.logger.error(
+                                f"[{cocotb.utils.get_sim_time('ns')} ns] {tag} at Row {row}, Col {col}: shift={actual_shift}\n"
+                                f"  RTL shifter_in[{i}]:  {hex(rtl_in_lane)}\n"
+                                f"  GM  shifter_in:       {hex(gm_in_vec_int) if gm_in_vec_int is not None else 'N/A'}\n"
+                                f"  RTL shifter_out[{i}]: {hex(rtl_out_lane)}\n"
+                                f"  GM  shifted_vec:      {hex(gm_vec_int) if gm_vec_int is not None else 'N/A'}")
 
     def check_gf2(self, tr):
-        gm = self.golden_model
-        if gm is None:
-            return
-            
+        # Disabled as requested by user - comparison is currently incorrect
+        return
+
+        import cocotb.utils
+
         col = tr['col']
         sum_packed = tr['sum']
-        
+        pc_sel = tr.get('pc_sel', [0, 0, 0, 0])
+
+        # Lazily build E-column hook deques for gf2_sums
+        if not hasattr(self, '_gf2_e_deques') or self._gf2_e_hooks_id != id(gm.hooks.get('gf2_sums', [])):
+            gs_hooks = gm.hooks.get('gf2_sums', [])
+            self._gf2_e_hooks_id = id(gs_hooks)
+            self._gf2_e_deques = self._build_e_col_deques('gf2_sums')
+
         for i in range(4):
             row = tr['rows'][i]
-            expected_sum_bits = None
-            for hook in gm.hooks.get('gf2_sums', []):
-                if hook['row'] == row and hook['col'] == col:
+            actual_sum = (sum_packed >> (i * 96)) & ((1 << 96) - 1)
+
+            if pc_sel[i] == 1:
+                # E column lane: pop next E-column hook for this row
+                expected_sum_bits = None
+                e_col = None
+                row_deque = self._gf2_e_deques.get(row)
+                if row_deque:
+                    hook = row_deque.popleft()
                     expected_sum_bits = hook['sum']
-                    break
-            
-            if expected_sum_bits is not None and len(expected_sum_bits) <= 96:
-                actual_sum = (sum_packed >> (i * 96)) & ((1 << 96) - 1)
-                expected_sum = bits_to_int_lsb(expected_sum_bits)
-                if actual_sum != expected_sum:
-                    import cocotb.utils
-                    sim_time = cocotb.utils.get_sim_time('ns')
-                    self.logger.error(f"[{sim_time} ns] GF2 MISMATCH at Row {row}, Col {col}. RTL: {hex(actual_sum)}, GM: {hex(expected_sum)}")
+                    e_col = hook['col']
+
+                if expected_sum_bits is not None and len(expected_sum_bits) <= 96:
+                    expected_sum = bits_to_int_lsb(expected_sum_bits)
+                    if actual_sum != expected_sum:
+                        sim_time = cocotb.utils.get_sim_time('ns')
+                        self.logger.error(
+                            f"[{sim_time} ns] GF2(E) MISMATCH at Row {row}, Col {e_col} (pc_sel).\n"
+                            f"  RTL gf2_acc[{i}]: {hex(actual_sum)}\n"
+                            f"  GM  gf2_acc:      {hex(expected_sum)}")
+                    else:
+                        self.logger.debug(
+                            f"GF2(E) OK at Row {row}, Col {e_col} (pc_sel):\n"
+                            f"  RTL gf2_acc[{i}]: {hex(actual_sum)}\n"
+                            f"  GM  gf2_acc:      {hex(expected_sum)}")
                 else:
-                    self.logger.debug(f"GF2 OK at Row {row}, Col {col}: {hex(actual_sum)}")
+                    self.logger.debug(
+                        f"GF2(E) RTL-ONLY at Row {row}, lane {i} (pc_sel, no GM hook):\n"
+                        f"  RTL gf2_acc[{i}]: {hex(actual_sum)}")
+            else:
+                # D column lane: match by (row, col) as before
+                expected_sum_bits = None
+                for hook in gm.hooks.get('gf2_sums', []):
+                    if hook['row'] == row and hook['col'] == col:
+                        expected_sum_bits = hook['sum']
+                        break
+
+                if expected_sum_bits is not None and len(expected_sum_bits) <= 96:
+                    expected_sum = bits_to_int_lsb(expected_sum_bits)
+                    if actual_sum != expected_sum:
+                        sim_time = cocotb.utils.get_sim_time('ns')
+                        self.logger.error(
+                            f"[{sim_time} ns] GF2 MISMATCH at Row {row}, Col {col}.\n"
+                            f"  RTL gf2_acc[{i}]: {hex(actual_sum)}\n"
+                            f"  GM  gf2_acc:      {hex(expected_sum)}")
+                    else:
+                        self.logger.debug(
+                            f"GF2 OK at Row {row}, Col {col}:\n"
+                            f"  RTL gf2_acc[{i}]: {hex(actual_sum)}\n"
+                            f"  GM  gf2_acc:      {hex(expected_sum)}")
 
     def check_lambda(self, tr):
         gm = self.golden_model
@@ -159,22 +313,33 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         elif tr['type'] == 'parity_add':
             lanes = tr['lanes']
             rows = tr['rows']
+            mdc = tr.get('d_cycle', 0)
             mask = (1 << Z) - 1
             # Reconstruct each logical row by concatenating its 96b sub-lanes
             # (same MSB-first convention as merge_select_lambda / the output
-            # banks), keyed by actual_row: SMALL 1 sub-lane/row, MEDIUM 2, LARGE 4.
+            # banks), keyed by the ACTIVE actual_row for this merge_d_cycle step
+            # (same lane->row mapping as the gf2_en remap in the core):
+            #   SMALL : 4 rows, lane k -> actual_row[k]
+            #   MEDIUM: 2 rows, lanes {0,1}->actual_row[2*(d_cycle-1)],
+            #                   lanes {2,3}->actual_row[2*(d_cycle-1)+1]
+            #   LARGE : 1 row,  all lanes -> actual_row[merge_d_cycle]
             if Z <= 96:
-                pairs = [(rows[k], lanes[k] & mask) for k in range(4)]
+                cand = [(rows[k], lanes[k] & mask) for k in range(4)]
             elif Z <= 192:
-                pairs = [(rows[0], (lanes[0] | (lanes[1] << 96)) & mask),
-                         (rows[1], (lanes[2] | (lanes[3] << 96)) & mask)]
+                base = 2 * (mdc - 1)
+                cand = [(rows[base],     (lanes[0] | (lanes[1] << 96)) & mask),
+                        (rows[base + 1], (lanes[2] | (lanes[3] << 96)) & mask)]
             else:
                 val = lanes[0] | (lanes[1] << 96) | (lanes[2] << 192) | (lanes[3] << 288)
-                pairs = [(rows[0], val & mask)]
+                cand = [(rows[mdc], val & mask)]
 
-            for row, rtl in pairs:
-                if row < 4 or row >= len(pg):
-                    continue  # rows 0-3 are core parity; skip padding/duplicate rows
+            seen = set()
+            for row, rtl in cand:
+                # rows 0-3 are core parity; the last row-group duplicates rows
+                # to pad to 4, so skip out-of-range and already-seen indices.
+                if row < 4 or row >= len(pg) or row in seen:
+                    continue
+                seen.add(row)
                 exp = bits_to_int_lsb(pg[row])
                 if rtl != exp:
                     self.logger.error(f"[{t} ns] ADD PARITY MISMATCH at Row {row}. RTL: {hex(rtl)}, GM: {hex(exp)}")

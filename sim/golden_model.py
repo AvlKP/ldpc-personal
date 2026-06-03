@@ -179,7 +179,7 @@ class LdpcEncoderGoldenModel:
                     shift = self._get_shift_value(z_idx, csr_idx, Z)
                     shifted_vec = self._circ_shift(i_groups[col], shift)
                     # Hook 2: Shifter output (Row, Col, Shift, Result)
-                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'shift': shift, 'vec': shifted_vec})
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'shift': shift, 'vec': shifted_vec, 'in_vec': i_groups[col].copy()})
                     
                     lambdas[r] = self._xor_vecs(lambdas[r], shifted_vec)
                     # Hook 3: GF(2) Accumulation
@@ -248,12 +248,16 @@ class LdpcEncoderGoldenModel:
 
                 if col < kb:
                     shifted_vec = self._circ_shift(i_groups[col], shift)
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'shift': shift, 'vec': shifted_vec, 'in_vec': i_groups[col].copy()})
                     p_r = self._xor_vecs(p_r, shifted_vec)
+                    self.hooks['gf2_sums'].append({'row': r, 'col': col, 'sum': p_r.copy()})
                 elif col < kb + 4:
                     # Note: These columns ARE present in the CSR for rows >= 4
                     c_idx = col - kb
                     shifted_vec = self._circ_shift(p_groups[c_idx], shift)
+                    self.hooks['shifted_vectors'].append({'row': r, 'col': col, 'shift': shift, 'vec': shifted_vec, 'in_vec': p_groups[c_idx].copy()})
                     p_r = self._xor_vecs(p_r, shifted_vec)
+                    self.hooks['gf2_sums'].append({'row': r, 'col': col, 'sum': p_r.copy()})
             
             p_groups[r] = p_r
             
