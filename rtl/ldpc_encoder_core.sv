@@ -502,7 +502,13 @@ end
 
 assign info_valid = (state_q == CALC_LAMBDA);
 assign parity_core_valid = (state_q == CALC_PC);
-assign parity_additional_valid = (state_q == CALC_PA) & rowgrp_changed_qdly;
+// The FSM leaves CALC_PA->IDLE on the rising edge of rowgrp_changed_q, but the
+// PA for that final row-group only becomes valid one cycle later, when
+// rowgrp_changed_qdly pulses -- by then state_q is already IDLE. Include IDLE
+// so the last batch (e.g. the 2-row remainder when the BG height isn't a
+// multiple of 4) is still flagged. rowgrp_changed_qdly is 0 during steady
+// IDLE, so this only fires on that one trailing cycle.
+assign parity_additional_valid = ((state_q == CALC_PA) | (state_q == IDLE)) & rowgrp_changed_qdly;
 
 logic [3:0][ROW_WIDTH:0] parity_additional_idx;
 always_comb begin
