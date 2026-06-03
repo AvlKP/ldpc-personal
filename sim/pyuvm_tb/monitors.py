@@ -169,6 +169,54 @@ class LdpcLambdaMonitor(uvm_monitor):
 
             prev_in_lambda = in_lambda
 
+class LdpcParityMonitor(uvm_monitor):
+    """Taps the core/additional parity the encoder hands to codeword_generator.
+
+    Core parity (core.parity_core, 4 lanes x 384b, each a full Z-bit p_c value
+    MSB-packed). core_parity_bit_calculator's output mapping is:
+        lane3 -> p_c1 = p_groups[0]    lane0 -> p_c2 = p_groups[1]
+        lane1 -> p_c3 = p_groups[2]    lane2 -> p_c4 = p_groups[3]
+    It is stable throughout CALC_PC, so snapshot every cycle and emit on exit.
+
+    Additional parity (core.parity_additional = row_sum, 4 sub-lanes x 96b)
+    holds the rows just finished when parity_additional_valid pulses, keyed by
+    core.actual_row_qdly. Captured once per rising edge of the pulse; the
+    scoreboard merges sub-lanes per Z and compares each row to p_groups[row].
+    """
+    def build_phase(self):
+        self.ap = uvm_analysis_port("ap", self)
+        self.bfm = ConfigDB().get(self, "", "BFM")
+
+    async def run_phase(self):
+        dut = self.bfm.dut
+        core = dut.ldpc_encoder_core
+        prev_core_valid = False
+        prev_add_valid = False
+        core_lanes = [0, 0, 0, 0]
+        while True:
+            await RisingEdge(core.clk_i)
+            await ReadOnly()
+            core_valid = safe_int(getattr(core, "parity_core_valid", None), 0) == 1
+            add_valid = safe_int(getattr(core, "parity_additional_valid", None), 0) == 1
+
+            # Core parity: snapshot while in CALC_PC, emit the settled set on exit.
+            if core_valid:
+                pc = safe_int(getattr(core, "parity_core"), 0)
+                core_lanes = [(pc >> (k * 384)) & ((1 << 384) - 1) for k in range(4)]
+            if prev_core_valid and not core_valid:
+                self.ap.write({'type': 'parity_core', 'lanes': list(core_lanes)})
+
+            # Additional parity: capture once per pulse (the pulse can be >1 cyc).
+            if add_valid and not prev_add_valid:
+                pa = safe_int(getattr(core, "parity_additional"), 0)
+                ar = safe_int(getattr(core, "actual_row_qdly"), 0)
+                lanes = [(pa >> (k * 96)) & ((1 << 96) - 1) for k in range(4)]
+                rows = [(ar >> (k * 6)) & 0x3F for k in range(4)]
+                self.ap.write({'type': 'parity_add', 'lanes': lanes, 'rows': rows})
+
+            prev_core_valid = core_valid
+            prev_add_valid = add_valid
+
 class LdpcOutputMonitor(uvm_monitor):
     def build_phase(self) -> None:
         self.bfm: LdpcTopBfm = ConfigDB().get(self, "", "BFM")

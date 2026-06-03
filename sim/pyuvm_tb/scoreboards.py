@@ -9,6 +9,7 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         self.shifter_fifo = uvm_tlm_analysis_fifo("shifter_fifo", self)
         self.gf2_fifo = uvm_tlm_analysis_fifo("gf2_fifo", self)
         self.lambda_fifo = uvm_tlm_analysis_fifo("lambda_fifo", self)
+        self.parity_fifo = uvm_tlm_analysis_fifo("parity_fifo", self)
         self.golden_model = ConfigDB().get(self, "", "GOLDEN_MODEL")
 
     async def run_phase(self):
@@ -17,6 +18,7 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         cocotb.start_soon(self.process_shifter())
         cocotb.start_soon(self.process_gf2())
         cocotb.start_soon(self.process_lambda())
+        cocotb.start_soon(self.process_parity())
 
     async def process_input(self):
         while True:
@@ -37,6 +39,11 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         while True:
             tr = await self.lambda_fifo.get()
             self.check_lambda(tr)
+
+    async def process_parity(self):
+        while True:
+            tr = await self.parity_fifo.get()
+            self.check_parity(tr)
 
     def check_input(self, tr):
         gm = self.golden_model
@@ -121,6 +128,58 @@ class LdpcInternalScoreboard(uvm_scoreboard):
                 self.logger.error(f"[{sim_time} ns] LAMBDA MISMATCH at Row {i}. RTL: {hex(actual_int)}, GM: {hex(expected_int)}")
             else:
                 self.logger.debug(f"LAMBDA OK at Row {i}: {hex(actual_int)}")
+
+    def check_parity(self, tr):
+        # Compares the parity the core produces (at the codeword_generator
+        # boundary) against the golden model's p_groups, per row, in the same
+        # RTL/GM style as the lambda check. p_groups[0..3] are core parity
+        # (p_c1..p_c4); p_groups[4..] are additional parity.
+        import cocotb.utils
+        gm = self.golden_model
+        if gm is None:
+            return
+        pg = gm.hooks.get('p_groups', [])
+        if not pg:
+            return
+        Z = len(pg[0])
+        t = cocotb.utils.get_sim_time('ns')
+
+        if tr['type'] == 'parity_core':
+            # parity_core lane -> p_groups index (core_parity_bit_calculator):
+            #   lane3=p_c1->pg0, lane0=p_c2->pg1, lane1=p_c3->pg2, lane2=p_c4->pg3
+            # Each lane is a full Z-bit value MSB-packed in 384b.
+            for lane, pgi in ((3, 0), (0, 1), (1, 2), (2, 3)):
+                rtl = (tr['lanes'][lane] >> (384 - Z)) & ((1 << Z) - 1)
+                exp = bits_to_int_lsb(pg[pgi])
+                if rtl != exp:
+                    self.logger.error(f"[{t} ns] CORE PARITY MISMATCH at Row {pgi}. RTL: {hex(rtl)}, GM: {hex(exp)}")
+                else:
+                    self.logger.debug(f"CORE PARITY OK at Row {pgi}: {hex(rtl)}")
+
+        elif tr['type'] == 'parity_add':
+            lanes = tr['lanes']
+            rows = tr['rows']
+            mask = (1 << Z) - 1
+            # Reconstruct each logical row by concatenating its 96b sub-lanes
+            # (same MSB-first convention as merge_select_lambda / the output
+            # banks), keyed by actual_row: SMALL 1 sub-lane/row, MEDIUM 2, LARGE 4.
+            if Z <= 96:
+                pairs = [(rows[k], lanes[k] & mask) for k in range(4)]
+            elif Z <= 192:
+                pairs = [(rows[0], (lanes[0] | (lanes[1] << 96)) & mask),
+                         (rows[1], (lanes[2] | (lanes[3] << 96)) & mask)]
+            else:
+                val = lanes[0] | (lanes[1] << 96) | (lanes[2] << 192) | (lanes[3] << 288)
+                pairs = [(rows[0], val & mask)]
+
+            for row, rtl in pairs:
+                if row < 4 or row >= len(pg):
+                    continue  # rows 0-3 are core parity; skip padding/duplicate rows
+                exp = bits_to_int_lsb(pg[row])
+                if rtl != exp:
+                    self.logger.error(f"[{t} ns] ADD PARITY MISMATCH at Row {row}. RTL: {hex(rtl)}, GM: {hex(exp)}")
+                else:
+                    self.logger.debug(f"ADD PARITY OK at Row {row}: {hex(rtl)}")
 
 
 class LdpcScoreboard(uvm_scoreboard):

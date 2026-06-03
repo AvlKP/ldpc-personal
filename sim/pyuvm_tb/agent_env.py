@@ -1,6 +1,6 @@
 from pyuvm import uvm_agent, uvm_sequencer, uvm_env
 from driver import LdpcDriver
-from monitors import LdpcOutputMonitor, LdpcInputBufferMonitor, LdpcShifterMonitor, LdpcGf2Monitor, LdpcLambdaMonitor
+from monitors import LdpcOutputMonitor, LdpcInputBufferMonitor, LdpcShifterMonitor, LdpcGf2Monitor, LdpcLambdaMonitor, LdpcParityMonitor
 from scoreboards import LdpcScoreboard, LdpcInternalScoreboard
 
 class LdpcAgent(uvm_agent):
@@ -22,6 +22,7 @@ class LdpcEnv(uvm_env):
         self.shifter_monitor = LdpcShifterMonitor("cyclic_shifter_monitor", self)
         self.gf2_monitor = LdpcGf2Monitor("gf2_sum_monitor", self)
         self.lambda_monitor = LdpcLambdaMonitor("lambda_monitor", self)
+        self.parity_monitor = LdpcParityMonitor("parity_monitor", self)
         self.internal_scoreboard = LdpcInternalScoreboard("internal_scoreboard", self)
 
     def connect_phase(self) -> None:
@@ -31,3 +32,4 @@ class LdpcEnv(uvm_env):
         self.shifter_monitor.ap.connect(self.internal_scoreboard.shifter_fifo.analysis_export)
         self.gf2_monitor.ap.connect(self.internal_scoreboard.gf2_fifo.analysis_export)
         self.lambda_monitor.ap.connect(self.internal_scoreboard.lambda_fifo.analysis_export)
+        self.parity_monitor.ap.connect(self.internal_scoreboard.parity_fifo.analysis_export)
