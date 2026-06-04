@@ -205,7 +205,7 @@ class LdpcParityMonitor(uvm_monitor):
     """Taps the core/additional parity the encoder hands to codeword_generator.
 
     Core parity (core.parity_core, 4 lanes x 384b, each a full Z-bit p_c value
-    MSB-packed). core_parity_bit_calculator's output mapping is:
+    LSB-packed). core_parity_bit_calculator's output mapping is:
         lane3 -> p_c1 = p_groups[0]    lane0 -> p_c2 = p_groups[1]
         lane1 -> p_c3 = p_groups[2]    lane2 -> p_c4 = p_groups[3]
     It is stable throughout CALC_PC, so snapshot every cycle and emit on exit.

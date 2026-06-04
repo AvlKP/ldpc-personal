@@ -28,7 +28,7 @@ always_comb begin
         shift_norm = shift_amt % zc_in;
 
         // Use explicit width replication for the all-ones mask
-        data_mask = {ZC_PER_CS{1'b1}} << (SHIFT_W'(ZC_PER_CS) - $unsigned(zc_in));
+        data_mask = {ZC_PER_CS{1'b1}} >> (SHIFT_W'(ZC_PER_CS) - $unsigned(zc_in));
 
         masked_data_in = data_in & data_mask;
 

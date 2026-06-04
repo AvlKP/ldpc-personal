@@ -152,11 +152,10 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             if actual_shift != hook['shift']:
                 self.logger.error(f"[{t} ns] {kind} VAL MISMATCH at Row {row}, Col {hcol}: RTL {actual_shift}, GM {hook['shift']}")
             elif lanes_per_row == 1:
-                # SMALL: lane i IS row i's shifted vector, but it's MSB-packed
-                # in the 96b lane ([95:96-Z]); only the top Z bits are valid
-                # (low 96-Z are padding). Extract them before comparing.
+                # SMALL: lane i IS row i's shifted vector, LSB-packed in the
+                # 96b lane ([Z-1:0]); mask the bottom Z bits.
                 gm_vec = bits_to_int_lsb(hook['vec'])
-                rtl_val = rtl_out_lane >> (96 - Z)
+                rtl_val = rtl_out_lane & ((1 << Z) - 1)
                 if rtl_val == gm_vec:
                     self.logger.debug(f"{kind} OK at Row {row}, Col {hcol}: shift={actual_shift}, vec={hex(rtl_val)}")
                 else:
@@ -270,7 +269,7 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         for i in range(4):
             Z = len(expected_lambdas[i])
             expected_int = bits_to_int_lsb(expected_lambdas[i])
-            actual_int = (tr['lambdas'][i] >> (384 - Z)) & ((1 << Z) - 1)
+            actual_int = tr['lambdas'][i] & ((1 << Z) - 1)
             if actual_int != expected_int:
                 import cocotb.utils
                 sim_time = cocotb.utils.get_sim_time('ns')
@@ -296,9 +295,9 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         if tr['type'] == 'parity_core':
             # parity_core lane -> p_groups index (core_parity_bit_calculator):
             #   lane3=p_c1->pg0, lane0=p_c2->pg1, lane1=p_c3->pg2, lane2=p_c4->pg3
-            # Each lane is a full Z-bit value MSB-packed in 384b.
+            # Each lane is a full Z-bit value LSB-packed in 384b.
             for lane, pgi in ((3, 0), (0, 1), (1, 2), (2, 3)):
-                rtl = (tr['lanes'][lane] >> (384 - Z)) & ((1 << Z) - 1)
+                rtl = tr['lanes'][lane] & ((1 << Z) - 1)
                 exp = bits_to_int_lsb(pg[pgi])
                 if rtl != exp:
                     self.logger.error(f"[{t} ns] CORE PARITY MISMATCH at Row {pgi}. RTL: {hex(rtl)}, GM: {hex(exp)}")
@@ -311,7 +310,7 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             mdc = tr.get('d_cycle', 0)
             mask = (1 << Z) - 1
             # Reconstruct each logical row by concatenating its 96b sub-lanes
-            # (same MSB-first convention as merge_select_lambda / the output
+            # (LSB-packed, same convention as merge_sel_lambda / the output
             # banks), keyed by the ACTIVE actual_row for this merge_d_cycle step
             # (same lane->row mapping as the gf2_en remap in the core):
             #   SMALL : 4 rows, lane k -> actual_row[k]
@@ -319,8 +318,8 @@ class LdpcInternalScoreboard(uvm_scoreboard):
             #                   lanes {2,3}->actual_row[2*(d_cycle-1)+1]
             #   LARGE : 1 row,  all lanes -> actual_row[merge_d_cycle]
             if Z <= 96:
-                # Each sub-lane is MSB-packed in 96b ([95:96-Z]); take top Z.
-                cand = [(rows[k], (lanes[k] >> (96 - Z)) & mask) for k in range(4)]
+                # Each sub-lane is LSB-packed in 96b ([Z-1:0]); mask bottom Z.
+                cand = [(rows[k], lanes[k] & mask) for k in range(4)]
             elif Z <= 192:
                 base = 2 * (mdc - 1)
                 cand = [(rows[base],     (lanes[0] | (lanes[1] << 96)) & mask),

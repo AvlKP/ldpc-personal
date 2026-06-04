@@ -53,12 +53,12 @@ end
 logic [3:0][(ZC_MAX >> 2)-1:0] data_segment;
 always_comb begin
     case (zc_group)
-    // info_group_i is LSB-packed (active bits in [Zc-1:0]), but the cyclic
-    // shifter masks the TOP zc_in bits ([95:96-Zc]) of each 96-bit lane. For
-    // ZC_SMALL (no fold) MSB-align each lane by Zc so the active bits land in
-    // the masked region; otherwise the shift result is 0 for Zc < 96.
+    // info_group_i is LSB-packed (active bits in [Zc-1:0]).  The barrel shifter
+    // masks the BOTTOM zc_in bits of each 96-bit sub-lane, so no alignment
+    // shift is needed: the natural LSB packing passes through the DBP forward
+    // interleave and lands in [z_per_d-1:0] of every sub-lane automatically.
     ZC_SMALL: for (int unsigned j = 0; j < 4; j++)
-            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)] << ((ZC_MAX >> 2) - lifting_size_q);
+            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)];
     ZC_MEDIUM: for (int unsigned j = 0; j < 2; j++)
             {data_segment[j*2+1], data_segment[j*2]} = info_group_i[0 +: (ZC_MAX >> 1)];
     ZC_LARGE: {data_segment} = info_group_i;
@@ -482,9 +482,11 @@ logic info_valid;
 
 always_comb begin
   case (zc_group)
+    // parity_core is now LSB-packed: active Zc bits in [Zc-1:0].
+    // Extract from the bottom of each parity_core word.
     ZC_SMALL: begin
       for (int unsigned i = 0; i < 4; i++) begin
-        parity_core_packed[3-i] = parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
+        parity_core_packed[3-i] = parity_core[i][(ZC_MAX >> 2)-1:0];
       end
     end
     
@@ -492,7 +494,7 @@ always_comb begin
       for (int unsigned i = 0; i < 2; i++) begin
         {parity_core_packed[3 - 2*i], 
          parity_core_packed[2 - 2*i]} = 
-          parity_core[merge_row_idx + i][ZC_MAX-1 -: (ZC_MAX >> 1)];
+          parity_core[merge_row_idx + i][(ZC_MAX >> 1)-1:0];
       end
     end 
     ZC_LARGE: {parity_core_packed[0], parity_core_packed[1], parity_core_packed[2], parity_core_packed[3]} = parity_core[merge_row_idx];
