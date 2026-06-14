@@ -8,6 +8,10 @@ class LdpcEncoderGoldenModel:
         self.values = []
         self.values_sets = {}
         self.hooks = {}
+        # Per-frame snapshots of `hooks`, in encode() (= frame) order. The
+        # internal scoreboard indexes this by the RTL frame number so it never
+        # races against `hooks` being overwritten by a later frame's encode().
+        self.frame_hooks = []
         self._row_to_ptr_index_bg1 = {}
         self._row_to_ptr_index_bg2 = {}
 
@@ -262,7 +266,11 @@ class LdpcEncoderGoldenModel:
             p_groups[r] = p_r
             
         self.hooks['p_groups'] = [g.copy() for g in p_groups]
-        
+
+        # Snapshot this frame's hooks (a fresh dict each encode) so the internal
+        # scoreboard can look it up by frame index regardless of later encodes.
+        self.frame_hooks.append(self.hooks)
+
         parity_bits = []
         for g in p_groups:
             parity_bits.extend(g)

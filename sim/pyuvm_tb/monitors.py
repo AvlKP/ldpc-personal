@@ -36,14 +36,21 @@ class LdpcInputBufferMonitor(uvm_monitor):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
         pending_kb_idx = None
+        frame_id = -1
+        prev_idle = 1
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
-            
+            # Count RTL frames: each starts when the core leaves IDLE.
+            idle = safe_int(core.idle_o)
+            if prev_idle and not idle:
+                frame_id += 1
+            prev_idle = idle
+
             # Data from previous cycle's address selection is now valid on info_group_i
             if pending_kb_idx is not None:
                 data_in = safe_int(core.info_group_i)
-                self.ap.write({'type': 'input', 'kb_idx': pending_kb_idx, 'data': data_in})
+                self.ap.write({'type': 'input', 'kb_idx': pending_kb_idx, 'data': data_in, 'frame_id': frame_id})
                 pending_kb_idx = None
 
             if safe_int(core.state_q) == CoreState.CALC_LAMBDA and safe_int(core.inbuff_valid_i) == 1 and safe_int(core.inbuff_clear_o) == 0:
@@ -59,10 +66,16 @@ class LdpcShifterMonitor(uvm_monitor):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
         metadata_queue = deque()
+        frame_id = -1
+        prev_idle = 1
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
-            
+            idle = safe_int(core.idle_o)
+            if prev_idle and not idle:
+                frame_id += 1
+            prev_idle = idle
+
             # Latch metadata when CSR valid is high (start of pipeline)
             if safe_int(core.csr_valid_q) == 1:
                 col = safe_int(core.col_curr_q)
@@ -71,7 +84,8 @@ class LdpcShifterMonitor(uvm_monitor):
                 metadata_queue.append({
                     'col': col,
                     'rows': [(act_rows >> (i * 6)) & 0x3F for i in range(4)],
-                    'pc_sel': [(pc_sel >> i) & 1 for i in range(4)]
+                    'pc_sel': [(pc_sel >> i) & 1 for i in range(4)],
+                    'frame_id': frame_id
                 })
 
             # Consume metadata when CSR valid delayed is high (end of pipeline)
@@ -80,14 +94,20 @@ class LdpcShifterMonitor(uvm_monitor):
                 cs_in = safe_int(core.cs_data_in)
                 cs_out = safe_int(core.cs_data_out)
                 shift_val = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
+                # gf2_en_eff is the actual gf2_sum accumulate enable for this
+                # cs_data_out; lanes with it low are never summed, so the
+                # scoreboard must skip those fold-groups.
+                gf2_en = safe_int(core.gf2_en_eff)
                 self.ap.write({
-                    'type': 'shifter', 
-                    'in': cs_in, 
-                    'out': cs_out, 
-                    'shift': shift_val, 
-                    'col': meta['col'], 
+                    'type': 'shifter',
+                    'in': cs_in,
+                    'out': cs_out,
+                    'shift': shift_val,
+                    'col': meta['col'],
                     'rows': meta['rows'],
-                    'pc_sel': meta['pc_sel']
+                    'pc_sel': meta['pc_sel'],
+                    'gf2_en': gf2_en,
+                    'frame_id': meta['frame_id']
                 })
 
 class LdpcGf2Monitor(uvm_monitor):
@@ -149,9 +169,15 @@ class LdpcLambdaMonitor(uvm_monitor):
         lambda_acc = [0, 0, 0, 0]
         captured = False
         prev_in_lambda = False
+        frame_id = -1
+        prev_idle = 1
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
+            idle = safe_int(core.idle_o)
+            if prev_idle and not idle:
+                frame_id += 1
+            prev_idle = idle
             in_lambda = safe_int(core.state_q) == CoreState.CALC_LAMBDA
 
             # Fresh frame: clear the accumulator on entry to CALC_LAMBDA.
@@ -170,7 +196,7 @@ class LdpcLambdaMonitor(uvm_monitor):
 
             # Leaving CALC_LAMBDA: all groups have been latched; emit the set.
             if prev_in_lambda and not in_lambda and captured:
-                self.ap.write({'type': 'lambda', 'lambdas': list(lambda_acc)})
+                self.ap.write({'type': 'lambda', 'lambdas': list(lambda_acc), 'frame_id': frame_id})
                 captured = False
 
             prev_in_lambda = in_lambda
@@ -179,7 +205,7 @@ class LdpcParityMonitor(uvm_monitor):
     """Taps the core/additional parity the encoder hands to codeword_generator.
 
     Core parity (core.parity_core, 4 lanes x 384b, each a full Z-bit p_c value
-    MSB-packed). core_parity_bit_calculator's output mapping is:
+    LSB-packed). core_parity_bit_calculator's output mapping is:
         lane3 -> p_c1 = p_groups[0]    lane0 -> p_c2 = p_groups[1]
         lane1 -> p_c3 = p_groups[2]    lane2 -> p_c4 = p_groups[3]
     It is stable throughout CALC_PC, so snapshot every cycle and emit on exit.
@@ -199,9 +225,15 @@ class LdpcParityMonitor(uvm_monitor):
         prev_core_valid = False
         prev_add_valid = False
         core_lanes = [0, 0, 0, 0]
+        frame_id = -1
+        prev_idle = 1
         while True:
             await RisingEdge(core.clk_i)
             await ReadOnly()
+            idle = safe_int(core.idle_o)
+            if prev_idle and not idle:
+                frame_id += 1
+            prev_idle = idle
             core_valid = safe_int(getattr(core, "parity_core_valid", None), 0) == 1
             add_valid = safe_int(getattr(core, "parity_additional_valid", None), 0) == 1
 
@@ -210,7 +242,7 @@ class LdpcParityMonitor(uvm_monitor):
                 pc = safe_int(getattr(core, "parity_core"), 0)
                 core_lanes = [(pc >> (k * 384)) & ((1 << 384) - 1) for k in range(4)]
             if prev_core_valid and not core_valid:
-                self.ap.write({'type': 'parity_core', 'lanes': list(core_lanes)})
+                self.ap.write({'type': 'parity_core', 'lanes': list(core_lanes), 'frame_id': frame_id})
 
             # Additional parity: capture once per pulse (the pulse can be >1 cyc).
             # merge_d_cycle selects which actual_row(s) the lanes carry this
@@ -221,7 +253,7 @@ class LdpcParityMonitor(uvm_monitor):
                 mdc = safe_int(getattr(core, "merge_d_cycle"), 0)
                 lanes = [(pa >> (k * 96)) & ((1 << 96) - 1) for k in range(4)]
                 rows = [(ar >> (k * 6)) & 0x3F for k in range(4)]
-                self.ap.write({'type': 'parity_add', 'lanes': lanes, 'rows': rows, 'd_cycle': mdc})
+                self.ap.write({'type': 'parity_add', 'lanes': lanes, 'rows': rows, 'd_cycle': mdc, 'frame_id': frame_id})
 
             prev_core_valid = core_valid
             prev_add_valid = add_valid

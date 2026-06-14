@@ -53,13 +53,17 @@ end
 logic [3:0][(ZC_MAX >> 2)-1:0] data_segment;
 always_comb begin
     case (zc_group)
+    // info_group_i is LSB-packed (active bits in [Zc-1:0]).  The barrel shifter
+    // masks the BOTTOM zc_in bits of each 96-bit sub-lane, so no alignment
+    // shift is needed: the natural LSB packing passes through the DBP forward
+    // interleave and lands in [z_per_d-1:0] of every sub-lane automatically.
     ZC_SMALL: for (int unsigned j = 0; j < 4; j++)
-            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)];            
+            data_segment[j] = info_group_i[0 +: (ZC_MAX >> 2)];
     ZC_MEDIUM: for (int unsigned j = 0; j < 2; j++)
             {data_segment[j*2+1], data_segment[j*2]} = info_group_i[0 +: (ZC_MAX >> 1)];
     ZC_LARGE: {data_segment} = info_group_i;
     default: {data_segment} = '0;
-    endcase  
+    endcase
 end
   
 logic cw_ready;
@@ -98,6 +102,17 @@ typedef enum logic [2:0] {
 state_t state_q, state_n;
 logic [1:0] pc_state_cnt_q;
 
+// High from the 2nd LOAD cycle onward: the config has had one cycle in LOAD to
+// settle onto lifting_size_i/base_graph_i, so it's safe to latch it and start
+// the CSR decoder. (The new frame's config arrives ~1 cycle into LOAD, after
+// the IDLE->LOAD edge, so capturing on that edge sampled the OLD value.)
+logic cfg_settled;
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni)             cfg_settled <= 1'b0;
+  else if (state_q == LOAD) cfg_settled <= 1'b1;
+  else                      cfg_settled <= 1'b0;
+end
+
 // Capture frame config ONCE, at the instant we commit to a new frame
 // (IDLE -> LOAD). The register must NOT track the config wires during IDLE:
 // the codeword generator may still be draining the previous frame's core
@@ -109,7 +124,10 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) begin
     base_graph_q   <= '0;
     lifting_size_q <= '0;
-  end else if ((state_q == IDLE) & (state_n == LOAD)) begin
+  end else if (state_q == LOAD) begin
+    // Latch config DURING LOAD (not on the IDLE->LOAD edge): the new frame's
+    // config has settled onto the wires by then. Still never changes during
+    // IDLE, so the codeword generator's previous-frame drain is undisturbed.
     base_graph_q   <= base_graph_i;
     lifting_size_q <= lifting_size_i;
   end
@@ -151,7 +169,7 @@ logic csr_start_init, csr_start_calc;
 
 // Kick the CSR decoder off in LOAD, once base_graph_q / lifting_size_q have
 // been registered. (Previously this fired in IDLE off the raw config wires.)
-assign csr_start_init = (state_q == LOAD);
+assign csr_start_init = (state_q == LOAD) & cfg_settled;
 assign csr_start_calc = (state_q != IDLE) & (state_q != LOAD)
                       & (rowgrp_changed_qdly & (row_cnt_q < row_limit));
 assign csr_start = csr_start_init | csr_start_calc;
@@ -196,9 +214,9 @@ always_comb begin
           state_n = LOAD;
       else state_n = IDLE;
     LOAD:
-      // Config is now stable and the CSR decoder has been started; wait for
-      // its first valid output, then begin lambda accumulation.
-      if (csr_valid_q)
+      // Stay until config has settled (cfg_settled) AND the CSR decoder, which
+      // is started only after that, has produced its first valid output.
+      if (csr_valid_q & cfg_settled)
           state_n = CALC_LAMBDA;
       else state_n = LOAD;
     CALC_LAMBDA:
@@ -225,7 +243,8 @@ end
 
 // need to delay output by 1 clock to sync with input bits arrival
 logic [3:0][ZC_WIDTH-1:0] permutation_q, permutation_qdly;
-logic [COL_WIDTH-1:0] col_curr_q;
+logic [3:0][COL_WIDTH-1:0] col_idx_q, col_idx_qdly;
+logic [COL_WIDTH-1:0] col_curr_q, col_curr_qdly;
 logic [3:0] gf2_en_q, gf2_en_qdly;
 logic [NUM_CS-1:0] cs_pc_sel_q, cs_pc_sel_qdly;
 logic [3:0][ROW_WIDTH-1:0] actual_row_q;
@@ -243,12 +262,15 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
     rowgrp_changed_qdly <= 0;
     cs_pc_sel_qdly <= '0;
     actual_row_qdly <= '0;
+    col_curr_qdly <= '0;
   end else begin
     if (csr_valid_q) begin
       permutation_qdly <= permutation_q;
       gf2_en_qdly <= gf2_en_q;
       cs_pc_sel_qdly <= cs_pc_sel_q;
       actual_row_qdly <= actual_row_q;
+      col_idx_qdly <= col_idx_q;
+      col_curr_qdly <= col_curr_q;
     end else gf2_en_qdly <= '0;
 
     csr_valid_qdly <= csr_valid_q;
@@ -272,6 +294,7 @@ csr_decoder csr_decoder (
   .permutation_o (permutation_q),
   .gf2_en_o      (gf2_en_q),
   .actual_row_o  (actual_row_q),
+  .col_idx_o     (col_idx_q),
   .col_curr_o    (col_curr_q),
   .parity_core_col_o (cs_pc_sel_q),
   .rowgrp_changed_o  (rowgrp_changed_q)
@@ -405,16 +428,33 @@ core_parity_bit_calculator #(
 );
 
 logic [3:0][(ZC_MAX >> 2)-1:0] parity_core_arranged;
-logic [IDX_WIDTH-1:0] parity_core_sel;
-logic [$clog2(NUM_CS+1)-1:0] parity_core_sel_cnt;
+logic [3:0][IDX_WIDTH-1:0] parity_core_sel;
+
+// Which core-parity column is being fed back this cycle: c_idx = col_curr - KB.
+// col_curr_qdly aligns with cs_pc_sel_qdly / permutation_qdly (the column the
+// shifter is processing). Only meaningful when cs_pc_sel_qdly != 0.
+logic [COL_WIDTH-1:0] kb_cols;
+logic [3:0][1:0]      pc_col_idx;
+assign kb_cols    = base_graph_q ? COL_WIDTH'(KB_BG2) : COL_WIDTH'(KB_BG1);
 
 always_comb begin
-  parity_core_sel_cnt = '0;
-  for (int unsigned i = 0; i < NUM_CS; i++) 
-    if (cs_pc_sel_qdly[i]) parity_core_sel_cnt = parity_core_sel_cnt + 1'b1;
+  for (int i = 0; i < 4; i++) begin
+    pc_col_idx[i] = 2'(col_idx_qdly[i] - kb_cols);
+  end
+end
 
-  if (parity_core_sel_cnt >= NUM_CS) parity_core_sel = IDX_WIDTH'(NUM_CS-1);
-  else parity_core_sel = IDX_WIDTH'(parity_core_sel_cnt);
+// Map the core-parity column index to the parity_core lane that holds its p_c.
+// core_parity_bit_calculator stores p_c1=parity_core[3], p_c2=[0], p_c3=[1],
+// p_c4=[2]; column KB+c feeds p_c(c+1), so c=0->3, 1->0, 2->1, 3->2.
+always_comb begin
+  for (int i = 0; i < 4; i++) begin
+    case (pc_col_idx[i])
+      2'd0:    parity_core_sel[i] = IDX_WIDTH'(3); // p_c1
+      2'd1:    parity_core_sel[i] = IDX_WIDTH'(0); // p_c2
+      2'd2:    parity_core_sel[i] = IDX_WIDTH'(1); // p_c3
+      default: parity_core_sel[i] = IDX_WIDTH'(2); // p_c4 (c_idx==3)
+    endcase
+  end
 end
 
 pc_rearrange #(
@@ -428,11 +468,11 @@ pc_rearrange #(
 );
 
 always_comb begin
-  for (int unsigned i = 0; i < NUM_CS; i++) begin
-    if (cs_pc_sel_qdly[i]) 
-      cs_data_in[NUM_CS-1-i] = parity_core_arranged[i];
-    else 
-      cs_data_in[NUM_CS-1-i] = data_segment[NUM_CS-1-i];
+  for (int k = 0; k < NUM_CS; k++) begin
+    if (cs_pc_sel_qdly[k])
+      cs_data_in[k] = parity_core_arranged[k];
+    else
+      cs_data_in[k] = data_segment[k];
   end
 end
 
@@ -442,9 +482,11 @@ logic info_valid;
 
 always_comb begin
   case (zc_group)
+    // parity_core is now LSB-packed: active Zc bits in [Zc-1:0].
+    // Extract from the bottom of each parity_core word.
     ZC_SMALL: begin
       for (int unsigned i = 0; i < 4; i++) begin
-        parity_core_packed[3-i] = parity_core[i][ZC_MAX-1 -: (ZC_MAX >> 2)];
+        parity_core_packed[3-i] = parity_core[i][(ZC_MAX >> 2)-1:0];
       end
     end
     
@@ -452,7 +494,7 @@ always_comb begin
       for (int unsigned i = 0; i < 2; i++) begin
         {parity_core_packed[3 - 2*i], 
          parity_core_packed[2 - 2*i]} = 
-          parity_core[merge_row_idx + i][ZC_MAX-1 -: (ZC_MAX >> 1)];
+          parity_core[merge_row_idx + i][(ZC_MAX >> 1)-1:0];
       end
     end 
     ZC_LARGE: {parity_core_packed[0], parity_core_packed[1], parity_core_packed[2], parity_core_packed[3]} = parity_core[merge_row_idx];
@@ -462,7 +504,13 @@ end
 
 assign info_valid = (state_q == CALC_LAMBDA);
 assign parity_core_valid = (state_q == CALC_PC);
-assign parity_additional_valid = (state_q == CALC_PA) & rowgrp_changed_qdly;
+// The FSM leaves CALC_PA->IDLE on the rising edge of rowgrp_changed_q, but the
+// PA for that final row-group only becomes valid one cycle later, when
+// rowgrp_changed_qdly pulses -- by then state_q is already IDLE. Include IDLE
+// so the last batch (e.g. the 2-row remainder when the BG height isn't a
+// multiple of 4) is still flagged. rowgrp_changed_qdly is 0 during steady
+// IDLE, so this only fires on that one trailing cycle.
+assign parity_additional_valid = ((state_q == CALC_PA) | (state_q == IDLE)) & rowgrp_changed_qdly;
 
 logic [3:0][ROW_WIDTH:0] parity_additional_idx;
 always_comb begin
