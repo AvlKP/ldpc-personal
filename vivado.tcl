@@ -1,19 +1,23 @@
 # This script was generated automatically by bender.
-set ROOT "C:/Users/avila/eda/designs/ldpc_personal"
+set ROOT "D:/WSL/designs/1-projects/ldpc-personal"
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/fpga/pad_functional_xilinx.sv \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/fpga/tc_clk_xilinx.sv \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/fpga/tc_sram_xilinx.sv \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/rtl/tc_sram_impl.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/deprecated/pulp_clock_gating_async.sv \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/deprecated/cluster_clk_cells.sv \
     $ROOT/.bender/git/checkouts/tech_cells_generic-ec7551cd5d33f3e0/src/deprecated/pulp_clk_cells.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/binary_to_gray.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/cb_filter_pkg.sv \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/cc_onehot.sv \
@@ -68,6 +72,7 @@ add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/addr_decode_napot.sv \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/multiaddr_decode.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/cb_filter.sv \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/cdc_fifo_2phase.sv \
@@ -100,6 +105,7 @@ add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/stream_omega_net.sv \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/mem_to_banks.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/deprecated/clock_divider_counter.sv \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/deprecated/clk_div.sv \
@@ -117,6 +123,7 @@ add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/edge_propagator.sv \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/src/edge_propagator_rx.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/src/axi_pkg.sv \
     $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/src/axi_intf.sv \
@@ -178,14 +185,30 @@ add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/src/axi_xbar.sv \
     $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/src/axi_xp.sv \
 ]
+
 add_files -norecurse -fileset [current_fileset] [list \
     $ROOT/rtl/ldpc_pkg.sv \
     $ROOT/rtl/lutrom.sv \
     $ROOT/rtl/rom_dp.sv \
+    $ROOT/rtl/sdp_bram.sv \
     $ROOT/rtl/lutram.sv \
+    $ROOT/rtl/barrel_shifter.sv \
+    $ROOT/rtl/direct_bit_permutation.sv \
+    $ROOT/rtl/group_reordering.sv \
+    $ROOT/rtl/parameter_calculation.sv \
+    $ROOT/rtl/top_level_shifter.sv \
+    $ROOT/rtl/gf2_sum.sv \
+    $ROOT/rtl/merge_sel_lambda.sv \
+    $ROOT/rtl/core_parity_bit_calculator.sv \
+    $ROOT/rtl/pc_rearrange.sv \
+    $ROOT/rtl/codeword_generator.sv \
     $ROOT/rtl/csr_decoder.sv \
+    $ROOT/rtl/zc_decoder.sv \
+    $ROOT/rtl/set_index_decoder.sv \
+    $ROOT/rtl/ldpc_encoder_core.sv \
     $ROOT/rtl/input_buffer.sv \
-    $ROOT/rtl/ldpc_encoder.sv \
+    $ROOT/rtl/output_buffer.sv \
+    $ROOT/rtl/ldpc_encoder.v \
 ]
 
 set_property include_dirs [list \
@@ -197,6 +220,20 @@ set_property include_dirs [list \
     $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/include \
     $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/include \
 ] [current_fileset -simset]
+
+# Vivado requires .svh headers to be explicitly registered in the project
+# (set_property include_dirs alone does not satisfy [filemgmt 56-591]).
+set svh_headers [list \
+    $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/include/common_cells/assertions.svh \
+    $ROOT/.bender/git/checkouts/common_cells-faa88a3c3739dfb9/include/common_cells/registers.svh \
+    $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/include/axi/assign.svh \
+    $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/include/axi/port.svh \
+    $ROOT/.bender/git/checkouts/axi-dbe8c8ba5bb17ff2/include/axi/typedef.svh \
+]
+add_files -norecurse -fileset [current_fileset] $svh_headers
+foreach f $svh_headers {
+    set_property file_type {SystemVerilog Header} [get_files $f]
+}
 
 set_property verilog_define [list \
     TARGET_FPGA \

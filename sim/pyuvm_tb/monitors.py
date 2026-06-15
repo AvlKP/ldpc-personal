@@ -94,10 +94,15 @@ class LdpcShifterMonitor(uvm_monitor):
                 cs_in = safe_int(core.cs_data_in)
                 cs_out = safe_int(core.cs_data_out)
                 shift_val = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
-                # gf2_en_eff is the actual gf2_sum accumulate enable for this
-                # cs_data_out; lanes with it low are never summed, so the
-                # scoreboard must skip those fold-groups.
-                gf2_en = safe_int(core.gf2_en_eff)
+                # Position-domain context for this output cycle. A CSR entry
+                # holds 4 base-graph-row POSITIONS; the folded modes process a
+                # subset per cycle (merge_d_cycle says which), gf2_en_qdly is
+                # the per-POSITION accumulate enable, and col_idx_qdly is each
+                # position's absolute base-graph column (col_curr for D
+                # entries, the E column for parity-feedback entries).
+                d_cycle = safe_int(core.merge_d_cycle)
+                en_pos = safe_int(core.gf2_en_qdly)
+                col_idx_packed = safe_int(core.col_idx_qdly)
                 self.ap.write({
                     'type': 'shifter',
                     'in': cs_in,
@@ -106,7 +111,9 @@ class LdpcShifterMonitor(uvm_monitor):
                     'col': meta['col'],
                     'rows': meta['rows'],
                     'pc_sel': meta['pc_sel'],
-                    'gf2_en': gf2_en,
+                    'd_cycle': d_cycle,
+                    'en_pos': en_pos,
+                    'col_idx': [(col_idx_packed >> (i * 7)) & 0x7F for i in range(4)],
                     'frame_id': meta['frame_id']
                 })
 
@@ -259,15 +266,126 @@ class LdpcParityMonitor(uvm_monitor):
             prev_add_valid = add_valid
 
 class LdpcOutputMonitor(uvm_monitor):
+    """Captures the AXIS output per frame, plus two white-box views collected
+    by a free-running task: the parity values handed to the codeword
+    generator and the codeword RAM rows the output buffer fetches back.
+
+    The collector CANNOT live inside the per-frame AXIS capture loop: with the
+    double-banked codeword RAM, frame N+1's ENTIRE encode overlaps frame N's
+    readout, so events must be attributed by hardware frame counters (encode
+    frames = idle_o falling edges, readout frames = codeword_done pulses),
+    not by which capture window happens to observe them.
+    """
+    # Mirrors the output_buffer state_t encoding (declaration order)
+    OB_STREAM = 3
+
     def build_phase(self) -> None:
         self.bfm: LdpcTopBfm = ConfigDB().get(self, "", "BFM")
         self.recorder: TransactionRecorder = ConfigDB().get(self, "", "RECORDER")
         self.actual_ap = uvm_analysis_port("actual_ap", self)
+        # encode-frame keyed: base-graph row -> Zc-bit parity value
+        self.parity_rows_by_frame: dict[int, dict[int, int]] = {}
+        self.pc_events_by_frame: dict[int, int] = {}
+        self.pa_events_by_frame: dict[int, int] = {}
+        # readout-frame keyed: [{"addr", "data", "time_ns"}, ...]
+        self.ram_rows_by_frame: dict[int, list] = {}
+        self._seen_addrs_by_frame: dict[int, set] = {}
+
+    async def _collect_internal(self) -> None:
+        dut = self.bfm.dut
+        core = dut.ldpc_encoder_core
+        outbuff = dut.output_buffer
+
+        enc_frame = -1
+        rd_frame = 0
+        prev_idle = 1
+        prev_core_valid = False
+        prev_add_valid = False
+        core_lanes = [0, 0, 0, 0]
+        prev_ob_state = None
+        mask96 = (1 << 96) - 1
+
+        while True:
+            await RisingEdge(dut.clk_i)
+            await ReadOnly()
+
+            idle = safe_int(core.idle_o)
+            if prev_idle and not idle:
+                enc_frame += 1
+            prev_idle = idle
+
+            # Frame-stable config from the core's registered copies (the
+            # ctx is not available here; the values pin the lane layout)
+            zc = safe_int(core.lifting_size_q, 0)
+            mb = 42 if safe_int(core.base_graph_q, 0) else 46
+            mask_z = (1 << zc) - 1 if zc else 0
+
+            # --- parity hand-off at the core/codeword_generator boundary ---
+            core_valid = safe_int(getattr(core, "parity_core_valid", None), 0) == 1
+            add_valid = safe_int(getattr(core, "parity_additional_valid", None), 0) == 1
+
+            if core_valid:
+                pc = safe_int(getattr(core, "parity_core", None), 0)
+                core_lanes = [(pc >> (k * 384)) & ((1 << 384) - 1) for k in range(4)]
+            if prev_core_valid and not core_valid:
+                rows_acc = self.parity_rows_by_frame.setdefault(enc_frame, {})
+                self.pc_events_by_frame[enc_frame] = self.pc_events_by_frame.get(enc_frame, 0) + 1
+                # core_parity_bit_calculator lane map: p_c1=lane3, p_c2=lane0,
+                # p_c3=lane1, p_c4=lane2 -> p_groups rows 0..3
+                for lane, row in ((3, 0), (0, 1), (1, 2), (2, 3)):
+                    rows_acc[row] = core_lanes[lane] & mask_z
+
+            if add_valid and not prev_add_valid:
+                rows_acc = self.parity_rows_by_frame.setdefault(enc_frame, {})
+                self.pa_events_by_frame[enc_frame] = self.pa_events_by_frame.get(enc_frame, 0) + 1
+                pa = safe_int(getattr(core, "parity_additional", None), 0)
+                ar = safe_int(getattr(core, "actual_row_qdly", None), 0)
+                mdc = safe_int(getattr(core, "merge_d_cycle", None), 0)
+                lanes = [(pa >> (k * 96)) & mask96 for k in range(4)]
+                rows = [(ar >> (k * 6)) & 0x3F for k in range(4)]
+                # Reassemble rows by zc group, same lane->row mapping as the
+                # core's gf2_en remap (see internal scoreboard check_parity)
+                if zc <= 96:
+                    cand = [(rows[k], lanes[k] & mask_z) for k in range(4)]
+                elif zc <= 192:
+                    base = 2 * (mdc - 1)
+                    cand = [] if base < 0 else [
+                        (rows[base], (lanes[0] | (lanes[1] << 96)) & mask_z),
+                        (rows[base + 1], (lanes[2] | (lanes[3] << 96)) & mask_z),
+                    ]
+                else:
+                    val = lanes[0] | (lanes[1] << 96) | (lanes[2] << 192) | (lanes[3] << 288)
+                    cand = [(rows[mdc], val & mask_z)]
+                for row, val in cand:
+                    # skip the partial last group's duplicate padding labels
+                    if 4 <= row < mb and row not in rows_acc:
+                        rows_acc[row] = val
+
+            prev_core_valid = core_valid
+            prev_add_valid = add_valid
+
+            # --- codeword RAM rows, sampled when the output buffer enters
+            #     STREAM with a freshly fetched word ---
+            ob_state = safe_int(getattr(outbuff, "state_q", None), None)
+            if ob_state == self.OB_STREAM and prev_ob_state != self.OB_STREAM:
+                addr = safe_int(getattr(dut, "cw_r_addr", None), 0)
+                seen = self._seen_addrs_by_frame.setdefault(rd_frame, set())
+                if addr not in seen:
+                    seen.add(addr)
+                    self.ram_rows_by_frame.setdefault(rd_frame, []).append({
+                        "addr": addr,
+                        "data": safe_int(getattr(dut, "cw_r_data", None), 0),
+                        "time_ns": cocotb.utils.get_sim_time('ns'),
+                    })
+            prev_ob_state = ob_state
+
+            # Readout-frame boundary: codeword_done is a 1-cycle pulse fired
+            # after the frame's last RAM fetch, before its last AXIS beat.
+            if safe_int(getattr(dut, "outbuff_done", None), 0) == 1:
+                rd_frame += 1
 
     async def capture_frame(self, ctx: dict[str, Any]) -> dict[str, Any]:
         dut = self.bfm.dut
-        core = getattr(dut, "ldpc_encoder_core", None)
-        cwgen = getattr(core, "codeword_generator", None) if core is not None else None
 
         rng = random.Random(ctx["seed"] ^ 0x5A5A)
         captured_bits: list[int] = []
@@ -275,12 +393,6 @@ class LdpcOutputMonitor(uvm_monitor):
         accepted_words = 0
         total_words = ctx["total_words"]
         timeout_cycles = max(30000, total_words * 128)
-        
-        actual_parity_chunks = []
-        actual_internal_writes = []
-
-        parity_core_events = 0
-        parity_additional_events = 0
         tlast = 0
 
         for cycle in range(timeout_cycles):
@@ -288,44 +400,12 @@ class LdpcOutputMonitor(uvm_monitor):
             dut.m_axis_tready.value = ready
             await RisingEdge(dut.clk_i)
 
-            if cwgen is not None:
-                parity_core_valid = safe_int(getattr(cwgen, "parity_core_valid_i", None), 0)
-                parity_additional_valid = safe_int(getattr(cwgen, "parity_additional_valid_i", None), 0)
-                ext_valid = safe_int(getattr(cwgen, "ext_valid", None), 0)
-                outbuff_full_i = safe_int(getattr(cwgen, "outbuff_full_i", None), 0)
-                
-                if ext_valid == 1 and outbuff_full_i == 0 and (parity_core_valid == 1 or parity_additional_valid == 1):
-                    ext_len = safe_int(getattr(cwgen, "ext_len", None), 0)
-                    ext_data = safe_int(getattr(cwgen, "ext_data", None), 0)
-                    
-                    if parity_core_valid == 1:
-                        parity_core_events += 1
-                    if parity_additional_valid == 1:
-                        parity_additional_events += 1
-
-                    actual_parity_chunks.append({
-                        "len": ext_len,
-                        "data": ext_data,
-                        "src": "core" if parity_core_valid == 1 else "additional",
-                        "cycle": cycle,
-                        "time_ns": cocotb.utils.get_sim_time('ns')
-                    })
-
-            outbuff_wr_en = safe_int(getattr(dut, "outbuff_wr_en", None), 0)
-            if outbuff_wr_en == 1:
-                raw_wr = safe_int(getattr(dut, "outbuff_data", None), 0)
-                actual_internal_writes.append({
-                    "data": raw_wr & ((1 << OUTBUFF_WRITE_BITS) - 1),
-                    "cycle": cycle,
-                    "time_ns": cocotb.utils.get_sim_time('ns')
-                })
-
             tvalid = safe_int(dut.m_axis_tvalid, 0)
             if tvalid == 1 and ready == 1:
                 tlast = safe_int(dut.m_axis_tlast, 0)
                 raw = safe_int(dut.m_axis_tdata, 0)
                 accepted_words += 1
-                
+
                 actual_words.append({
                     "data": raw,
                     "time_ns": cocotb.utils.get_sim_time('ns')
@@ -347,19 +427,25 @@ class LdpcOutputMonitor(uvm_monitor):
 
         dut.m_axis_tready.value = 0
 
+        # By the time the frame's last AXIS word is accepted, its encode
+        # finished long ago and its codeword_done already pulsed, so the
+        # collector's per-frame views are complete.
+        fid = ctx["frame_id"]
         return {
-            "frame_id": ctx["frame_id"],
+            "frame_id": fid,
             "actual_bits": captured_bits[: ctx["output_bits"]],
             "actual_words": actual_words,
             "accepted_words": accepted_words,
-            "parity_core_events": parity_core_events,
-            "parity_additional_events": parity_additional_events,
-            "actual_parity_chunks": actual_parity_chunks,
-            "actual_internal_writes": actual_internal_writes,
+            "parity_core_events": self.pc_events_by_frame.get(fid, 0),
+            "parity_additional_events": self.pa_events_by_frame.get(fid, 0),
+            "actual_parity_rows": self.parity_rows_by_frame.get(fid, {}),
+            "actual_ram_rows": self.ram_rows_by_frame.get(fid, []),
             "tlast_on_last_word": tlast
         }
 
     async def run_phase(self) -> None:
+        import cocotb
+        cocotb.start_soon(self._collect_internal())
         while True:
             ctx = await self.bfm.capture_queue.get()
             actual = await self.capture_frame(ctx)

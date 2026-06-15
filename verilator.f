@@ -202,5 +202,5 @@
 /foss/designs/1-projects/ldpc-personal/rtl/lutram.sv
 /foss/designs/1-projects/ldpc-personal/rtl/csr_decoder.sv
 /foss/designs/1-projects/ldpc-personal/rtl/input_buffer.sv
-/foss/designs/1-projects/ldpc-personal/rtl/ldpc_encoder.sv
+/foss/designs/1-projects/ldpc-personal/rtl/ldpc_encoder.v
 

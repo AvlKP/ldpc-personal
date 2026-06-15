@@ -68,12 +68,12 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         expected_bits = hooks['i_groups'][tr['kb_idx']]
         expected_int = bits_to_int_lsb(expected_bits)
 
+        import cocotb.utils
+        sim_time = cocotb.utils.get_sim_time('ns')
         if tr['data'] != expected_int:
-            import cocotb.utils
-            sim_time = cocotb.utils.get_sim_time('ns')
             self.logger.error(f"[{sim_time} ns] INPUT MISMATCH at KB={tr['kb_idx']}. RTL: {hex(tr['data'])}, GM: {hex(expected_int)}")
         else:
-            self.logger.debug(f"Input KB={tr['kb_idx']} aligned correctly.")
+            self.logger.info(f"[{sim_time} ns] INPUT KB={tr['kb_idx']}. RTL: {hex(tr['data'])}, GM: {hex(expected_int)}")
 
     def _build_e_col_deques(self, hooks_dict, hook_key):
         """Build per-row ordered deques of E-column (col >= kb) hooks for one
@@ -94,100 +94,85 @@ class LdpcInternalScoreboard(uvm_scoreboard):
         return deques
 
     def check_shifter(self, tr):
-        # The RTL cyclic shifter is 4 lanes x 96b. For MEDIUM/LARGE one Z-bit
-        # (192/384) shifted vector is FOLDED across 2/4 lanes, and
-        # group_reordering permutes which lanes carry which row between the
-        # shift-value side and the output side. So the per-lane shift VALUE
-        # (the permutation p) still matches per lane, but the OUTPUT must be
-        # reassembled into Z-bit vectors and matched by VALUE against the GM
-        # shifted_vec (a per-lane "lane i == row i" compare cannot work).
+        # Position-aware shifter check. A CSR entry holds 4 base-graph-row
+        # POSITIONS; each output cycle processes a subset of them, folded onto
+        # the four physical 96b lanes:
+        #   SMALL  (Z<=96)    : positions 0..3 <-> lanes 0..3, one cycle
+        #   MEDIUM (Z<=192)   : positions {mb, mb+1}, mb=2*(d_cycle-1), on
+        #                       lane pairs {0,1} / {2,3}
+        #   LARGE  (Z>192)    : position d_cycle on lanes {0,1,2,3}
+        # Position p carries its own row (rows[p]), absolute column
+        # (col_idx[p]) and normalized shift (p_norm[p]). The GM hook is the
+        # unique base-graph entry at (row, col), so every check is a direct
+        # idempotent lookup -- no ordering assumptions, no E-column deques.
         import cocotb.utils
         hooks = self._frame_hooks(tr)
         if hooks is None:
             return
-
-        col = tr['col']
-        shift_val_packed = tr['shift']
-        rtl_out_packed = tr['out']
-        pc_sel = tr.get('pc_sel', [0, 0, 0, 0])
-        gf2_en = tr.get('gf2_en', 0xF)
-        mask96 = (1 << 96) - 1
-        out_lanes = [(rtl_out_packed >> (i * 96)) & mask96 for i in range(4)]
         t = cocotb.utils.get_sim_time('ns')
 
-        # E-column hook deques are stateful (popped in order), so rebuild them
-        # whenever the RTL frame changes (transactions arrive in frame order).
+        # (row, col) -> hook map, rebuilt when the RTL frame changes.
         fid = tr.get('frame_id', -1)
-        if getattr(self, '_shift_e_frame', None) != fid:
-            self._shift_e_frame = fid
-            self._shift_e_deques = self._build_e_col_deques(hooks, 'shifted_vectors')
+        if getattr(self, '_sv_frame', None) != fid:
+            self._sv_frame = fid
+            self._sv_by_rowcol = {(h['row'], h['col']): h
+                                  for h in hooks.get('shifted_vectors', [])}
 
-        # GM shifted_vec terms processed at this column (D and E entries both
-        # land at col_curr == tr['col']). Z determines the fold width.
-        sv_here = [h for h in hooks.get('shifted_vectors', []) if h['col'] == col]
-        Z = len(sv_here[0]['vec']) if sv_here else 96
+        Z = len(hooks['i_groups'][0]) if hooks.get('i_groups') else 96
         lanes_per_row = max(1, (Z + 95) // 96)
+        d_cycle = tr.get('d_cycle', 0)
+        if lanes_per_row == 1:
+            pos_lanes = {p: (p,) for p in range(4)}
+        elif lanes_per_row == 2:
+            mb = 2 * (d_cycle - 1)
+            if mb < 0:
+                return
+            pos_lanes = {mb: (0, 1), mb + 1: (2, 3)}
+        else:
+            pos_lanes = {d_cycle: (0, 1, 2, 3)}
 
-        # --- 1. Per-lane SHIFT VALUE (permutation) check, plus the SMALL vec ---
-        for i in range(4):
-            # Skip lanes that aren't accumulated this cycle: their shifter output
-            # is stale and never summed, and (for E columns) they must not pop a
-            # GM E-column hook.
-            if not ((gf2_en >> i) & 1):
+        en_pos = tr.get('en_pos', 0xF)
+        pc_sel = tr.get('pc_sel', [0, 0, 0, 0])
+        col_idx = tr.get('col_idx', [tr['col']] * 4)
+        mask96 = (1 << 96) - 1
+        maskZ = (1 << Z) - 1
+        out_lanes = [(tr['out'] >> (i * 96)) & mask96 for i in range(4)]
+        in_lanes = [(tr['in'] >> (i * 96)) & mask96 for i in range(4)]
+
+        for p, lanes in pos_lanes.items():
+            if not ((en_pos >> p) & 1):
                 continue
-            row = tr['rows'][i]
-            actual_shift = (shift_val_packed >> (i * 9)) & 0x1FF
-            rtl_out_lane = out_lanes[i]
-            if pc_sel[i] == 1:
-                row_deque = self._shift_e_deques.get(row)
-                hook = row_deque.popleft() if row_deque else None
-                kind = "SHIFT(E)"
-            else:
-                hook = next((h for h in hooks.get('shifted_vectors', [])
-                             if h['row'] == row and h['col'] == col), None)
-                kind = "SHIFT"
+            row = tr['rows'][p]
+            pcol = col_idx[p]
+            shift = (tr['shift'] >> (p * 9)) & 0x1FF
+            kind = "SHIFT(E)" if pc_sel[p] else "SHIFT"
+            hook = self._sv_by_rowcol.get((row, pcol))
             if hook is None:
+                self.logger.error(f"[{t} ns] {kind} NO GM HOOK at Row {row}, Col {pcol} (col_curr {tr['col']})")
                 continue
-            hcol = hook['col']
-            if actual_shift != hook['shift']:
-                self.logger.error(f"[{t} ns] {kind} VAL MISMATCH at Row {row}, Col {hcol}: RTL {actual_shift}, GM {hook['shift']}")
-            elif lanes_per_row == 1:
-                # SMALL: lane i IS row i's shifted vector, LSB-packed in the
-                # 96b lane ([Z-1:0]); mask the bottom Z bits.
-                gm_vec = bits_to_int_lsb(hook['vec'])
-                rtl_val = rtl_out_lane & ((1 << Z) - 1)
-                if rtl_val == gm_vec:
-                    self.logger.debug(f"{kind} OK at Row {row}, Col {hcol}: shift={actual_shift}, vec={hex(rtl_val)}")
-                else:
-                    self.logger.error(f"[{t} ns] {kind} VEC MISMATCH at Row {row}, Col {hcol}: shift={actual_shift}\n  RTL: {hex(rtl_val)}\n  GM:  {hex(gm_vec)}")
+            if shift != hook['shift']:
+                self.logger.error(f"[{t} ns] {kind} VAL MISMATCH at Row {row}, Col {pcol}: RTL {shift}, GM {hook['shift']}")
             else:
-                self.logger.debug(f"{kind} VAL OK at Row {row}, Col {hcol}: shift={actual_shift}")
-
-        # --- 2. Reassembled OUTPUT vector check for the folded modes ---
-        if lanes_per_row == 1 or not sv_here:
-            return
-        gm_by_val = {}
-        for h in sv_here:
-            gm_by_val.setdefault(bits_to_int_lsb(h['vec']), h)
-
-        # Fold-groups of physical lanes: MEDIUM has two 192b rows {0,1},{2,3};
-        # LARGE has one 384b row {0,1,2,3}. A group is only meaningful if ALL its
-        # lanes are accumulated (gf2_en set) -- otherwise those lanes hold stale
-        # shifter output that is never summed, so skip the group entirely.
-        groups = [(0, 1), (2, 3)] if lanes_per_row == 2 else [(0, 1, 2, 3)]
-        for lanes in groups:
-            if not all((gf2_en >> l) & 1 for l in lanes):
-                continue  # group not accumulated this cycle
+                self.logger.info(f"[{t} ns] {kind} VAL at Row {row}, Col {pcol}: RTL {shift}, GM {hook['shift']}")
+            # Reassemble this position's fold-group (concat layout: lane k of
+            # the group holds bits [96k +: 96] of the Z-bit vector).
             rv = 0
-            for pos, l in enumerate(lanes):
-                rv |= out_lanes[l] << (pos * 96)
-            h = gm_by_val.get(rv)
-            if h is not None:
-                self.logger.debug(f"SHIFT VEC OK at Row {h['row']}, Col {col}: {hex(rv)}")
+            riv = 0
+            for k, l in enumerate(lanes):
+                rv |= out_lanes[l] << (k * 96)
+                riv |= in_lanes[l] << (k * 96)
+            rv &= maskZ
+            riv &= maskZ
+            gm_in = bits_to_int_lsb(hook['in_vec'])
+            gm_vec = bits_to_int_lsb(hook['vec'])
+            if riv == gm_in:
+                self.logger.info(f"[{t} ns] {kind} UNSHIFTED at Row {row}, Col {pcol}: RTL {hex(riv)}, GM {hex(gm_in)}")
             else:
-                self.logger.error(
-                    f"[{t} ns] SHIFT VEC MISMATCH at Col {col}: reassembled RTL {hex(rv)} "
-                    f"matches no GM shifted_vec {[hex(v) for v in gm_by_val]}")
+                self.logger.error(f"[{t} ns] {kind} UNSHIFTED MISMATCH at Row {row}, Col {pcol}: RTL {hex(riv)}, GM {hex(gm_in)}")
+            if rv == gm_vec:
+                self.logger.info(f"[{t} ns] {kind} VEC at Row {row}, Col {pcol}: RTL {hex(rv)}, GM {hex(gm_vec)}")
+            else:
+                self.logger.error(f"[{t} ns] {kind} VEC MISMATCH at Row {row}, Col {pcol}: shift={shift}, RTL {hex(rv)}, GM {hex(gm_vec)}")
 
     def check_gf2(self, tr):
         # Disabled as requested by user - comparison is currently incorrect
@@ -351,12 +336,45 @@ class LdpcScoreboard(uvm_scoreboard):
         self.recorder: TransactionRecorder = ConfigDB().get(self, "", "RECORDER")
 
     @staticmethod
-    def zc_group_multiplier(zc: int) -> int:
+    def rows_per_pa_event(zc: int) -> int:
+        """Base-graph rows completed per additional-parity hand-off pulse."""
         if zc > 192:
             return 1
         if zc > 96:
             return 2
         return 4
+
+    @staticmethod
+    def expected_ram_rows(exp_bits: list[int], zc: int, kb: int, nb: int):
+        """Expected codeword RAM image: {bank row: (value, used-bit mask)}.
+
+        Mirrors the codeword_generator layout / output_buffer address
+        generator: pf = 4/2/1 columns per 384b bank row; info rows from 0,
+        core parity from cp_base = ceil(KB/pf), additional parity from
+        ap_base = cp_base + 4/pf. Boundary padding sub-banks (and bits above
+        Zc inside a slot) are excluded via the mask -- they are never written
+        nor read.
+        """
+        pf = 4 if zc <= 96 else (2 if zc <= 192 else 1)
+        slot_bits = 384 // pf
+        cp_base = (kb + pf - 1) // pf
+        ap_base = cp_base + 4 // pf
+        rows: dict[int, int] = {}
+        masks: dict[int, int] = {}
+        col_mask = (1 << zc) - 1
+        for c in range(nb):
+            if c < kb:
+                addr, slot = c // pf, c % pf
+            elif c < kb + 4:
+                rel = c - kb
+                addr, slot = cp_base + rel // pf, rel % pf
+            else:
+                rel = c - kb - 4
+                addr, slot = ap_base + rel // pf, rel % pf
+            val = bits_to_int_lsb(exp_bits[c * zc:(c + 1) * zc])
+            rows[addr] = rows.get(addr, 0) | (val << (slot * slot_bits))
+            masks[addr] = masks.get(addr, 0) | (col_mask << (slot * slot_bits))
+        return rows, masks
 
     async def run_phase(self) -> None:
         for _ in range(self.frame_count):
@@ -394,77 +412,52 @@ class LdpcScoreboard(uvm_scoreboard):
                 self.logger.error(f"[{time_ns} ns] Frame {frame_id} mismatch at bit {mismatch} (word {word_idx}).\nExp window: {exp_bits[lo:hi]} (hex: {exp_hex})\nAct window: {act_bits[lo:hi]} (hex: {act_hex})")
                 has_error = True
 
-        # 2. Parity chunk comparison
+        # 2. Parity hand-off comparison (row-keyed: the CSR row schedule
+        #    completes rows out of order, so there is no linear stream)
+        zc = expected["zc"]
+        kb = expected["input_bits"] // zc
+        nb = expected["output_bits"] // zc
+        mb = nb - kb
         p_groups = expected["hooks"]["p_groups"]
-        parity_expected = []
-        for g in p_groups:
-            parity_expected.extend(g)
-            
-        parity_mult = self.zc_group_multiplier(expected["zc"])
-        expected_len = expected["zc"] * parity_mult
-        
-        parity_cursor = 0
-        actual_chunks = actual.get("actual_parity_chunks", [])
-        for idx, chunk in enumerate(actual_chunks):
-            if chunk["len"] != expected_len:
-                self.logger.error(f"[{chunk.get('time_ns', 'UNKNOWN')} ns] Parity group length mismatch frame={frame_id} chunk={idx} exp_len={expected_len} act_len={chunk['len']}")
+        rtl_rows = actual.get("actual_parity_rows", {})
+        for row_idx, grp in enumerate(p_groups):
+            exp_val = bits_to_int_lsb(grp)
+            if row_idx not in rtl_rows:
+                self.logger.error(f"Frame {frame_id} parity row {row_idx} never handed to codeword_generator")
                 has_error = True
-            
-            if parity_cursor + chunk["len"] > len(parity_expected):
-                self.logger.error(f"[{chunk.get('time_ns', 'UNKNOWN')} ns] Parity monitor overflow frame={frame_id} cursor={parity_cursor} ext_len={chunk['len']} parity_total={len(parity_expected)}")
+            elif rtl_rows[row_idx] != exp_val:
+                self.logger.error(f"Frame {frame_id} parity row {row_idx} mismatch at hand-off.\nRTL:    {hex(rtl_rows[row_idx])}\nGolden: {hex(exp_val)}")
                 has_error = True
-                break
-                
-            observed_bits = int_to_bits_lsb(chunk["data"], chunk["len"])
-            expected_chunk = parity_expected[parity_cursor : parity_cursor + chunk["len"]]
-            
-            if observed_bits != expected_chunk:
-                mismatch = next((i for i, (exp, act) in enumerate(zip(expected_chunk, observed_bits)) if exp != act), -1)
-                exp_hex = hex(bits_to_int_lsb(expected_chunk))
-                act_hex = hex(bits_to_int_lsb(observed_bits))
-                self.logger.error(f"[{chunk.get('time_ns', 'UNKNOWN')} ns] Parity group mismatch frame={frame_id} src={chunk['src']} bit={mismatch}\nRTL:    {observed_bits} (hex: {act_hex})\nGolden: {expected_chunk} (hex: {exp_hex})")
-                has_error = True
-            
-            parity_cursor += chunk["len"]
 
-        if parity_cursor != len(parity_expected):
-            self.logger.error(f"Parity consumption mismatch frame={frame_id} exp={len(parity_expected)} act={parity_cursor}")
+        if actual["parity_core_events"] != 1:
+            self.logger.error(f"Frame {frame_id} expected 1 core-parity hand-off, saw {actual['parity_core_events']}")
+            has_error = True
+        exp_pa_events = -(-(mb - 4) // self.rows_per_pa_event(zc))
+        if actual["parity_additional_events"] != exp_pa_events:
+            self.logger.error(f"Frame {frame_id} additional-parity hand-off count mismatch exp={exp_pa_events} act={actual['parity_additional_events']}")
             has_error = True
 
-        if len(parity_expected) > 0 and actual["parity_core_events"] == 0:
-            self.logger.error(f"No core parity groups observed frame={frame_id}")
+        # 3. Codeword RAM image (rows as fetched back by the output buffer),
+        #    masked to the sub-bank slots the layout actually uses
+        exp_rows, exp_masks = self.expected_ram_rows(exp_bits, zc, kb, nb)
+        ram_rows = actual.get("actual_ram_rows", [])
+        if len(ram_rows) != len(exp_rows):
+            self.logger.error(f"Codeword RAM row count mismatch frame={frame_id} exp={len(exp_rows)} act={len(ram_rows)}")
             has_error = True
-        if len(parity_expected) > 0 and actual["parity_additional_events"] == 0:
-            self.logger.error(f"No additional parity groups observed frame={frame_id}")
-            has_error = True
-
-        # 3. Output buffer write comparison
-        expected_internal_writes = []
-        OUTBUFF_WRITE_BITS = 384
-        write_count = (expected["output_bits"] + OUTBUFF_WRITE_BITS - 1) // OUTBUFF_WRITE_BITS
-        for idx in range(write_count):
-            lo = idx * OUTBUFF_WRITE_BITS
-            hi = min((idx + 1) * OUTBUFF_WRITE_BITS, expected["output_bits"])
-            row_bits = exp_bits[lo:hi] + [0] * (OUTBUFF_WRITE_BITS - (hi - lo))
-            expected_internal_writes.append(bits_to_int_lsb(row_bits))
-            
-        actual_writes = actual.get("actual_internal_writes", [])
-        if len(actual_writes) != len(expected_internal_writes):
-            self.logger.error(f"Internal output_buffer write count mismatch frame={frame_id} exp={len(expected_internal_writes)} act={len(actual_writes)}")
-            has_error = True
-            
-        for write_idx, (obs_wr_dict, exp_wr) in enumerate(zip(actual_writes, expected_internal_writes)):
-            obs_wr = obs_wr_dict["data"]
-            if obs_wr != exp_wr:
-                observed_bits = int_to_bits_lsb(obs_wr, OUTBUFF_WRITE_BITS)
-                expected_bits_row = int_to_bits_lsb(exp_wr, OUTBUFF_WRITE_BITS)
-                mismatch = next((i for i, (exp, act) in enumerate(zip(expected_bits_row, observed_bits)) if exp != act), -1)
-                lo = max(0, mismatch - 16)
-                hi = min(OUTBUFF_WRITE_BITS, mismatch + 17)
-                exp_hex = hex(bits_to_int_lsb(expected_bits_row[lo:hi]))
-                act_hex = hex(bits_to_int_lsb(observed_bits[lo:hi]))
-                self.logger.error(f"[{obs_wr_dict.get('time_ns', 'UNKNOWN')} ns] Output-buffer write mismatch frame={frame_id} row={write_idx} bit={mismatch}\nExp window: {expected_bits_row[lo:hi]} (hex: {exp_hex})\nAct window: {observed_bits[lo:hi]} (hex: {act_hex})")
+        for rec in ram_rows:
+            addr = rec["addr"]
+            if addr not in exp_rows:
+                self.logger.error(f"[{rec.get('time_ns', 'UNKNOWN')} ns] Output buffer fetched unexpected codeword RAM row frame={frame_id} addr={addr}")
                 has_error = True
+                continue
+            got = rec["data"] & exp_masks[addr]
+            if got != exp_rows[addr]:
+                self.logger.error(f"[{rec.get('time_ns', 'UNKNOWN')} ns] Codeword RAM row mismatch frame={frame_id} addr={addr}\nRTL:    {hex(got)}\nGolden: {hex(exp_rows[addr])}")
+                has_error = True
+        missing = sorted(set(exp_rows) - {rec["addr"] for rec in ram_rows})
+        if missing:
+            self.logger.error(f"Codeword RAM rows never fetched frame={frame_id} addrs={missing}")
+            has_error = True
 
         # 4. TLAST check
         if actual.get("tlast_on_last_word", 0) != 1:

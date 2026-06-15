@@ -10,7 +10,11 @@ package:
 
 dependencies:
   axi: { git: "https://github.com/pulp-platform/axi.git", version: "0.39" }
-  common_cells: {git: "https://github.com/pulp-platform/common_cells.git", version: "1.39.0"}
+  common_cells:
+    {
+      git: "https://github.com/pulp-platform/common_cells.git",
+      version: "1.39.0",
+    }
 
 sources:
   # Source files grouped in levels. Files in level 0 have no dependencies on files in this
@@ -18,14 +22,32 @@ sources:
   # levels 1 and 0, etc. Files within a level are ordered alphabetically.
   # Level 0
   - "rtl/ldpc_pkg.sv"
-  
+
   - "rtl/lutrom.sv"
   - "rtl/rom_dp.sv"
+  - "rtl/sdp_bram.sv"
 
   - "rtl/lutram.sv"
-  # level 1
+  - "rtl/barrel_shifter.sv"
+  - "rtl/direct_bit_permutation.sv"
+  - "rtl/group_reordering.sv"
+  - "rtl/parameter_calculation.sv"
+
+  # Level 1.5
+  - "rtl/top_level_shifter.sv"
+  - "rtl/gf2_sum.sv"
+  - "rtl/merge_sel_lambda.sv"
+  - "rtl/core_parity_bit_calculator.sv"
+  - "rtl/pc_rearrange.sv"
+  - "rtl/codeword_generator.sv"
   - "rtl/csr_decoder.sv"
+
+  # level 1
+  - "rtl/zc_decoder.sv"
+  - "rtl/set_index_decoder.sv"
+  - "rtl/ldpc_encoder_core.sv"
   - "rtl/input_buffer.sv"
+  - "rtl/output_buffer.sv"
 
   # level 2
-  - "rtl/ldpc_encoder.sv"
+  - "rtl/ldpc_encoder.v"

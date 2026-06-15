@@ -28,7 +28,9 @@ module ldpc_encoder_core #(
   input logic codeword_done_i,
 
   output logic [ZC_WIDTH-1:0] lifting_size_o,
-  output zc_group_t zc_group_o,
+  // Plain 2-bit vector (zc_group_t encoding) so the Verilog top level can
+  // route it to the output buffer without SV enum typing at the boundary.
+  output logic [1:0] zc_group_o,
   output logic base_graph_o
 );
 
@@ -88,7 +90,10 @@ logic csr_start;
 assign row_limit = (base_graph_q)?
     ROW_WIDTH'(BG2_ROW_N) : ROW_WIDTH'(BG1_ROW_N);
 
-assign cw_last_col = (row_cnt_n >= row_limit) & rowgrp_changed_qdly;
+// cw_last_col is registered below (after the FSM): it must pulse exactly on
+// the final additional-parity hand-off cycle, i.e. one cycle after the last
+// row-group's rowgrp_changed edge. It cannot be derived combinationally from
+// rowgrp_changed_qdly because row_cnt_q has already been reset by then.
 
 // FSM
 typedef enum logic [2:0] {
@@ -230,11 +235,23 @@ always_comb begin
     CALC_PA:
       // csr decoder will assert rowgrp_changed_q at +1 cycle after last permutation
       // last pa will be available by then
-      if (row_cnt_n >= row_limit & (rowgrp_changed_q & ~rowgrp_changed_qdly)) 
+      if (row_cnt_n >= row_limit & (rowgrp_changed_q & ~rowgrp_changed_qdly))
         state_n = IDLE;
       else state_n = CALC_PA;
     default: state_n = CALC_PA;
     endcase
+end
+
+// Frame-done strobe for the codeword generator. The condition below is true
+// exactly on the final row-group's rowgrp_changed rising edge (the same one
+// that sends the FSM to IDLE); registering it lands the pulse on the next
+// cycle, which is precisely when parity_additional_valid flags the final PA
+// batch. The generator uses it to close and swap its write bank.
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) cw_last_col <= 1'b0;
+  else          cw_last_col <= (rowgrp_changed_q & ~rowgrp_changed_qdly)
+                             & (row_cnt_n >= row_limit)
+                             & (state_q == CALC_PA);
 end
 
 // -----------
@@ -369,13 +386,38 @@ logic [3:0][ZC_MAX-1:0] lambda;
 logic [IDX_WIDTH-1:0] merge_row_idx;
 assign merge_row_idx = IDX_WIDTH'(row_cnt_q);
 
+// Pass phase for the folded modes. merge_row_idx (row_cnt mod 4) walks each
+// row-group's passes high-position-first (MEDIUM: 2,1; LARGE: 3,2,1,0).
+// The FINAL row-group of both base graphs is half-height (ROW_N % 4 == 2):
+// only the LOW positions {0,1} hold real rows (the CSR duplicates the row
+// LABELS into {2,3} but their column ranges are empty), so the natural phase
+// would spend the tail pass(es) on the empty positions {3,2} and the last two
+// parity rows would never accumulate. Clamp the phase to the passes actually
+// remaining; for full groups the clamp never binds.
+logic [ROW_WIDTH-1:0] rows_left;
+assign rows_left = row_limit - row_cnt_q;
+
 // TODO: make sequential based on calc_pc state counter
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni || state_q == IDLE) merge_d_cycle <= '0;
   else case (zc_group)
     ZC_SMALL:  merge_d_cycle <= '0;
-    ZC_MEDIUM: merge_d_cycle <= IDX_WIDTH'((NUM_CS >> 1) - (merge_row_idx >> 1));
-    ZC_LARGE:  merge_d_cycle <= IDX_WIDTH'(NUM_CS - merge_row_idx - 1);
+    ZC_MEDIUM: begin
+      automatic logic [1:0] nat_m;
+      automatic logic [ROW_WIDTH-1:0] pairs_left;
+      nat_m      = IDX_WIDTH'((unsigned'(NUM_CS) >> 1) - (32'(merge_row_idx) >> 1));
+      pairs_left = rows_left >> 1;
+      merge_d_cycle <= (ROW_WIDTH'(nat_m) <= pairs_left)
+                       ? nat_m : IDX_WIDTH'(pairs_left);
+    end
+    ZC_LARGE: begin
+      automatic logic [1:0] nat_l;
+      automatic logic [ROW_WIDTH-1:0] rows_left_m1;
+      nat_l        = IDX_WIDTH'(unsigned'(NUM_CS) - 32'(merge_row_idx) - 32'd1);
+      rows_left_m1 = rows_left - 1'b1;
+      merge_d_cycle <= (ROW_WIDTH'(nat_l) <= rows_left_m1)
+                       ? nat_l : IDX_WIDTH'(rows_left_m1);
+    end
     default:   merge_d_cycle <= '0;
   endcase
 end
@@ -457,19 +499,68 @@ always_comb begin
   end
 end
 
+// parity_core_sel is PER-ROW-POSITION (indexed like col_idx_qdly), but
+// pc_rearrange consumes a PER-LANE selection: it reads [0] for lane pair
+// {0,1} and [2] for pair {2,3} in MEDIUM, and [0] for all lanes in LARGE.
+// Remap positions onto lanes exactly like cs_pc_sel_eff / gf2_en_eff, so each
+// fold-group gets the p_c of the row it is actually processing this cycle.
+logic [3:0][IDX_WIDTH-1:0] parity_core_sel_eff;
+always_comb begin
+  case (zc_group)
+    ZC_MEDIUM: begin
+      parity_core_sel_eff[0] = parity_core_sel[med_base];
+      parity_core_sel_eff[1] = parity_core_sel[med_base];
+      parity_core_sel_eff[2] = parity_core_sel[med_base + 2'd1];
+      parity_core_sel_eff[3] = parity_core_sel[med_base + 2'd1];
+    end
+    ZC_LARGE: begin
+      parity_core_sel_eff[0] = parity_core_sel[merge_d_cycle];
+      parity_core_sel_eff[1] = parity_core_sel[merge_d_cycle];
+      parity_core_sel_eff[2] = parity_core_sel[merge_d_cycle];
+      parity_core_sel_eff[3] = parity_core_sel[merge_d_cycle];
+    end
+    ZC_SMALL:  parity_core_sel_eff = parity_core_sel;
+    default:   parity_core_sel_eff = parity_core_sel;
+  endcase
+end
+
 pc_rearrange #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */)
  ) pc_rearrange (
-  .pc_sel(parity_core_sel),
+  .pc_sel(parity_core_sel_eff),
   .d     (zc_group),
   .pc_in (parity_core),
   .pc_out(parity_core_arranged)
 );
 
+// cs_pc_sel_qdly is a PER-ROW-POSITION D/E selector straight from the CSR
+// (same indexing as gf2_en_q). In the folded modes each logical row is spread
+// over several cyclic-shifter lanes, so every lane of a fold-group must share
+// that row's selection -- otherwise one sub-lane picks data_segment while its
+// partner picks parity_core_arranged, corrupting the reassembled vector. Remap
+// exactly like gf2_en_eff:
+//   ZC_SMALL : lane i  = row i
+//   ZC_MEDIUM: pair k  = row 2*(d_cycle-1)+k    (med_base / med_base+1)
+//   ZC_LARGE : all     = row merge_d_cycle      (broadcast)
+logic [3:0] cs_pc_sel_eff;
+always_comb begin
+  case (zc_group)
+    ZC_MEDIUM: begin
+      cs_pc_sel_eff[0] = cs_pc_sel_qdly[med_base];
+      cs_pc_sel_eff[1] = cs_pc_sel_qdly[med_base];
+      cs_pc_sel_eff[2] = cs_pc_sel_qdly[med_base + 2'd1];
+      cs_pc_sel_eff[3] = cs_pc_sel_qdly[med_base + 2'd1];
+    end
+    ZC_LARGE:  cs_pc_sel_eff = {4{cs_pc_sel_qdly[merge_d_cycle]}};
+    ZC_SMALL:  cs_pc_sel_eff = cs_pc_sel_qdly;   // lane i = row i
+    default:   cs_pc_sel_eff = cs_pc_sel_qdly;
+  endcase
+end
+
 always_comb begin
   for (int k = 0; k < NUM_CS; k++) begin
-    if (cs_pc_sel_qdly[k])
+    if (cs_pc_sel_eff[k])
       cs_data_in[k] = parity_core_arranged[k];
     else
       cs_data_in[k] = data_segment[k];
@@ -480,29 +571,56 @@ logic [3:0][(ZC_MAX >> 2)-1:0] parity_core_packed;
 logic parity_core_valid, parity_additional_valid;
 logic info_valid;
 
+// Pack the core parity for the codeword generator, one CALC_PC cycle at a
+// time. The generator writes lane k of cycle n at bank row (cp_base + n),
+// sub-bank k, i.e. codeword column KB + n*cols_per_cycle + slot. parity_core
+// lane mapping (core_parity_bit_calculator): p_c1=[3], p_c2=[0], p_c3=[1],
+// p_c4=[2]; column KB+c carries p_c(c+1). All values are LSB-packed.
+// pc_state_cnt_q counts the CALC_PC cycles 0..(1/2/4)-1.
 always_comb begin
   case (zc_group)
-    // parity_core is now LSB-packed: active Zc bits in [Zc-1:0].
-    // Extract from the bottom of each parity_core word.
+    // One cycle: lanes 0..3 = columns KB..KB+3 = p_c1..p_c4.
     ZC_SMALL: begin
-      for (int unsigned i = 0; i < 4; i++) begin
-        parity_core_packed[3-i] = parity_core[i][(ZC_MAX >> 2)-1:0];
-      end
+      parity_core_packed[0] = parity_core[3][(ZC_MAX >> 2)-1:0]; // p_c1
+      parity_core_packed[1] = parity_core[0][(ZC_MAX >> 2)-1:0]; // p_c2
+      parity_core_packed[2] = parity_core[1][(ZC_MAX >> 2)-1:0]; // p_c3
+      parity_core_packed[3] = parity_core[2][(ZC_MAX >> 2)-1:0]; // p_c4
     end
-    
+    // Two cycles of two columns: {KB,KB+1} = {p_c1,p_c2}, then {p_c3,p_c4}.
+    // Lane pair {0,1} = even column (lower half), {2,3} = odd column.
     ZC_MEDIUM: begin
-      for (int unsigned i = 0; i < 2; i++) begin
-        {parity_core_packed[3 - 2*i], 
-         parity_core_packed[2 - 2*i]} = 
-          parity_core[merge_row_idx + i][(ZC_MAX >> 1)-1:0];
-      end
-    end 
-    ZC_LARGE: {parity_core_packed[0], parity_core_packed[1], parity_core_packed[2], parity_core_packed[3]} = parity_core[merge_row_idx];
+      {parity_core_packed[1], parity_core_packed[0]} =
+        (pc_state_cnt_q[0] == 1'b0) ? parity_core[3][(ZC_MAX >> 1)-1:0]   // p_c1
+                                    : parity_core[1][(ZC_MAX >> 1)-1:0];  // p_c3
+      {parity_core_packed[3], parity_core_packed[2]} =
+        (pc_state_cnt_q[0] == 1'b0) ? parity_core[0][(ZC_MAX >> 1)-1:0]   // p_c2
+                                    : parity_core[2][(ZC_MAX >> 1)-1:0];  // p_c4
+    end
+    // Four cycles of one column: cycle n = p_c(n+1) = parity_core[n-1 mod 4];
+    // lane k holds bits [96k +: 96] of the Zc-bit value.
+    ZC_LARGE: {parity_core_packed[3], parity_core_packed[2],
+               parity_core_packed[1], parity_core_packed[0]} =
+                 parity_core[pc_state_cnt_q - 2'd1];
     default: parity_core_packed = '0;
   endcase
 end
 
-assign info_valid = (state_q == CALC_LAMBDA);
+// Systematic-data hand-off to the codeword generator: one strobe per CSR
+// info-column consumption, aligned to the qdly stage where data_segment is
+// valid (info_group_i lags info_group_sel_o/col_curr_q by one cycle). The
+// column index travels alongside (col_curr_qdly) so the generator can address
+// the write by the column itself -- columns repeat across the folded modes'
+// row-group passes, and rewriting the same column with the same data is
+// harmless. E-column cycles (col >= KB) are parity feedback, not info.
+// LOAD is included because the very FIRST CSR entry (column 0) is consumed
+// while the FSM is still in LOAD: the LOAD->CALC_LAMBDA transition registers
+// one cycle after csr_valid_q rises. The CSR cannot present anything else
+// during LOAD (it is restarted there), so the gate stays exact.
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) info_valid <= 1'b0;
+  else          info_valid <= ((state_q == CALC_LAMBDA) | (state_q == LOAD))
+                            & csr_valid_q & (col_curr_q < kb_cols);
+end
 assign parity_core_valid = (state_q == CALC_PC);
 // The FSM leaves CALC_PA->IDLE on the rising edge of rowgrp_changed_q, but the
 // PA for that final row-group only becomes valid one cycle later, when
@@ -512,29 +630,68 @@ assign parity_core_valid = (state_q == CALC_PC);
 // IDLE, so this only fires on that one trailing cycle.
 assign parity_additional_valid = ((state_q == CALC_PA) | (state_q == IDLE)) & rowgrp_changed_qdly;
 
-logic [3:0][ROW_WIDTH:0] parity_additional_idx;
+// Per-LANE row index for the additional-parity hand-off. actual_row_qdly is
+// per-ROW-POSITION (CSR indexing); the generator needs the row each physical
+// lane is a sub-lane of this pass. Same fold remap as gf2_en_eff.
+logic [3:0][COL_WIDTH-1:0] parity_additional_idx;
 always_comb begin
-  for (int unsigned i = 0; i < 4; i++) begin
-    parity_additional_idx[i] = {1'b0, actual_row_qdly[i]};
+  case (zc_group)
+    ZC_MEDIUM: begin
+      parity_additional_idx[0] = COL_WIDTH'(actual_row_qdly[med_base]);
+      parity_additional_idx[1] = COL_WIDTH'(actual_row_qdly[med_base]);
+      parity_additional_idx[2] = COL_WIDTH'(actual_row_qdly[med_base + 2'd1]);
+      parity_additional_idx[3] = COL_WIDTH'(actual_row_qdly[med_base + 2'd1]);
+    end
+    ZC_LARGE: begin
+      for (int unsigned i = 0; i < 4; i++)
+        parity_additional_idx[i] = COL_WIDTH'(actual_row_qdly[merge_d_cycle]);
+    end
+    default: begin // ZC_SMALL: lane i = row position i
+      for (int unsigned i = 0; i < 4; i++)
+        parity_additional_idx[i] = COL_WIDTH'(actual_row_qdly[i]);
+    end
+  endcase
+end
+
+// Which lanes of a PA hand-off carry REAL rows. Only ZC_SMALL's final
+// (partial) row-group has stale duplicate row labels in the upper positions
+// (BG height % 4 != 0); writing those lanes would clobber real rows with the
+// zeroed accumulators. The folded modes never select the empty positions
+// (merge_d_cycle clamp), so their mask is always full. Sampled on the rowgrp
+// edge, while rows_left still reflects the group just finished, so it is
+// stable during the hand-off cycle that follows.
+logic [3:0] pa_lane_mask_q;
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) pa_lane_mask_q <= 4'hF;
+  else if (rowgrp_changed_q & ~rowgrp_changed_qdly) begin
+    if ((zc_group == ZC_SMALL) && (rows_left < ROW_WIDTH'(3'd4)))
+      case (rows_left[1:0])
+        2'd1:    pa_lane_mask_q <= 4'b0001;
+        2'd2:    pa_lane_mask_q <= 4'b0011;
+        2'd3:    pa_lane_mask_q <= 4'b0111;
+        default: pa_lane_mask_q <= 4'hF;
+      endcase
+    else pa_lane_mask_q <= 4'hF;
   end
 end
 
-assign cw_ready = 1; // TODO remove this if cwgen is done
 codeword_generator codeword_generator (
   .clk_i                (clk_i),
   .arst_ni              (arst_ni),
   .zc_group_i           (zc_group),
   .info_valid_i         (info_valid),
+  .info_col_i           (col_curr_qdly),
   .info_data_i          (data_segment),
   .core_parity_valid_i  (parity_core_valid),
   .core_parity_data_i   (parity_core_packed),
   .add_parity_valid_i   (parity_additional_valid),
   .add_parity_idx_i     (parity_additional_idx),
+  .add_parity_mask_i    (pa_lane_mask_q),
   .add_parity_data_i    (parity_additional),
   .base_graph_i         (base_graph_q),
   .lifting_size_i       (lifting_size_q),
   .input_last_subblock_i(cw_last_col),
-  // .upstream_ready_o     (cw_ready),
+  .upstream_ready_o     (cw_ready),
   .codeword_valid_o     (codeword_valid_o),
   .r_addr_i             (r_addr_i),
   .r_data_o             (r_data_o),

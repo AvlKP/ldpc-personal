@@ -8,7 +8,7 @@ module output_buffer #(
     input logic arst_ni,                                   // Active-low asynchronous reset
 
     input logic base_graph_i,                              // 0: BG1, 1: BG2 configuration selection flag
-    input zc_group_t zc_group_i,                           // Pre-calculated lifting size group configuration enum
+    input logic [1:0] zc_group_i,                          // Lifting size group (zc_group_t encoding, plain vector for the Verilog top)
     input logic [ZC_WIDTH-1:0] lifting_size_i,             // Active valid target lifting size Z
 
     // Codeword Generator Module Interface
@@ -66,19 +66,34 @@ module output_buffer #(
     logic [COL_WIDTH-1:0]    col_max;
     logic [COL_WIDTH-1:0]    sys_limit;
     logic [1:0]              slot_idx;
-    logic [8:0]              total_bits_left;
     logic                    ram_word_exhausted;
     logic [ZC_MAX-1:0]       current_column_chunk;
-    logic [ZC_WIDTH-1:0]     effective_shifter_cnt;
+
+    // Typed view of the group select (port is a plain vector for the top)
+    zc_group_t zc_grp;
+    assign zc_grp = zc_group_t'(zc_group_i);
 
     assign axis_handshake = internal_valid & internal_ready;
     assign r_addr_o       = r_addr_q;
     assign col_max        = (base_graph_i) ? BG2_COL_N : BG1_COL_N;
     assign sys_limit      = (base_graph_i) ? COL_WIDTH'(10) : COL_WIDTH'(22);
-    
+
     assign col_depleted   = (shifter_cnt_n == '0);
     assign flush_complete = (accum_cnt_n == '0);
-    assign effective_shifter_cnt = (shifter_cnt_q == '0) ? lifting_size_i : shifter_cnt_q;
+
+    // Exact frame length and a sent-bit counter drive TLAST. (Deriving the
+    // remaining bits from shifter_cnt_q is ambiguous: 0 means both "last
+    // column not yet loaded" and "everything consumed", which loses TLAST
+    // whenever output_bits is an exact multiple of DATA_WIDTH.)
+    logic [15:0] total_bits;
+    logic [15:0] sent_bits_q;
+    assign total_bits = 16'(col_max) * 16'(lifting_size_i);
+
+    always_ff @(posedge clk_i or negedge arst_ni) begin
+        if (!arst_ni)              sent_bits_q <= '0;
+        else if (state_q == IDLE)  sent_bits_q <= '0;
+        else if (axis_handshake)   sent_bits_q <= sent_bits_q + 16'(DATA_WIDTH);
+    end
 
     //--------------------------------------------------------------------------
     // Concern 1: Subblock Column Chunk Demultiplexing Logic (Explicitly Configured)
@@ -97,7 +112,7 @@ module output_buffer #(
         current_column_chunk = r_data_i;
         ram_word_exhausted   = (r_addr_n != r_addr_q);
 
-        unique case (zc_group_i)
+        unique case (zc_grp)
             ZC_SMALL: begin
                 unique case (slot_idx)
                     2'b00: current_column_chunk = ZC_MAX'(r_data_i[95:0]);
@@ -181,7 +196,10 @@ module output_buffer #(
         codeword_done_n = 1'b0;
 
         case (state_q)
-            IDLE:     if (codeword_valid_i) state_n = FETCH;
+            // ~codeword_done_o: the generator clears codeword_valid_i one
+            // cycle after the done pulse, so without the guard IDLE would
+            // immediately relaunch a ghost readout of the bank just released.
+            IDLE:     if (codeword_valid_i & ~codeword_done_o) state_n = FETCH;
             FETCH:    state_n = WAIT_RAM;
             WAIT_RAM: state_n = STREAM;
             STREAM:   if (col_depleted) begin
@@ -269,45 +287,31 @@ module output_buffer #(
         r_addr_n  = r_addr_q;
         
         case (state_q)
-            IDLE: if (codeword_valid_i) begin
+            IDLE: if (codeword_valid_i & ~codeword_done_o) begin
                 col_idx_n = '0;
                 r_addr_n  = '0;
             end
             STREAM: if (col_depleted && col_idx_q != col_max - 1) begin
                 col_idx_n = col_idx_q + 1;
-                r_addr_n  = get_r_addr(col_idx_n, base_graph_i, zc_group_i);
+                r_addr_n  = get_r_addr(col_idx_n, base_graph_i, zc_grp);
             end
             default: ;
         endcase
     end
 
     //--------------------------------------------------------------------------
-    // Concern 5: Total Bit Tracking & Outbound AXI Stream Mapping
+    // Concern 5: Outbound AXI Stream Mapping
     //--------------------------------------------------------------------------
-    always_comb begin
-        if (state_q == FLUSH) begin
-            total_bits_left = {3'b0, accum_cnt_q};
-        end else if (state_q == STREAM && col_idx_q == col_max - 1) begin
-            total_bits_left = {3'b0, accum_cnt_q} + effective_shifter_cnt;
-        end else begin
-            total_bits_left = 9'h1FF; // 511 acts as safe out-of-bounds flag
-        end
-    end
-
     always_comb begin
         internal_data  = accum_q[DATA_WIDTH-1:0];
         internal_valid = 1'b0;
-        internal_last  = 1'b0;
-        
+        // The beat being offered is the frame's last one when every bit not
+        // yet handed to the skid buffer fits into it.
+        internal_last  = ((total_bits - sent_bits_q) <= 16'(DATA_WIDTH));
+
         case (state_q)
-            STREAM: begin
-                internal_valid = (accum_cnt_q >= ACCUM_WIDTH'(DATA_WIDTH));
-                internal_last  = (total_bits_left <= DATA_WIDTH);
-            end
-            FLUSH: begin
-                internal_valid = (accum_cnt_q > '0);
-                internal_last  = (total_bits_left <= DATA_WIDTH);
-            end 
+            STREAM: internal_valid = (accum_cnt_q >= ACCUM_WIDTH'(DATA_WIDTH));
+            FLUSH:  internal_valid = (accum_cnt_q > '0);
             default: ;
         endcase
     end

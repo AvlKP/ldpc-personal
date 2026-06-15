@@ -82,12 +82,13 @@ typedef enum  {
 w_state_t w_state_n, w_state_q;
 
 logic axis_handshake;
+logic tran_en, accum_to_ram_en, tran_init, tran_done, stall_en;
 assign axis_handshake = s_axis_tready & s_axis_tvalid;
 
 // --------------------------------------------------------
 // Optimized Output Control Logic (Decoupled from w_state_n)
 // --------------------------------------------------------
-assign tran_en         = axis_handshake; 
+assign tran_en         = axis_handshake;
 assign accum_to_ram_en = (accum_count_q >= ram_zc_q[w_swap_q]);
 
 assign tran_init       = (w_state_q == W_IDLE) & axis_handshake;
@@ -227,7 +228,11 @@ generate
   genvar i;
   for (i = 0; i < 2; i++) begin : ram_gen
     logic we;
-    assign we = accum_to_ram_en & (w_swap_q == i);
+    // The accumulator drain runs until it holds < Zc bits, so the AXIS word
+    // padding of the final beat can produce a few surplus groups; clamp the
+    // write address to the RAM depth (groups beyond KB-1 are never read).
+    assign we = accum_to_ram_en & (w_swap_q == i)
+              & (w_addr_q < KB_WIDTH'(KB_BG1));
 
     lutram #(
       .WORD_WIDTH(ZC_MAX),

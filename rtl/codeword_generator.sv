@@ -1,28 +1,57 @@
 import ldpc_pkg::*;
 
+// Double-banked codeword assembly RAM between the encoder core and the
+// output buffer.
+//
+// Bank layout (per half, addressed by "bank row", 4 sub-banks of 96b):
+//   ZC_SMALL  (Zc<=96) : 4 columns per row, column c at sub-bank c%4
+//   ZC_MEDIUM (Zc<=192): 2 columns per row, column c at sub-bank pair c%2
+//   ZC_LARGE  (Zc<=384): 1 column per row across all 4 sub-banks
+// Segments: info rows [0 .. ceil(KB/pf)-1], core parity rows starting at
+// cp_base = ceil(KB/pf), additional parity at ap_base = cp_base + 4/pf.
+// Partial boundary rows leave padding sub-banks that are never read back
+// (the output buffer's address generator skips them with the same bases).
+//
+// Write sources (mutually exclusive by core FSM construction):
+//   - info: one column per strobe, addressed by info_col_i. The folded modes
+//     revisit columns across row-group passes; rewrites carry identical data.
+//   - core parity: one strobe per CALC_PC cycle, cycle n -> bank row
+//     cp_base + n (the per-cycle column packing is done in the core).
+//   - additional parity: one strobe per finished row-group pass, up to 4 rows
+//     landing on ARBITRARY bank rows/sub-banks (the CSR row schedule is out
+//     of order), so the event is staged and drained one row per cycle.
+//     Row-group passes always span more cycles than the rows they complete,
+//     so a drain never collides with the next event.
 module codeword_generator (
     input logic clk_i,
     input logic arst_ni,
 
-    // Upstream Encoder Core Interface
+    // Upstream Encoder Core Interface (strobes aligned to the core's qdly
+    // stage; config inputs are the core's frame-stable registered copies)
     input logic [ZC_WIDTH-1:0] lifting_size_i,
     input zc_group_t zc_group_i,
     input logic base_graph_i,
 
     input logic info_valid_i,
+    input logic [COL_WIDTH-1:0] info_col_i,
     input logic [3:0][(ZC_MAX >> 2)-1:0] info_data_i,
 
     input logic core_parity_valid_i,
     input logic [3:0][(ZC_MAX >> 2)-1:0] core_parity_data_i,
 
+    // Lane k carries (a 96b sub-lane of) base-graph row add_parity_idx_i[k];
+    // add_parity_mask_i flags the lanes holding real rows (the final partial
+    // row-group of ZC_SMALL pads with stale duplicate labels).
     input logic add_parity_valid_i,
-    input logic [3:0][COL_WIDTH-1:0] add_parity_idx_i, 
+    input logic [3:0][COL_WIDTH-1:0] add_parity_idx_i,
+    input logic [3:0] add_parity_mask_i,
     input logic [3:0][(ZC_MAX >> 2)-1:0] add_parity_data_i,
 
+    // High on the FINAL add_parity strobe of a frame: swap write banks.
     input logic input_last_subblock_i,
     output logic upstream_ready_o,
 
-    // Inter-Module Interface to Output Buffer
+    // Inter-Module Interface to Output Buffer (read data registered, 1 cycle)
     output logic codeword_valid_o,
     input logic [COL_WIDTH-1:0] r_addr_i,
     output logic [ZC_MAX-1:0] r_data_o,
@@ -33,171 +62,220 @@ module codeword_generator (
     output logic base_graph_o
 );
 
-    // 4 Horizontally Separated Memory Sub-Banks (Depth: 256, Width: 96)
-    (* ram_style = "block" *) logic [(ZC_MAX >> 2)-1:0] ram [0:3][0:255];
+    localparam int unsigned LANE_W = ZC_MAX >> 2; // 96
 
-    // Control and Interlock Boundary Tracking Registers
+    // 4 Horizontally Separated Memory Sub-Banks (Depth: 256, Width: 96)
+    (* ram_style = "block" *) logic [LANE_W-1:0] ram [0:3][0:255];
+
     logic       w_swap_q, r_swap_q;
     logic [1:0] bank_full_q;
-    logic [COL_WIDTH-1:0] w_seq_addr_q, w_seq_addr_n;
-
-    // Structural Addressing and Muxing Vectors
-    logic [3:0][COL_WIDTH:0] w_addr;
-    logic [3:0][(ZC_MAX >> 2)-1:0] w_data_mux;
-    logic [3:0] w_en;                                      // Independent write enables per sub-bank
-    logic       input_stroke;
 
     // Configuration double buffering registers
-    logic [1:0] base_graph_q;
+    logic [1:0]               base_graph_q;
     logic [1:0][ZC_WIDTH-1:0] lifting_size_q;
-    zc_group_t [1:0] zc_group_q;
+    zc_group_t [1:0]          zc_group_q;
 
-    // Phase Boundary Alignment Evaluation Wires
+    // Segment base rows for the CURRENT frame's group/base-graph config
     logic [COL_WIDTH-1:0] core_parity_base_row;
     logic [COL_WIDTH-1:0] add_parity_base_row;
-    logic [2:0] packing_factor;
-    logic [COL_WIDTH-1:0] core_parity_start_idx;
-    logic [COL_WIDTH-1:0] active_w_seq_addr;
-    logic [3:0][COL_WIDTH-1:0] rel_idx;
-
-    assign input_stroke     = (info_valid_i | core_parity_valid_i | add_parity_valid_i) & upstream_ready_o;
-    assign upstream_ready_o = (w_swap_q == 1'b0) ? !bank_full_q[0] : !bank_full_q[1];
-    assign codeword_valid_o = (r_swap_q == 1'b0) ? bank_full_q[0] : bank_full_q[1];
-
-    //--------------------------------------------------------------------------
-    // Offsets & Phase Base Row and Stride Calculations
-    //--------------------------------------------------------------------------
     always_comb begin
-        unique case (zc_group_i)
+        case (zc_group_i)
             ZC_SMALL: begin
-                core_parity_base_row = base_graph_i ? 7'd3 : 7'd6;   // ceil(10/4)=3, ceil(22/4)=6
-                add_parity_base_row  = core_parity_base_row + 7'd1; // Core parity takes exactly 1 row
-                packing_factor       = 3'd4;
+                core_parity_base_row = base_graph_i ? 7'd3  : 7'd6;  // ceil(KB/4)
+                add_parity_base_row  = core_parity_base_row + 7'd1;
             end
             ZC_MEDIUM: begin
-                core_parity_base_row = base_graph_i ? 7'd5 : 7'd11;  // ceil(10/2)=5, ceil(22/2)=11
-                add_parity_base_row  = core_parity_base_row + 7'd2; // Core parity takes exactly 2 rows
-                packing_factor       = 3'd2;
+                core_parity_base_row = base_graph_i ? 7'd5  : 7'd11; // ceil(KB/2)
+                add_parity_base_row  = core_parity_base_row + 7'd2;
             end
             ZC_LARGE: begin
-                core_parity_base_row = base_graph_i ? 7'd10 : 7'd22; // 10/1=10, 22/1=22
-                add_parity_base_row  = core_parity_base_row + 7'd4; // Core parity takes exactly 4 rows
-                packing_factor       = 3'd1;
+                core_parity_base_row = base_graph_i ? 7'd10 : 7'd22; // KB
+                add_parity_base_row  = core_parity_base_row + 7'd4;
             end
             default: begin
                 core_parity_base_row = 7'd6;
                 add_parity_base_row  = 7'd7;
-                packing_factor       = 3'd4;
             end
         endcase
-        
-        // Calculate the absolute starting index to force a row alignment jump
-        core_parity_start_idx = core_parity_base_row * packing_factor;
-        
-        // Intercept unaligned transitions instantly during the current write cycle
-        active_w_seq_addr = (core_parity_valid_i && (w_seq_addr_q < core_parity_start_idx)) ? 
-                            core_parity_start_idx : w_seq_addr_q;
     end
 
     //--------------------------------------------------------------------------
-    // Sequential Ingestion Address Pointer Evolution
+    // Additional-parity staging & one-row-per-cycle drain
     //--------------------------------------------------------------------------
+    // The hand-off pulse is edge-detected: after the final group of a frame
+    // the core's rowgrp_changed_qdly (and thus add_parity_valid_i) stays high
+    // through IDLE while the accumulators have already been cleared, so only
+    // the first cycle carries the real data.
+    logic pa_valid_d;
+    logic pa_event;
+    always_ff @(posedge clk_i or negedge arst_ni) begin
+        if (!arst_ni) pa_valid_d <= 1'b0;
+        else          pa_valid_d <= add_parity_valid_i;
+    end
+    assign pa_event = add_parity_valid_i & ~pa_valid_d;
+
+    logic                      pa_busy_q;
+    logic [1:0]                pa_ptr_q;       // row-of-event being written
+    logic [3:0][LANE_W-1:0]    pa_data_q;
+    logic [3:0][COL_WIDTH-1:0] pa_idx_q;
+    logic [3:0]                pa_mask_q;
+    logic                      pa_swap_q;      // bank half of the staged event
+    logic                      pa_last_q;      // event closes the frame
+    zc_group_t                 pa_grp_q;
+    logic [COL_WIDTH-1:0]      pa_ap_base_q;
+
+    // Rows carried per event (minus one): SMALL row-groups complete 4 rows,
+    // MEDIUM passes 2, LARGE passes 1.
+    logic [1:0] pa_rows_max;
     always_comb begin
-        w_seq_addr_n = w_seq_addr_q;
-        if (upstream_ready_o) begin
-            if (info_valid_i) begin
-                if (input_last_subblock_i) w_seq_addr_n = '0;
-                else                       w_seq_addr_n = w_seq_addr_q + COL_WIDTH'(1);
-            end else if (core_parity_valid_i) begin
-                // Force step-pointer forward past the padding gap if entering unaligned
-                if (w_seq_addr_q < core_parity_start_idx) begin
-                    w_seq_addr_n = core_parity_start_idx + COL_WIDTH'(packing_factor);
-                end else if (input_last_subblock_i) begin
-                    w_seq_addr_n = '0;
-                end else begin
-                    w_seq_addr_n = w_seq_addr_q + COL_WIDTH'(packing_factor);
-                end
-            end else if (add_parity_valid_i & input_last_subblock_i) begin
-                w_seq_addr_n = '0;
+        case (pa_grp_q)
+            ZC_SMALL:  pa_rows_max = 2'd3;
+            ZC_MEDIUM: pa_rows_max = 2'd1;
+            ZC_LARGE:  pa_rows_max = 2'd0;
+            default:   pa_rows_max = 2'd0;
+        endcase
+    end
+
+    always_ff @(posedge clk_i or negedge arst_ni) begin
+        if (!arst_ni) begin
+            pa_busy_q    <= 1'b0;
+            pa_ptr_q     <= '0;
+            pa_data_q    <= '0;
+            pa_idx_q     <= '0;
+            pa_mask_q    <= '0;
+            pa_swap_q    <= 1'b0;
+            pa_last_q    <= 1'b0;
+            pa_grp_q     <= ZC_SMALL;
+            pa_ap_base_q <= '0;
+        end else if (pa_event & ~pa_busy_q) begin
+            pa_busy_q    <= 1'b1;
+            pa_ptr_q     <= '0;
+            pa_data_q    <= add_parity_data_i;
+            pa_idx_q     <= add_parity_idx_i;
+            pa_mask_q    <= add_parity_mask_i;
+            pa_swap_q    <= w_swap_q;
+            pa_last_q    <= input_last_subblock_i;
+            pa_grp_q     <= zc_group_i;
+            pa_ap_base_q <= add_parity_base_row;
+        end else if (pa_busy_q) begin
+            if (pa_ptr_q == pa_rows_max) begin
+                pa_busy_q <= 1'b0;
+                pa_last_q <= 1'b0;
+            end else begin
+                pa_ptr_q <= pa_ptr_q + 2'd1;
             end
         end
     end
 
-    //--------------------------------------------------------------------------
-    // Address Steering Matrix & Sub-Bank Write Enable Decoding
-    //--------------------------------------------------------------------------
+    // Drain decode: which sub-banks / bank row / data the staged row hits.
+    logic [3:0]             pa_w_en;
+    logic [COL_WIDTH-1:0]   pa_rel;
+    logic [COL_WIDTH-1:0]   pa_addr;
+    logic [3:0][LANE_W-1:0] pa_wdata;
+    logic                   pa_row_real;
+
     always_comb begin
-        w_en       = '0;
-        w_data_mux = core_parity_data_i;
-        for (int unsigned i = 0; i < 4; i++) begin
-            w_addr[i]  = {w_swap_q, active_w_seq_addr}; 
-            rel_idx[i] = add_parity_idx_i[i] - COL_WIDTH'(4);
-        end
+        pa_w_en     = '0;
+        pa_wdata    = pa_data_q;
+        pa_rel      = '0;
+        pa_addr     = '0;
+        pa_row_real = 1'b0;
 
-        // Phase A: Systematic/Info Ingestion (Arrives 1-by-1)
-        if (info_valid_i) begin
-            w_data_mux = info_data_i;
-            unique case (zc_group_i)
-                ZC_SMALL: begin
-                    w_en[active_w_seq_addr[1:0]] = upstream_ready_o;
-                    for (int unsigned i = 0; i < 4; i++) begin
-                        w_addr[i] = {w_swap_q, 2'b00, active_w_seq_addr[COL_WIDTH-1:2]};
-                    end
-                end
-                ZC_MEDIUM: begin
-                    if (active_w_seq_addr[0] == 1'b0) w_en[1:0] = {2{upstream_ready_o}};
-                    else                              w_en[3:2] = {2{upstream_ready_o}};
-                    for (int unsigned i = 0; i < 4; i++) begin
-                        w_addr[i] = {w_swap_q, 1'b0, active_w_seq_addr[COL_WIDTH-1:1]};
-                    end
-                end
-                ZC_LARGE: begin
-                    w_en = {4{upstream_ready_o}};
-                    for (int unsigned i = 0; i < 4; i++) begin
-                        w_addr[i] = {w_swap_q, active_w_seq_addr};
-                    end
-                end
-            endcase
+        case (pa_grp_q)
+            ZC_SMALL: begin
+                // Row pa_ptr: 96b on lane pa_ptr -> sub-bank rel%4.
+                pa_rel      = pa_idx_q[pa_ptr_q] - 7'd4;
+                pa_addr     = pa_ap_base_q + (pa_rel >> 2);
+                pa_row_real = pa_mask_q[pa_ptr_q];
+                for (int unsigned i = 0; i < 4; i++)
+                    pa_wdata[i] = pa_data_q[pa_ptr_q];
+                pa_w_en     = 4'b0001 << pa_rel[1:0];
+            end
+            ZC_MEDIUM: begin
+                // Row pa_ptr[0]: 192b on lanes {2p,2p+1} -> sub-bank pair rel%2.
+                pa_rel      = pa_idx_q[{pa_ptr_q[0], 1'b0}] - 7'd4;
+                pa_addr     = pa_ap_base_q + (pa_rel >> 1);
+                pa_row_real = pa_mask_q[{pa_ptr_q[0], 1'b0}];
+                pa_wdata[0] = pa_data_q[{pa_ptr_q[0], 1'b0}];
+                pa_wdata[1] = pa_data_q[{pa_ptr_q[0], 1'b1}];
+                pa_wdata[2] = pa_data_q[{pa_ptr_q[0], 1'b0}];
+                pa_wdata[3] = pa_data_q[{pa_ptr_q[0], 1'b1}];
+                pa_w_en     = pa_rel[0] ? 4'b1100 : 4'b0011;
+            end
+            ZC_LARGE: begin
+                // Single row: full 384b across all sub-banks.
+                pa_rel      = pa_idx_q[0] - 7'd4;
+                pa_addr     = pa_ap_base_q + pa_rel;
+                pa_row_real = pa_mask_q[0];
+                pa_wdata    = pa_data_q;
+                pa_w_en     = 4'b1111;
+            end
+            default: ;
+        endcase
 
-        // Phase B: Core Parity Ingestion (Row Aligned, Groups of 4/2/1)
-        end else if (core_parity_valid_i) begin
-            w_data_mux = core_parity_data_i;
-            w_en       = {4{upstream_ready_o}};
-            unique case (zc_group_i)
-                ZC_SMALL:  for (int unsigned i = 0; i < 4; i++) w_addr[i] = {w_swap_q, 2'b00, active_w_seq_addr[COL_WIDTH-1:2]};
-                ZC_MEDIUM: for (int unsigned i = 0; i < 4; i++) w_addr[i] = {w_swap_q, 1'b0,  active_w_seq_addr[COL_WIDTH-1:1]};
-                ZC_LARGE:  for (int unsigned i = 0; i < 4; i++) w_addr[i] = {w_swap_q,        active_w_seq_addr};
-            endcase
-
-        // Phase C: Additional Parity Ingestion (Out-of-order, appended past Parity blocks)
-        end else if (add_parity_valid_i) begin
-            w_data_mux = add_parity_data_i;
-            w_en       = {4{upstream_ready_o}};
-            
-            unique case (zc_group_i)
-                ZC_SMALL: begin
-                    for (int unsigned i = 0; i < 4; i++) begin
-                        w_addr[i] = {w_swap_q, add_parity_base_row + (rel_idx[i] >> 2)};
-                    end
-                end
-                ZC_MEDIUM: begin
-                    w_addr[0] = {w_swap_q, add_parity_base_row + (rel_idx[0] >> 1)};
-                    w_addr[1] = {w_swap_q, add_parity_base_row + (rel_idx[0] >> 1)};
-                    w_addr[2] = {w_swap_q, add_parity_base_row + (rel_idx[1] >> 1)};
-                    w_addr[3] = {w_swap_q, add_parity_base_row + (rel_idx[1] >> 1)};
-                end
-                ZC_LARGE: begin
-                    for (int unsigned i = 0; i < 4; i++) begin
-                        w_addr[i] = {w_swap_q, add_parity_base_row + rel_idx[0]};
-                    end
-                end
-            endcase
-        end
+        if (!pa_busy_q || !pa_row_real) pa_w_en = '0;
     end
 
     //--------------------------------------------------------------------------
-    // Sub-Bank Physical Hardware Memory Writing
+    // Core-parity write sequencing: one bank row per valid cycle from cp_base
     //--------------------------------------------------------------------------
+    logic [1:0] pc_cnt_q;
+    always_ff @(posedge clk_i or negedge arst_ni) begin
+        if (!arst_ni)                                    pc_cnt_q <= '0;
+        else if (core_parity_valid_i & upstream_ready_o) pc_cnt_q <= pc_cnt_q + 2'd1;
+        else                                             pc_cnt_q <= '0;
+    end
+
+    //--------------------------------------------------------------------------
+    // Write port mux (PA drain has priority; it never overlaps info/PC writes
+    // because PA events only occur in CALC_PA/IDLE and the next frame is held
+    // off by upstream_ready_o until the drain finishes)
+    //--------------------------------------------------------------------------
+    logic [3:0]               w_en;
+    logic [3:0][COL_WIDTH:0]  w_addr;       // {bank half, bank row}
+    logic [3:0][LANE_W-1:0]   w_data_mux;
+
+    always_comb begin
+        w_en       = '0;
+        w_data_mux = info_data_i;
+        for (int unsigned i = 0; i < 4; i++) begin
+            w_addr[i] = {w_swap_q, 7'd0};
+        end
+
+        if (pa_busy_q) begin
+            w_en       = pa_w_en;
+            w_data_mux = pa_wdata;
+            for (int unsigned i = 0; i < 4; i++) begin
+                w_addr[i] = {pa_swap_q, pa_addr};
+            end
+        end else if (info_valid_i & upstream_ready_o) begin
+            w_data_mux = info_data_i;
+            case (zc_group_i)
+                ZC_SMALL: begin
+                    w_en = 4'b0001 << info_col_i[1:0];
+                    for (int unsigned i = 0; i < 4; i++)
+                        w_addr[i] = {w_swap_q, info_col_i >> 2};
+                end
+                ZC_MEDIUM: begin
+                    w_en = info_col_i[0] ? 4'b1100 : 4'b0011;
+                    for (int unsigned i = 0; i < 4; i++)
+                        w_addr[i] = {w_swap_q, info_col_i >> 1};
+                end
+                ZC_LARGE: begin
+                    w_en = 4'b1111;
+                    for (int unsigned i = 0; i < 4; i++)
+                        w_addr[i] = {w_swap_q, info_col_i};
+                end
+                default: ;
+            endcase
+        end else if (core_parity_valid_i & upstream_ready_o) begin
+            w_data_mux = core_parity_data_i;
+            w_en       = 4'b1111;
+            for (int unsigned i = 0; i < 4; i++)
+                w_addr[i] = {w_swap_q, core_parity_base_row + 7'(pc_cnt_q)};
+        end
+    end
+
     always_ff @(posedge clk_i) begin
         for (int unsigned i = 0; i < 4; i++) begin
             if (w_en[i]) begin
@@ -207,51 +285,58 @@ module codeword_generator (
     end
 
     //--------------------------------------------------------------------------
-    // Read Port Structural Mapping
+    // Read port (registered, 1-cycle latency; output buffer waits one cycle)
     //--------------------------------------------------------------------------
     logic [COL_WIDTH:0] r_addr;
     assign r_addr = {r_swap_q, r_addr_i};
 
     always_ff @(posedge clk_i) begin
         for (int unsigned i = 0; i < 4; i++) begin
-            r_data_o[i*(ZC_MAX >> 2) +: (ZC_MAX >> 2)] <= ram[i][r_addr];
+            r_data_o[i*LANE_W +: LANE_W] <= ram[i][r_addr];
         end
     end
 
     //--------------------------------------------------------------------------
-    // Control Boundaries and Swap State Machinery
+    // Bank swap & full/empty interlock
     //--------------------------------------------------------------------------
+    // The write half swaps immediately on the frame's final PA event so the
+    // next frame's writes route to the fresh half while the staged rows still
+    // drain into the old one (their jobs carry pa_swap_q). The bank is only
+    // flagged readable once that final drain completes.
     always_ff @(posedge clk_i or negedge arst_ni) begin
         if (!arst_ni) begin
             r_swap_q       <= 1'b0;
             w_swap_q       <= 1'b0;
             bank_full_q    <= 2'b00;
-            w_seq_addr_q   <= '0;
             base_graph_q   <= '0;
             lifting_size_q <= '0;
-            zc_group_q     <= '0;
+            zc_group_q     <= {ZC_SMALL, ZC_SMALL};
         end else begin
-            w_seq_addr_q <= w_seq_addr_n;
-
-            if (input_stroke & input_last_subblock_i) begin
-                w_swap_q              <= ~w_swap_q;
-                bank_full_q[w_swap_q] <= 1'b1;
-
+            if (pa_event & input_last_subblock_i) begin
+                w_swap_q                 <= ~w_swap_q;
                 base_graph_q[w_swap_q]   <= base_graph_i;
                 lifting_size_q[w_swap_q] <= lifting_size_i;
                 zc_group_q[w_swap_q]     <= zc_group_i;
             end
 
+            if (pa_busy_q & pa_last_q & (pa_ptr_q == pa_rows_max))
+                bank_full_q[pa_swap_q] <= 1'b1;
+
             if (codeword_done_i) begin
                 r_swap_q              <= ~r_swap_q;
                 bank_full_q[r_swap_q] <= 1'b0;
-
-                base_graph_q[r_swap_q]   <= '0;
-                lifting_size_q[r_swap_q] <= '0;
-                zc_group_q[r_swap_q]     <= ZC_SMALL;
             end
         end
     end
+
+    // Ready blocks the core from STARTING a frame (gates IDLE->LOAD) while
+    // the target bank is still being read out or a final drain is in flight;
+    // it never deasserts against a running frame's own writes.
+    assign upstream_ready_o = ~bank_full_q[w_swap_q] & ~pa_busy_q;
+    // ~codeword_done_i: bank_full/r_swap update one cycle after the done
+    // pulse; mask the dying cycle so the consumer never sees the released
+    // bank as still valid.
+    assign codeword_valid_o = bank_full_q[r_swap_q] & ~codeword_done_i;
 
     assign lifting_size_o = lifting_size_q[r_swap_q];
     assign base_graph_o   = base_graph_q[r_swap_q];
