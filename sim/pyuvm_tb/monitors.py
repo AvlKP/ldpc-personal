@@ -94,10 +94,15 @@ class LdpcShifterMonitor(uvm_monitor):
                 cs_in = safe_int(core.cs_data_in)
                 cs_out = safe_int(core.cs_data_out)
                 shift_val = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
-                # gf2_en_eff is the actual gf2_sum accumulate enable for this
-                # cs_data_out; lanes with it low are never summed, so the
-                # scoreboard must skip those fold-groups.
-                gf2_en = safe_int(core.gf2_en_eff)
+                # Position-domain context for this output cycle. A CSR entry
+                # holds 4 base-graph-row POSITIONS; the folded modes process a
+                # subset per cycle (merge_d_cycle says which), gf2_en_qdly is
+                # the per-POSITION accumulate enable, and col_idx_qdly is each
+                # position's absolute base-graph column (col_curr for D
+                # entries, the E column for parity-feedback entries).
+                d_cycle = safe_int(core.merge_d_cycle)
+                en_pos = safe_int(core.gf2_en_qdly)
+                col_idx_packed = safe_int(core.col_idx_qdly)
                 self.ap.write({
                     'type': 'shifter',
                     'in': cs_in,
@@ -106,7 +111,9 @@ class LdpcShifterMonitor(uvm_monitor):
                     'col': meta['col'],
                     'rows': meta['rows'],
                     'pc_sel': meta['pc_sel'],
-                    'gf2_en': gf2_en,
+                    'd_cycle': d_cycle,
+                    'en_pos': en_pos,
+                    'col_idx': [(col_idx_packed >> (i * 7)) & 0x7F for i in range(4)],
                     'frame_id': meta['frame_id']
                 })
 

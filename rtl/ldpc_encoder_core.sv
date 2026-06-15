@@ -369,13 +369,38 @@ logic [3:0][ZC_MAX-1:0] lambda;
 logic [IDX_WIDTH-1:0] merge_row_idx;
 assign merge_row_idx = IDX_WIDTH'(row_cnt_q);
 
+// Pass phase for the folded modes. merge_row_idx (row_cnt mod 4) walks each
+// row-group's passes high-position-first (MEDIUM: 2,1; LARGE: 3,2,1,0).
+// The FINAL row-group of both base graphs is half-height (ROW_N % 4 == 2):
+// only the LOW positions {0,1} hold real rows (the CSR duplicates the row
+// LABELS into {2,3} but their column ranges are empty), so the natural phase
+// would spend the tail pass(es) on the empty positions {3,2} and the last two
+// parity rows would never accumulate. Clamp the phase to the passes actually
+// remaining; for full groups the clamp never binds.
+logic [ROW_WIDTH-1:0] rows_left;
+assign rows_left = row_limit - row_cnt_q;
+
 // TODO: make sequential based on calc_pc state counter
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni || state_q == IDLE) merge_d_cycle <= '0;
   else case (zc_group)
     ZC_SMALL:  merge_d_cycle <= '0;
-    ZC_MEDIUM: merge_d_cycle <= IDX_WIDTH'((NUM_CS >> 1) - (merge_row_idx >> 1));
-    ZC_LARGE:  merge_d_cycle <= IDX_WIDTH'(NUM_CS - merge_row_idx - 1);
+    ZC_MEDIUM: begin
+      automatic logic [1:0] nat_m;
+      automatic logic [ROW_WIDTH-1:0] pairs_left;
+      nat_m      = IDX_WIDTH'((unsigned'(NUM_CS) >> 1) - (32'(merge_row_idx) >> 1));
+      pairs_left = rows_left >> 1;
+      merge_d_cycle <= (ROW_WIDTH'(nat_m) <= pairs_left)
+                       ? nat_m : IDX_WIDTH'(pairs_left);
+    end
+    ZC_LARGE: begin
+      automatic logic [1:0] nat_l;
+      automatic logic [ROW_WIDTH-1:0] rows_left_m1;
+      nat_l        = IDX_WIDTH'(unsigned'(NUM_CS) - 32'(merge_row_idx) - 32'd1);
+      rows_left_m1 = rows_left - 1'b1;
+      merge_d_cycle <= (ROW_WIDTH'(nat_l) <= rows_left_m1)
+                       ? nat_l : IDX_WIDTH'(rows_left_m1);
+    end
     default:   merge_d_cycle <= '0;
   endcase
 end
@@ -457,19 +482,68 @@ always_comb begin
   end
 end
 
+// parity_core_sel is PER-ROW-POSITION (indexed like col_idx_qdly), but
+// pc_rearrange consumes a PER-LANE selection: it reads [0] for lane pair
+// {0,1} and [2] for pair {2,3} in MEDIUM, and [0] for all lanes in LARGE.
+// Remap positions onto lanes exactly like cs_pc_sel_eff / gf2_en_eff, so each
+// fold-group gets the p_c of the row it is actually processing this cycle.
+logic [3:0][IDX_WIDTH-1:0] parity_core_sel_eff;
+always_comb begin
+  case (zc_group)
+    ZC_MEDIUM: begin
+      parity_core_sel_eff[0] = parity_core_sel[med_base];
+      parity_core_sel_eff[1] = parity_core_sel[med_base];
+      parity_core_sel_eff[2] = parity_core_sel[med_base + 2'd1];
+      parity_core_sel_eff[3] = parity_core_sel[med_base + 2'd1];
+    end
+    ZC_LARGE: begin
+      parity_core_sel_eff[0] = parity_core_sel[merge_d_cycle];
+      parity_core_sel_eff[1] = parity_core_sel[merge_d_cycle];
+      parity_core_sel_eff[2] = parity_core_sel[merge_d_cycle];
+      parity_core_sel_eff[3] = parity_core_sel[merge_d_cycle];
+    end
+    ZC_SMALL:  parity_core_sel_eff = parity_core_sel;
+    default:   parity_core_sel_eff = parity_core_sel;
+  endcase
+end
+
 pc_rearrange #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */)
  ) pc_rearrange (
-  .pc_sel(parity_core_sel),
+  .pc_sel(parity_core_sel_eff),
   .d     (zc_group),
   .pc_in (parity_core),
   .pc_out(parity_core_arranged)
 );
 
+// cs_pc_sel_qdly is a PER-ROW-POSITION D/E selector straight from the CSR
+// (same indexing as gf2_en_q). In the folded modes each logical row is spread
+// over several cyclic-shifter lanes, so every lane of a fold-group must share
+// that row's selection -- otherwise one sub-lane picks data_segment while its
+// partner picks parity_core_arranged, corrupting the reassembled vector. Remap
+// exactly like gf2_en_eff:
+//   ZC_SMALL : lane i  = row i
+//   ZC_MEDIUM: pair k  = row 2*(d_cycle-1)+k    (med_base / med_base+1)
+//   ZC_LARGE : all     = row merge_d_cycle      (broadcast)
+logic [3:0] cs_pc_sel_eff;
+always_comb begin
+  case (zc_group)
+    ZC_MEDIUM: begin
+      cs_pc_sel_eff[0] = cs_pc_sel_qdly[med_base];
+      cs_pc_sel_eff[1] = cs_pc_sel_qdly[med_base];
+      cs_pc_sel_eff[2] = cs_pc_sel_qdly[med_base + 2'd1];
+      cs_pc_sel_eff[3] = cs_pc_sel_qdly[med_base + 2'd1];
+    end
+    ZC_LARGE:  cs_pc_sel_eff = {4{cs_pc_sel_qdly[merge_d_cycle]}};
+    ZC_SMALL:  cs_pc_sel_eff = cs_pc_sel_qdly;   // lane i = row i
+    default:   cs_pc_sel_eff = cs_pc_sel_qdly;
+  endcase
+end
+
 always_comb begin
   for (int k = 0; k < NUM_CS; k++) begin
-    if (cs_pc_sel_qdly[k])
+    if (cs_pc_sel_eff[k])
       cs_data_in[k] = parity_core_arranged[k];
     else
       cs_data_in[k] = data_segment[k];
