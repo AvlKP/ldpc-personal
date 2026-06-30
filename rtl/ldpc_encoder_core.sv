@@ -259,7 +259,8 @@ end
 // -----------
 
 // need to delay output by 1 clock to sync with input bits arrival
-logic [3:0][ZC_WIDTH-1:0] permutation_q, permutation_qdly;
+logic [3:0][ZC_WIDTH-1:0] permutation_q, p_norm_qdly;
+logic [3:0][ZC_WIDTH-1:0] p_norm_q;  // (permutation_q % z) pre-register, Cut #2
 logic [3:0][COL_WIDTH-1:0] col_idx_q, col_idx_qdly;
 logic [COL_WIDTH-1:0] col_curr_q, col_curr_qdly;
 logic [3:0] gf2_en_q, gf2_en_qdly;
@@ -273,7 +274,7 @@ assign info_group_sel_o = KB_WIDTH'(col_curr_q);
 
 always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
   if (!arst_ni) begin
-    permutation_qdly <= '0;
+    p_norm_qdly <= '0;
     gf2_en_qdly <= '0;
     csr_valid_qdly <= 0;
     rowgrp_changed_qdly <= 0;
@@ -282,7 +283,7 @@ always_ff @(posedge clk_i or negedge arst_ni) begin : csr_delay
     col_curr_qdly <= '0;
   end else begin
     if (csr_valid_q) begin
-      permutation_qdly <= permutation_q;
+      p_norm_qdly <= p_norm_q;
       gf2_en_qdly <= gf2_en_q;
       cs_pc_sel_qdly <= cs_pc_sel_q;
       actual_row_qdly <= actual_row_q;
@@ -317,15 +318,30 @@ csr_decoder csr_decoder (
   .rowgrp_changed_o  (rowgrp_changed_q)
 );
 
+// Cut #2: pre-compute per-lane (permutation_q % z) one cycle early so the
+// runtime divider is registered into the csr_delay stage (p_norm_qdly) and off
+// the shifter datapath. Depends only on permutation_q and the frame-constant z
+// (not merge_d_cycle/d), so parameter_calculation consumes it via PRE_MOD=1 and
+// only does the cheap lane-select. '1 is the null marker; guard z==0 (idle).
+always_comb begin
+  for (int i = 0; i < 4; i++) begin
+    p_norm_q[i] = (permutation_q[i] != '1)
+                ? ((lifting_size_q != '0) ? (permutation_q[i] % lifting_size_q)
+                                          : '0)
+                : permutation_q[i];
+  end
+end
+
 logic [3:0][(ZC_MAX >> 2)-1:0] cs_data_in, cs_data_out;
 
 top_level_shifter #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
-  .NUM_CS   (NUM_CS /* default 4 */)
+  .NUM_CS   (NUM_CS /* default 4 */),
+  .PRE_MOD  (1'b1)  /* Cut #2: p arrives pre-modulo'd (p_norm_qdly) */
  ) top_level_shifter (
   .data_in      ({>>{cs_data_in}}),
   .z            (lifting_size_q),
-  .p            (permutation_qdly),
+  .p            (p_norm_qdly),
   .merge_d_cycle(merge_d_cycle),
   .data_out     ({>>{cs_data_out}}),
   .d            (zc_group)
@@ -473,7 +489,7 @@ logic [3:0][(ZC_MAX >> 2)-1:0] parity_core_arranged;
 logic [3:0][IDX_WIDTH-1:0] parity_core_sel;
 
 // Which core-parity column is being fed back this cycle: c_idx = col_curr - KB.
-// col_curr_qdly aligns with cs_pc_sel_qdly / permutation_qdly (the column the
+// col_curr_qdly aligns with cs_pc_sel_qdly / p_norm_qdly (the column the
 // shifter is processing). Only meaningful when cs_pc_sel_qdly != 0.
 logic [COL_WIDTH-1:0] kb_cols;
 logic [3:0][1:0]      pc_col_idx;

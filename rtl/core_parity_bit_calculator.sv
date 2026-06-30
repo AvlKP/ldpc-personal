@@ -18,6 +18,7 @@ module core_parity_bit_calculator #(
     logic [2:0]               i_ls;
     logic [8:0]               pa_shift, pb_shift;
     logic [8:0]               shifter_amt;
+    logic [8:0]               shifter_amt_q;   // shifter_amt % z, registered (frame-constant)
     logic                     shifter_dir;
     logic                     pa_active;
 
@@ -77,14 +78,26 @@ module core_parity_bit_calculator #(
         end
     end
 
+    // shifter_amt (= pa/pb) and z are frame-constant, so shifter_amt % z never
+    // changes during a frame. Register it once so the runtime modulo (a divider)
+    // stays off the critical path; z is latched in LOAD, long before the first
+    // CALC_PC shift, so shifter_amt_q is always settled when used. Guard z==0 to
+    // avoid an x from %0 while idle.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) shifter_amt_q <= '0;
+        else        shifter_amt_q <= (z != 0) ? (shifter_amt % z) : '0;
+    end
+
     assign cs_in = data_in_reg[0] ^ data_in_reg[1] ^ data_in_reg[2] ^ data_in_reg[3];
 
+    // PRE_NORM: shifter_amt_q is already < z, so the shifter skips its own modulo.
     barrel_shifter #(
-        .ZC_PER_CS(W)
+        .ZC_PER_CS(W),
+        .PRE_NORM (1'b1)
     ) shifter_inst (
         .data_in   (cs_in),
         .zc_in     (z),
-        .shift_amt (shifter_amt),
+        .shift_amt (shifter_amt_q),
         .direction (shifter_dir),
         .data_out  (cs_out)
     );

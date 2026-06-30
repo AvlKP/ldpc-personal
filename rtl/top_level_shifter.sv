@@ -2,7 +2,8 @@ import ldpc_pkg::*;
 
 module top_level_shifter #(
     parameter int ZC_PER_CS = 96,
-    parameter int NUM_CS = 4
+    parameter int NUM_CS = 4,
+    parameter bit PRE_MOD = 1'b0
 )(
     input  logic [NUM_CS*ZC_PER_CS-1:0] data_in,
     input  logic [8:0]               z,
@@ -28,7 +29,8 @@ module top_level_shifter #(
 
     parameter_calculation #(
         .ZC_PER_CS(ZC_PER_CS),
-        .NUM_CS(NUM_CS)
+        .NUM_CS(NUM_CS),
+        .PRE_MOD(PRE_MOD)
     ) param_calc_inst (
         .z             (z),
         .p             (p),
@@ -74,7 +76,8 @@ module top_level_shifter #(
             assign actual_shift_amt = use_q_plus[i] ? q_plus[i] : q[i];
 
             barrel_shifter #(
-                .ZC_PER_CS(ZC_PER_CS)
+                .ZC_PER_CS(ZC_PER_CS),
+                .PRE_NORM (1'b1)   // q / q_plus already < z_per_d (parameter_calculation)
             ) shifter_inst (
                 .data_in   (gr_out[i]),
                 .zc_in     (z_per_d),

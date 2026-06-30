@@ -2,7 +2,8 @@ import ldpc_pkg::*;
 
 module parameter_calculation #(
     parameter int ZC_PER_CS = 96,
-    parameter int NUM_CS = 4
+    parameter int NUM_CS = 4,
+    parameter bit PRE_MOD = 1'b0
 )(
     input  logic [8:0] z,
     input  logic [NUM_CS-1:0][8:0] p,
@@ -33,7 +34,10 @@ module parameter_calculation #(
     // Normalize p: subtract z when p >= z, preserving the null marker (9'h1FF).
     // z is always divisible by d in each Zc group, so p_mod_d is unchanged by this.
     for (int i = 0; i < NUM_CS; i++) begin
-      p_norm[i] = (p[i] != 9'h1FF) ? (p[i] % z) : p[i];
+      // PRE_MOD: p already holds (p % z), computed upstream and registered, so
+      // skip the runtime divider here and pass it straight through.
+      p_norm[i] = PRE_MOD ? p[i]
+                          : ((p[i] != 9'h1FF) ? (p[i] % z) : p[i]);
     end
 
     case (d)

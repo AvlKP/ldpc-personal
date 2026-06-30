@@ -1,6 +1,7 @@
 module barrel_shifter #(
     parameter int unsigned ZC_PER_CS = 96,
-    parameter int unsigned SHIFT_W = $clog2(ZC_PER_CS + 1) 
+    parameter bit          PRE_NORM  = 1'b0,
+    parameter int unsigned SHIFT_W = $clog2(ZC_PER_CS + 1)
 )(
     input  logic [ZC_PER_CS-1:0] data_in,
     input  logic [SHIFT_W-1:0]   zc_in,
@@ -24,8 +25,13 @@ always_comb begin
     data_out       = '0;
 
     if (shift_amt != '1) begin
-        // Normalize shift into [0, zc_in) to support p >= z inputs
-        shift_norm = shift_amt % zc_in;
+        // Normalize shift into [0, zc_in). PRE_NORM callers guarantee
+        // shift_amt <= zc_in (already reduced), so a single conditional subtract
+        // replaces the runtime modulo (a divider) and keeps it off the datapath.
+        if (PRE_NORM)
+            shift_norm = (shift_amt >= zc_in) ? (shift_amt - zc_in) : shift_amt;
+        else
+            shift_norm = shift_amt % zc_in;
 
         // Use explicit width replication for the all-ones mask
         data_mask = {ZC_PER_CS{1'b1}} >> (SHIFT_W'(ZC_PER_CS) - $unsigned(zc_in));
