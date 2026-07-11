@@ -1,264 +1,273 @@
+"""Integration TB: codeword_generator + output_buffer (outbuff_integration).
+
+Drives the generator's write side with the same core-like driver the
+standalone codeword_generator TB uses, then checks the output_buffer's
+AXI-Stream against the golden packed codeword: columns 0..mb-1 concatenated
+LSB-first, 32-bit words, TLAST on the final (possibly partial) word.
+
+Unlike the standalone TB this drives the FULL additional-parity set
+(42 for BG1, 38 for BG2) so every column exists; the ZC_SMALL tail beat
+carries filler lanes, either out-of-range (bank_valid guarded away) or
+duplicate row labels with zero data (mimicking the encoder core's final
+half row-group, which the output_buffer must ignore).
+"""
+
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
 import random
 
-# Lifting groups matching ldpc_pkg
-ZC_SMALL  = 0
-ZC_MEDIUM = 1
-ZC_LARGE  = 3
+from codeword_generator_tb import (
+    ZC_SMALL, ZC_MEDIUM, ZC_LARGE,
+    KB_BG1, KB_BG2, BG1_COL_N, BG2_COL_N, COL_WIDTH, LANE_BITS,
+    zc_to_group, generate_subblock, pack_into_lanes,
+    assign_dut_value, CodewordDriver,
+)
 
-async def reset_dut(dut):
-    dut.arst_ni.value = 0
-    dut.base_graph_i.value = 0
-    dut.zc_group_i.value = ZC_SMALL
-    dut.lifting_size_i.value = 0
-    dut.codeword_valid_i.value = 0
-    dut.r_data_i.value = 0
-    dut.m_axis_tready.value = 1
-    await ClockCycles(dut.clk_i, 5)
-    dut.arst_ni.value = 1
-    await ClockCycles(dut.clk_i, 5)
 
-async def bram_responder(dut, ram_data):
-    """Models a BRAM with 1-cycle read latency relative to r_addr_o updates."""
-    while True:
-        await FallingEdge(dut.clk_i)
-        addr = int(dut.r_addr_o.value)
-        if addr < len(ram_data):
-            dut.r_data_i.value = ram_data[addr]
-        else:
-            dut.r_data_i.value = 0
+def bg_params_full(base_graph):
+    """(kb, mb, num_additional) with the FULL additional-parity count."""
+    if base_graph:
+        return KB_BG2, BG2_COL_N, BG2_COL_N - KB_BG2 - 4  # 38
+    return KB_BG1, BG1_COL_N, BG1_COL_N - KB_BG1 - 4      # 42
 
-async def run_output_buffer_test(dut, zc_group, base_graph, lifting_size, backpressure=False):
-    dut._log.info(f"Starting Output Buffer Test: zc_group={zc_group}, base_graph={base_graph}, lifting_size={lifting_size}, backpressure={backpressure}")
-    
-    col_max = 52 if base_graph else 68 # BG2: 52, BG1: 68
-    
-    # 1. Generate random column data and pack into BRAM rows
-    # ZC_SMALL: 4 columns/row. ZC_MEDIUM: 2 columns/row. ZC_LARGE: 1 column/row.
-    columns = [random.getrandbits(lifting_size) for _ in range(col_max)]
-    
-    # Construct continuous bitstream of golden output
-    golden_bitstream = 0
+
+def expected_axis_words(columns, zc):
+    """Golden AXIS words: columns packed LSB-first into one bitstream."""
+    stream = 0
+    mask = (1 << zc) - 1
     for i, col in enumerate(columns):
-        golden_bitstream |= (col << (i * lifting_size))
-    
-    total_bits = col_max * lifting_size
-    num_axis_words = (total_bits + 31) // 32
-    expected_words = []
-    for i in range(num_axis_words):
-        word = (golden_bitstream >> (i * 32)) & 0xFFFFFFFF
-        expected_words.append(word)
-        
-    # Pack columns into RAM words (384-bit wide) matching physical codeword generator layout
-    ram_data = [0] * 256
-    sys_limit = 10 if base_graph else 22
-    
-    # 1. Pack Systematic
+        stream |= (col & mask) << (i * zc)
+    total_bits = len(columns) * zc
+    n_words = (total_bits + 31) // 32
+    return [(stream >> (32 * i)) & 0xFFFFFFFF for i in range(n_words)]
+
+
+async def drive_add_parity_full(dut, subblocks, indices, order, zc, zc_group,
+                                dup_filler=False):
+    """Friend-driver-compatible PA phase, but with the full row count.
+
+    SMALL tail beat filler lanes: out-of-range indices (dup_filler=False,
+    bank_valid write is address-guarded) or duplicates of the beat's real
+    lanes with zero data (dup_filler=True, real-core behaviour).
+    """
+    n = len(subblocks)
+
     if zc_group == ZC_SMALL:
-        for c in range(sys_limit):
-            row = c // 4
-            slot = c % 4
-            ram_data[row] |= (columns[c] << (slot * 96))
-    elif zc_group == ZC_MEDIUM:
-        for c in range(sys_limit):
-            row = c // 2
-            slot = c % 2
-            ram_data[row] |= (columns[c] << (slot * 192))
-    else: # ZC_LARGE
-        for c in range(sys_limit):
-            ram_data[c] = columns[c]
-            
-    # 2. Pack Core Parity
-    if zc_group == ZC_SMALL:
-        cp_base = 3 if base_graph else 6
-        row_val = 0
-        for i in range(4):
-            col_val = columns[sys_limit + i]
-            row_val |= (col_val << (i * 96))
-        ram_data[cp_base] = row_val
-    elif zc_group == ZC_MEDIUM:
-        cp_base = 5 if base_graph else 11
-        row_val_0 = columns[sys_limit] | (columns[sys_limit + 1] << 192)
-        row_val_1 = columns[sys_limit + 2] | (columns[sys_limit + 3] << 192)
-        ram_data[cp_base] = row_val_0
-        ram_data[cp_base + 1] = row_val_1
-    else: # ZC_LARGE
-        cp_base = 10 if base_graph else 22
-        for i in range(4):
-            ram_data[cp_base + i] = columns[sys_limit + i]
-            
-    # 3. Pack Additional Parity
-    ap_cols = columns[sys_limit + 4 :]
-    if zc_group == ZC_SMALL:
-        cp_base = 3 if base_graph else 6
-        ap_base = cp_base + 1
-        for i, col in enumerate(ap_cols):
-            row = ap_base + (i // 4)
-            slot = i % 4
-            ram_data[row] |= (col << (slot * 96))
-    elif zc_group == ZC_MEDIUM:
-        cp_base = 5 if base_graph else 11
-        ap_base = cp_base + 2
-        for i, col in enumerate(ap_cols):
-            row = ap_base + (i // 2)
-            slot = i % 2
-            ram_data[row] |= (col << (slot * 192))
-    else: # ZC_LARGE
-        cp_base = 10 if base_graph else 22
-        ap_base = cp_base + 4
-        for i, col in enumerate(ap_cols):
-            row = ap_base + i
-            ram_data[row] = col
-            
-    # Start BRAM responder task
-    bram_task = cocotb.start_soon(bram_responder(dut, ram_data))
-    
-    # Set config inputs
-    dut.base_graph_i.value = base_graph
-    dut.zc_group_i.value = zc_group
-    dut.lifting_size_i.value = lifting_size
-    
-    # Start background task to catch codeword_done_o pulse asynchronously and robustly
-    done_event = cocotb.triggers.Event()
-    async def catch_done():
-        while True:
+        for i in range(0, n, 4):
+            lane_idx = []
+            lane_data = []
+            for j in range(4):
+                k = i + j
+                if k < n:
+                    lane_idx.append(indices[order[k]])
+                    lane_data.append(subblocks[order[k]])
+                elif dup_filler:
+                    # duplicate label of lane j-2, zeroed accumulator
+                    lane_idx.append(lane_idx[j - 2])
+                    lane_data.append(0)
+                else:
+                    lane_idx.append(BG1_COL_N + j)  # out of bank_valid range
+                    lane_data.append(0)
+
+            packed_idx = 0
+            packed_data = 0
+            for j in range(4):
+                packed_idx |= (lane_idx[j] & ((1 << COL_WIDTH) - 1)) << (j * COL_WIDTH)
+                packed_data |= (lane_data[j] & ((1 << LANE_BITS) - 1)) << (j * LANE_BITS)
+
+            assign_dut_value(dut.add_parity_idx_i, packed_idx)
+            assign_dut_value(dut.add_parity_data_i, packed_data)
+            assign_dut_value(dut.add_parity_valid_i, 1)
+            assign_dut_value(dut.last_block_i, 1 if (i + 4 >= n) else 0)
             await RisingEdge(dut.clk_i)
-            if dut.codeword_done_o.value == 1:
-                done_event.set()
-                break
-    cocotb.start_soon(catch_done())
 
-    # Assert codeword_valid_i
-    dut.codeword_valid_i.value = 1
-    await RisingEdge(dut.clk_i)
-    dut.codeword_valid_i.value = 0
-    
-    # 2. Latency Check: State transitions IDLE -> FETCH -> WAIT_RAM -> STREAM
-    # The FSM state is state_q
-    # IDLE is 000, FETCH is 001, WAIT_RAM is 010, STREAM is 011
-    # We just transition, wait for FETCH (1 cycle), then WAIT_RAM (1 cycle).
-    # So 2 cycles total of setup latency before STREAM.
-    # Let's assert state transition timing.
-    await FallingEdge(dut.clk_i)
-    # Right after RisingEdge where codeword_valid_i was seen, state should be FETCH
-    assert int(dut.state_q.value) == 1, f"State is not FETCH, got {int(dut.state_q.value)}"
-    await RisingEdge(dut.clk_i)
-    await FallingEdge(dut.clk_i)
-    assert int(dut.state_q.value) == 2, f"State is not WAIT_RAM, got {int(dut.state_q.value)}"
-    await RisingEdge(dut.clk_i)
-    await FallingEdge(dut.clk_i)
-    assert int(dut.state_q.value) == 3, f"State is not STREAM, got {int(dut.state_q.value)}"
-    
-    # 3. Stream & verify output words
-    actual_words = []
-    beats_count = 0
-    
-    async def debug_monitor(dut):
-        cycle = 0
-        while True:
+    elif zc_group == ZC_MEDIUM:
+        assert n % 2 == 0, "MEDIUM PA count must be even (42/38 both are)"
+        for i in range(0, n, 2):
+            idx_a = indices[order[i]]
+            idx_b = indices[order[i + 1]]
+            lanes_a = pack_into_lanes(subblocks[order[i]], zc, 2)
+            lanes_b = pack_into_lanes(subblocks[order[i + 1]], zc, 2)
+
+            packed_idx = 0
+            packed_data = 0
+            for j, idx in enumerate([idx_a, idx_a, idx_b, idx_b]):
+                packed_idx |= (idx & ((1 << COL_WIDTH) - 1)) << (j * COL_WIDTH)
+            for j, lane in enumerate([lanes_a[0], lanes_a[1], lanes_b[0], lanes_b[1]]):
+                packed_data |= (lane & ((1 << LANE_BITS) - 1)) << (j * LANE_BITS)
+
+            assign_dut_value(dut.add_parity_idx_i, packed_idx)
+            assign_dut_value(dut.add_parity_data_i, packed_data)
+            assign_dut_value(dut.add_parity_valid_i, 1)
+            assign_dut_value(dut.last_block_i, 1 if (i + 2 >= n) else 0)
             await RisingEdge(dut.clk_i)
-            await cocotb.triggers.Timer(1, units="ps")
-            dut._log.info(
-                f"Cycle {cycle:04d}: state={dut.state_q.value} col={int(dut.col_idx_q.value)} r_addr={int(dut.r_addr_q.value)} "
-                f"accum_cnt={int(dut.accum_cnt_q.value)} shifter_cnt={int(dut.shifter_cnt_q.value)} "
-                f"eff_shift={int(dut.effective_shifter_cnt.value)} tot_bits={int(dut.total_bits_left.value)} "
-                f"col_depl={int(dut.col_depleted.value)} ram_exh={int(dut.ram_word_exhausted.value)} "
-                f"i_val={int(dut.internal_valid.value)} i_rdy={int(dut.internal_ready.value)} i_last={int(dut.internal_last.value)} "
-                f"m_val={int(dut.m_axis_tvalid.value)} m_rdy={int(dut.m_axis_tready.value)} m_last={int(dut.m_axis_tlast.value)}"
-            )
-            cycle += 1
 
-    monitor_task = cocotb.start_soon(debug_monitor(dut))
+    else:  # LARGE
+        for i in range(n):
+            idx = indices[order[i]]
+            lanes = pack_into_lanes(subblocks[order[i]], zc, 4)
+            packed_idx = 0
+            packed_data = 0
+            for j in range(4):
+                packed_idx |= (idx & ((1 << COL_WIDTH) - 1)) << (j * COL_WIDTH)
+                packed_data |= (lanes[j] & ((1 << LANE_BITS) - 1)) << (j * LANE_BITS)
 
-    # 1. Independent Monitor Loop
-    async def axis_monitor():
-        while len(actual_words) < num_axis_words:
+            assign_dut_value(dut.add_parity_idx_i, packed_idx)
+            assign_dut_value(dut.add_parity_data_i, packed_data)
+            assign_dut_value(dut.add_parity_valid_i, 1)
+            assign_dut_value(dut.last_block_i, 1 if (i + 1 >= n) else 0)
             await RisingEdge(dut.clk_i)
-            if dut.m_axis_tvalid.value == 1 and dut.m_axis_tready.value == 1:
-                data = int(dut.m_axis_tdata.value)
-                last = int(dut.m_axis_tlast.value)
-                actual_words.append(data)
-                
-                # Verify TLAST alignment
-                is_last_word = (len(actual_words) == num_axis_words)
-                assert last == (1 if is_last_word else 0), f"m_axis_tlast mismatch. Expected: {1 if is_last_word else 0}, Actual: {last} at word {len(actual_words)-1}/{num_axis_words}"
 
-    monitor_tb_task = cocotb.start_soon(axis_monitor())
+    assign_dut_value(dut.add_parity_valid_i, 0)
+    assign_dut_value(dut.last_block_i, 0)
 
-    # 2. Driver Loop for backpressure
-    while len(actual_words) < num_axis_words:
-        if backpressure and random.random() < 0.2:
-            dut.m_axis_tready.value = 0
-        else:
-            dut.m_axis_tready.value = 1
+
+async def drive_frame(dut, driver, base_graph, zc, rng, shuffle_pa=False,
+                      dup_filler=False):
+    """Write one full frame into the generator. Returns golden column list."""
+    zc_group = zc_to_group(zc)
+    kb, mb, num_additional = bg_params_full(base_graph)
+
+    info = [generate_subblock(zc, rng) for _ in range(kb)]
+    pc = [generate_subblock(zc, rng) for _ in range(4)]
+    pa_indices = list(range(4, 4 + num_additional))
+    pa = [generate_subblock(zc, rng) for _ in range(num_additional)]
+    pa_order = list(range(num_additional))
+    if shuffle_pa:
+        rng.shuffle(pa_order)
+        if zc_group == ZC_SMALL and dup_filler:
+            # real core hands the final half-group last; keep tail = last rows
+            pa_order = sorted(pa_order[:-2]) + pa_order[-2:]
+
+    driver._idle_dut_inputs()
+    driver._set_config(base_graph, zc_group, zc)
+    while True:
         await RisingEdge(dut.clk_i)
-
-    # Make sure monitor task completes and any assertions are raised
-    await monitor_tb_task
-
-    # Deassert ready
-    dut.m_axis_tready.value = 0
-    
-    # Wait for codeword_done_o pulse caught asynchronously
-    await done_event.wait()
-        
+        if int(dut.ready_o.value) == 1:
+            break
+    assign_dut_value(dut.init_i, 1)
     await RisingEdge(dut.clk_i)
-    
-    # Verify the output data
-    for i in range(num_axis_words):
-        assert actual_words[i] == expected_words[i], \
-            f"Data mismatch at AXI word {i}. Expected: {hex(expected_words[i])}, Actual: {hex(actual_words[i])}"
-            
-    bram_task.cancel()
-    monitor_task.cancel()
-    dut._log.info(f"Verification Successful for zc_group={zc_group}, lifting_size={lifting_size}!")
+    assign_dut_value(dut.init_i, 0)
+
+    await driver._drive_info(info, zc, zc_group)
+    await driver._drive_core_parity(pc, zc, zc_group)
+    await drive_add_parity_full(dut, pa, pa_indices, pa_order, zc, zc_group,
+                                dup_filler=dup_filler)
+    driver._idle_dut_inputs()
+
+    # columns in codeword order: info, core parity, additional (col = kb+idx)
+    columns = list(info) + list(pc)
+    by_idx = {pa_indices[k]: pa[k] for k in range(num_additional)}
+    columns += [by_idx[i] for i in range(4, 4 + num_additional)]
+    assert len(columns) == mb
+    return columns
+
+
+async def axis_sink(dut, rng, p_ready=1.0, max_cycles=200000):
+    """Collect one TLAST-delimited packet with random backpressure."""
+    words = []
+    for _ in range(max_cycles):
+        assign_dut_value(dut.m_axis_tready, 1 if rng.random() < p_ready else 0)
+        await FallingEdge(dut.clk_i)
+        if int(dut.m_axis_tvalid.value) and int(dut.m_axis_tready.value):
+            words.append(int(dut.m_axis_tdata.value))
+            if int(dut.m_axis_tlast.value):
+                await RisingEdge(dut.clk_i)
+                assign_dut_value(dut.m_axis_tready, 0)
+                return words
+        await RisingEdge(dut.clk_i)
+    raise AssertionError(f"AXIS sink timeout after {max_cycles} cycles "
+                         f"({len(words)} words collected)")
+
+
+def check_words(label, got, exp):
+    assert len(got) == len(exp), \
+        f"{label}: word count {len(got)} != expected {len(exp)}"
+    for i, (g, e) in enumerate(zip(got, exp)):
+        assert g == e, f"{label}: word {i}: got {g:#010x} expected {e:#010x}"
+
+
+async def reset_dut(dut, cycles=5):
+    assign_dut_value(dut.arst_ni, 0)
+    assign_dut_value(dut.m_axis_tready, 0)
+    await ClockCycles(dut.clk_i, cycles)
+    assign_dut_value(dut.arst_ni, 1)
+    await ClockCycles(dut.clk_i, cycles)
+
+
+async def run_one(dut, driver, base_graph, zc, rng, p_ready=1.0,
+                  shuffle_pa=False, dup_filler=False, label=""):
+    columns = await drive_frame(dut, driver, base_graph, zc, rng,
+                                shuffle_pa=shuffle_pa, dup_filler=dup_filler)
+    words = await axis_sink(dut, rng, p_ready=p_ready)
+    check_words(label, words, expected_axis_words(columns, zc))
+    dut._log.info(f"  {label}: {len(words)} words OK")
+
 
 @cocotb.test()
-async def test_bg1_small(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+async def test_integration_sweep(dut):
+    """Directed BG x Zc sweep, full throughput, sorted PA."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    rng = random.Random(1001)
+    driver = CodewordDriver(dut, rng)
     await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_SMALL, base_graph=0, lifting_size=48)
+
+    configs = [
+        (0, 2), (0, 32), (0, 48), (0, 96),      # BG1 SMALL (min, word, mid, bank edge)
+        (1, 16), (1, 80),                        # BG2 SMALL
+        (0, 104), (0, 128), (0, 192),            # BG1 MEDIUM
+        (1, 144), (1, 176),                      # BG2 MEDIUM
+        (0, 208), (0, 384),                      # BG1 LARGE (min, max)
+        (1, 240), (1, 288),                      # BG2 LARGE
+    ]
+    for bg, zc in configs:
+        await run_one(dut, driver, bg, zc, rng,
+                      label=f"sweep_bg{2 if bg else 1}_zc{zc}")
+    dut._log.info("integration sweep PASSED")
+
 
 @cocotb.test()
-async def test_bg1_medium(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+async def test_integration_backpressure(dut):
+    """Random tready stalls + shuffled PA arrival order."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    rng = random.Random(2002)
+    driver = CodewordDriver(dut, rng)
     await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_MEDIUM, base_graph=0, lifting_size=144)
+
+    for bg, zc in [(0, 48), (0, 128), (0, 384), (1, 2)]:
+        await run_one(dut, driver, bg, zc, rng, p_ready=0.5, shuffle_pa=True,
+                      label=f"bp_bg{2 if bg else 1}_zc{zc}")
+    dut._log.info("integration backpressure PASSED")
+
 
 @cocotb.test()
-async def test_bg1_large(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+async def test_integration_duplicate_labels(dut):
+    """ZC_SMALL final half-group duplicates (real-core tail) must be ignored."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    rng = random.Random(3003)
+    driver = CodewordDriver(dut, rng)
     await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_LARGE, base_graph=0, lifting_size=384)
+
+    for bg, zc in [(0, 48), (1, 80), (0, 96)]:
+        await run_one(dut, driver, bg, zc, rng, dup_filler=True,
+                      label=f"dup_bg{2 if bg else 1}_zc{zc}")
+    dut._log.info("duplicate-label robustness PASSED")
+
 
 @cocotb.test()
-async def test_bg2_small(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
+async def test_integration_pingpong(dut):
+    """Two frames with different configs back to back through the ping-pong."""
+    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    rng = random.Random(4004)
+    driver = CodewordDriver(dut, rng)
     await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_SMALL, base_graph=1, lifting_size=80)
 
-@cocotb.test()
-async def test_bg2_medium(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-    await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_MEDIUM, base_graph=1, lifting_size=192)
+    cols0 = await drive_frame(dut, driver, 0, 128, rng)
+    cols1 = await drive_frame(dut, driver, 1, 80, rng)  # fills the pong bank
 
-@cocotb.test()
-async def test_bg2_large(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-    await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_LARGE, base_graph=1, lifting_size=288)
-
-@cocotb.test()
-async def test_backpressure_bg1_small(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-    await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_SMALL, base_graph=0, lifting_size=48, backpressure=True)
-
-@cocotb.test()
-async def test_backpressure_bg2_large(dut):
-    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
-    await reset_dut(dut)
-    await run_output_buffer_test(dut, zc_group=ZC_LARGE, base_graph=1, lifting_size=288, backpressure=True)
+    words0 = await axis_sink(dut, rng, p_ready=0.7)
+    check_words("pingpong_frame0", words0, expected_axis_words(cols0, 128))
+    words1 = await axis_sink(dut, rng, p_ready=0.7)
+    check_words("pingpong_frame1", words1, expected_axis_words(cols1, 80))
+    dut._log.info("ping-pong PASSED")

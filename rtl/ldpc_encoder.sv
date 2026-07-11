@@ -151,11 +151,11 @@ logic [10:0] core_word_cnt;
 
 logic [ZC_WIDTH-1:0] outbuff_lifting_size;
 logic outbuff_base_graph;
-zc_group_t outbuff_zc_group;
 
 logic cw_valid;
 logic [COL_WIDTH-1:0] cw_r_addr;
 logic [ZC_MAX-1:0] cw_r_data;
+logic [3:0] cw_bank_valid;
 logic outbuff_done;
 
 // ==== AXI Stream input ====
@@ -187,11 +187,11 @@ output_buffer #(
   .arst_ni         (arst_ni),
   .base_graph_i    (outbuff_base_graph),
   .lifting_size_i  (outbuff_lifting_size),
-  .zc_group_i      (outbuff_zc_group),
   .codeword_valid_i(cw_valid),
   .codeword_done_o (outbuff_done),
   .r_addr_o        (cw_r_addr),
   .r_data_i        (cw_r_data),
+  .bank_valid_i    (cw_bank_valid),
   .m_axis_tdata    (m_axis_tdata),
   .m_axis_tvalid   (m_axis_tvalid),
   .m_axis_tready   (m_axis_tready),
@@ -216,9 +216,10 @@ ldpc_encoder_core #(
   .codeword_valid_o(cw_valid),
   .r_addr_i        (cw_r_addr),
   .r_data_o        (cw_r_data),
+  .bank_valid_o    (cw_bank_valid),
   .codeword_done_i (outbuff_done),
   .lifting_size_o  (outbuff_lifting_size),
-  .zc_group_o      (outbuff_zc_group),
+  .zc_group_o      (/* unused: output_buffer no longer needs the group */),
   .base_graph_o    (outbuff_base_graph)
 );
 

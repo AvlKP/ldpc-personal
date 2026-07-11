@@ -1,5 +1,23 @@
 import ldpc_pkg::*;
 
+// Drains the codeword generator's banked column store into a dense LSB-first
+// 32-bit AXI-Stream.
+//
+// Generator contract (see codeword_generator.sv / codeword_generator_tb.py):
+// read address == codeword column index. Each address holds exactly ONE
+// column: its Zc bits span the banks flagged in bank_valid_i in increasing
+// bank order, 96 bits per bank, padding above Zc ("data with padding, bit
+// mask to remove"). Reads have one cycle of latency; r_data_i / bank_valid_i
+// are aligned. lifting_size_i / base_graph_i are the generator's read-side
+// config and stay stable for the whole readout.
+//
+// Per fetched column the drain takes <=32-bit slices from the lowest
+// still-valid bank (reverse priority encoder), thermometer-masks the final
+// partial slice, barrel-shifts it by the output register's fill level and
+// ORs it into a 64-bit append register whose low word is the AXIS beat.
+// Valid banks left over after the column's Zc bits are consumed are
+// discarded: the core's final half row-group duplicates row labels into the
+// upper lanes, which land in higher banks at the same address.
 module output_buffer #(
     parameter int unsigned DATA_WIDTH = 32,
     localparam int unsigned COL_WIDTH = $clog2(BG1_COL_N)
@@ -8,14 +26,14 @@ module output_buffer #(
     input logic arst_ni,                                   // Active-low asynchronous reset
 
     input logic base_graph_i,                              // 0: BG1, 1: BG2 configuration selection flag
-    input zc_group_t zc_group_i,                           // Pre-calculated lifting size group configuration enum
     input logic [ZC_WIDTH-1:0] lifting_size_i,             // Active valid target lifting size Z
 
     // Codeword Generator Module Interface
     input  logic                 codeword_valid_i,         // Memory bank ready notification flag
     output logic                 codeword_done_o,          // Codeword readout complete acknowledgement strobe
-    output logic [COL_WIDTH-1:0] r_addr_o,                 // Row index lookup address driven to generator
-    input  logic [ZC_MAX-1:0]     r_data_i,                 // Recombined 384-bit wide row data return from generator
+    output logic [COL_WIDTH-1:0] r_addr_o,                 // Column lookup address driven to generator
+    input  logic [ZC_MAX-1:0]    r_data_i,                 // Recombined 384-bit wide column data return from generator
+    input  logic [3:0]           bank_valid_i,             // Which 96-bit banks of r_data_i hold this column
 
     // Downstream Master AXI Stream Interface
     output logic [DATA_WIDTH-1:0] m_axis_tdata,            // AXI Stream data payload channel
@@ -24,342 +42,182 @@ module output_buffer #(
     output logic                  m_axis_tlast             // End-of-frame packet delimiter strobe
 );
 
-    // Encapsulate AXI Stream Channels into a packed structure for generic instantiation
-    typedef struct packed {
-        logic [DATA_WIDTH-1:0] tdata;
-        logic                  tlast;
-    } axis_packet_t;
+    localparam int unsigned LANE_W     = ZC_MAX >> 2;         // 96-bit bank width
+    localparam int unsigned LANE_STEPS = LANE_W / DATA_WIDTH; // 3 slices per full bank
+    localparam int unsigned OUT_LEN    = 2 * DATA_WIDTH;      // 64-bit append register
+    localparam int unsigned FILL_W     = $clog2(OUT_LEN + 1); // fill counts 0..64
 
     // FSM State Encoding
-    typedef enum logic [2:0] { 
-        IDLE     = 3'b000,
-        FETCH    = 3'b001,
-        WAIT_RAM = 3'b010,
-        STREAM   = 3'b011,
-        FLUSH    = 3'b100
+    typedef enum logic [2:0] {
+        IDLE    = 3'b000,
+        FETCH   = 3'b001,  // column address presented, generator registers the read
+        CAPTURE = 3'b010,  // r_data_i / bank_valid_i valid: load the bank registers
+        DRAIN   = 3'b011,  // one <=32-bit slice per cycle into the append register
+        FLUSH   = 3'b100   // all columns consumed: emit the trailing partial words
     } state_t;
 
-    // Control and Datapath Register Chains
-    state_t                  state_q, state_n;
-    logic [COL_WIDTH-1:0]    col_idx_q, col_idx_n;
-    logic [COL_WIDTH-1:0]    r_addr_q, r_addr_n;
-    
-    localparam int unsigned  ACCUM_LEN = 2 * DATA_WIDTH;
-    localparam int unsigned  ACCUM_WIDTH = $clog2(ACCUM_LEN);
-    logic [ACCUM_LEN-1:0]    accum_q, accum_n;
-    logic [ACCUM_WIDTH-1:0]  accum_cnt_q, accum_cnt_n;
+    state_t state_q, state_n;
 
-    logic [ZC_MAX-1:0]       shifter_q, shifter_n;
-    logic [ZC_WIDTH-1:0]     shifter_cnt_q, shifter_cnt_n;
-    logic                    codeword_done_n;
+    // Column sequencing (address == column index)
+    logic [COL_WIDTH-1:0] col_cnt_q, col_cnt_n;
+    logic                 col_last;
 
-    // Internal Skid Buffer Interconnect Lines
-    logic                    internal_valid;
-    logic                    internal_ready;
-    logic [DATA_WIDTH-1:0]   internal_data;
-    logic                    internal_last;
+    // Bank registers: the fetched column, drained lowest-valid-bank first
+    typedef logic [3:0][LANE_W-1:0] bank_arr_t;
+    bank_arr_t              bank_q, bank_n;
+    logic [3:0]             bank_valid_q, bank_valid_n;
+    logic [1:0]             bank_sel;
+    logic [1:0]             bank_step_q, bank_step_n; // slices taken from the selected bank
 
-    // Boundary Evaluation Status Flags
-    logic                    axis_handshake;
-    logic                    col_depleted;
-    logic                    flush_complete;
-    logic [COL_WIDTH-1:0]    col_max;
-    logic [COL_WIDTH-1:0]    sys_limit;
-    logic [1:0]              slot_idx;
-    logic [8:0]              total_bits_left;
-    logic                    ram_word_exhausted;
-    logic [ZC_MAX-1:0]       current_column_chunk;
-    logic [ZC_WIDTH-1:0]     effective_shifter_cnt;
+    // Remaining bits of the current column (loaded with the lifting size)
+    logic [ZC_WIDTH-1:0] col_rem_q, col_rem_n;
 
-    assign axis_handshake = internal_valid & internal_ready;
-    assign r_addr_o       = r_addr_q;
-    assign col_max        = (base_graph_i) ? BG2_COL_N : BG1_COL_N;
-    assign sys_limit      = (base_graph_i) ? COL_WIDTH'(10) : COL_WIDTH'(22);
-    
-    assign col_depleted   = (shifter_cnt_n == '0);
-    assign flush_complete = (accum_cnt_n == '0);
-    assign effective_shifter_cnt = (shifter_cnt_q == '0) ? lifting_size_i : shifter_cnt_q;
+    // Output append register ("OR append" + 64-bit output reg of the design)
+    logic [OUT_LEN-1:0] out_q, out_n;
+    logic [FILL_W-1:0]  fill_q, fill_n;
 
-    //--------------------------------------------------------------------------
-    // Concern 1: Subblock Column Chunk Demultiplexing Logic (Explicitly Configured)
-    //--------------------------------------------------------------------------
+    logic codeword_done_n;
+
+    assign col_last = (col_cnt_q == (base_graph_i ? COL_WIDTH'(BG2_COL_N - 1)
+                                                  : COL_WIDTH'(BG1_COL_N - 1)));
+    assign r_addr_o = col_cnt_q;
+
+    // The append register doubles as the AXIS holding stage: while 32+ bits
+    // are pending, appends land at bit fill_q >= 32, so tdata's low word
+    // stays stable under a stalled tvalid as AXIS requires.
+    logic handshake;
+    assign m_axis_tdata  = out_q[DATA_WIDTH-1:0];
+    assign m_axis_tvalid = (state_q != IDLE)
+                         & ((fill_q >= FILL_W'(DATA_WIDTH))
+                            | ((state_q == FLUSH) & (fill_q != '0)));
+    assign m_axis_tlast  = (state_q == FLUSH) & (fill_q <= FILL_W'(DATA_WIDTH));
+    assign handshake     = m_axis_tvalid & m_axis_tready;
+
+    // Reverse priority encoder: the lowest still-valid bank holds the
+    // column's next 96-bit span (banks fill LSB-first).
     always_comb begin
-        // Calculate Phase-Aware Slot Index within the BRAM word
-        if (col_idx_q < sys_limit) begin
-            slot_idx = col_idx_q[1:0];
-        end else if (col_idx_q < sys_limit + 4) begin
-            slot_idx = 2'(col_idx_q - sys_limit);
-        end else begin
-            slot_idx = 2'(col_idx_q - sys_limit - 4);
-        end
-
-        // Secure defensive defaults to guarantee zero latch generation
-        current_column_chunk = r_data_i;
-        ram_word_exhausted   = (r_addr_n != r_addr_q);
-
-        unique case (zc_group_i)
-            ZC_SMALL: begin
-                unique case (slot_idx)
-                    2'b00: current_column_chunk = ZC_MAX'(r_data_i[95:0]);
-                    2'b01: current_column_chunk = ZC_MAX'(r_data_i[191:96]);
-                    2'b10: current_column_chunk = ZC_MAX'(r_data_i[287:192]);
-                    2'b11: current_column_chunk = ZC_MAX'(r_data_i[383:288]);
-                endcase
-            end
-            
-            ZC_MEDIUM: begin
-                if (slot_idx[0] == 1'b0) begin
-                    current_column_chunk = ZC_MAX'(r_data_i[191:0]);
-                end else begin
-                    current_column_chunk = ZC_MAX'(r_data_i[383:192]);
-                end
-            end
-            
-            ZC_LARGE: begin
-                current_column_chunk = r_data_i;
-            end
+        casez (bank_valid_q)
+            4'b???1: bank_sel = 2'd0;
+            4'b??10: bank_sel = 2'd1;
+            4'b?100: bank_sel = 2'd2;
+            4'b1000: bank_sel = 2'd3;
+            default: bank_sel = 2'd0;
         endcase
     end
 
-    //--------------------------------------------------------------------------
-    // Concern 2: Gearbox Datapath Shifting Engine
-    //--------------------------------------------------------------------------
-    always_comb begin
-        logic [ACCUM_WIDTH-1:0] take_bits;
-        logic [DATA_WIDTH-1:0]  slice;
+    logic [OUT_LEN-1:0] eff_out;   // append register view after this cycle's pop
+    logic [FILL_W-1:0]  eff_fill;
+    logic [5:0]         take;      // bits consumed this slice: 32, or the final partial
+    logic [DATA_WIDTH-1:0] slice;
+    logic               can_append;
 
-        accum_n       = accum_q;
-        accum_cnt_n   = accum_cnt_q;
-        shifter_n     = shifter_q;
-        shifter_cnt_n = shifter_cnt_q;
-        take_bits     = '0;
-        slice         = '0;
-
-        if (axis_handshake) begin
-            accum_n = accum_n >> DATA_WIDTH;
-            if (accum_cnt_n >= ACCUM_WIDTH'(DATA_WIDTH)) begin
-                accum_cnt_n = accum_cnt_n - ACCUM_WIDTH'(DATA_WIDTH);
-            end else begin
-                accum_cnt_n = '0;
-            end
-        end
-
-        if (state_q == IDLE) begin
-            accum_n       = '0;
-            accum_cnt_n   = '0;
-            shifter_cnt_n = '0;
-        end else if (state_q == STREAM) begin
-            // Extract lookahead chunk from active row wires if the local register tracker is empty
-            if (shifter_cnt_n == '0) begin
-                shifter_n     = current_column_chunk;
-                shifter_cnt_n = lifting_size_i;
-            end
-
-            // Localized extraction loop and variable bit masking
-            if (accum_cnt_n < ACCUM_WIDTH'(DATA_WIDTH) && shifter_cnt_n > '0) begin
-                take_bits = (shifter_cnt_n >= ZC_WIDTH'(DATA_WIDTH)) ? 
-                             ACCUM_WIDTH'(DATA_WIDTH) : shifter_cnt_n[ACCUM_WIDTH-1:0];
-                slice     = shifter_n[DATA_WIDTH-1:0];
-                
-                if (take_bits < ACCUM_WIDTH'(DATA_WIDTH)) begin
-                    slice = slice & ((DATA_WIDTH'(1) << take_bits) - DATA_WIDTH'(1));
-                end
-                
-                accum_n       = accum_n | (ACCUM_LEN'(slice) << accum_cnt_n);
-                accum_cnt_n   = accum_cnt_n + take_bits;
-                shifter_n     = shifter_n >> DATA_WIDTH;
-                shifter_cnt_n = shifter_cnt_n - ZC_WIDTH'(take_bits);
-            end
-        end
-    end
-
-    //--------------------------------------------------------------------------
-    // Concern 3: FSM Control Phase Controller
-    //--------------------------------------------------------------------------
     always_comb begin
         state_n         = state_q;
+        col_cnt_n       = col_cnt_q;
+        bank_n          = bank_q;
+        bank_valid_n    = bank_valid_q;
+        bank_step_n     = bank_step_q;
+        col_rem_n       = col_rem_q;
         codeword_done_n = 1'b0;
 
-        case (state_q)
-            IDLE:     if (codeword_valid_i) state_n = FETCH;
-            FETCH:    state_n = WAIT_RAM;
-            WAIT_RAM: state_n = STREAM;
-            STREAM:   if (col_depleted) begin
-                          if (col_idx_q == col_max - 1) begin
-                              state_n = FLUSH;
-                          end else if (ram_word_exhausted) begin
-                              state_n = WAIT_RAM; // Trigger 1-cycle latency wait state for new row
-                          end else begin
-                              state_n = STREAM;   // Stay in STREAM to consume next packed column chunk
-                          end
-                      end
-            FLUSH:    if (flush_complete) begin
-                          codeword_done_n = 1'b1;
-                          state_n         = IDLE;
-                      end
-            default:  state_n = IDLE;
-        endcase
-    end
-
-    //--------------------------------------------------------------------------
-    // Concern 4: Sequential Addressing Matrix Generation Logic
-    //--------------------------------------------------------------------------
-    function automatic [COL_WIDTH-1:0] get_r_addr(
-        input logic [COL_WIDTH-1:0] c,
-        input logic                 bg,
-        input zc_group_t            g
-    );
-        logic [COL_WIDTH-1:0] limit;
-        logic [COL_WIDTH-1:0] cp_base;
-        logic [COL_WIDTH-1:0] ap_base;
-        logic [COL_WIDTH-1:0] addr;
-        
-        limit = bg ? COL_WIDTH'(10) : COL_WIDTH'(22);
-        
-        unique case (g)
-            ZC_SMALL: begin
-                cp_base = bg ? COL_WIDTH'(3) : COL_WIDTH'(6);
-                ap_base = cp_base + COL_WIDTH'(1);
-            end
-            ZC_MEDIUM: begin
-                cp_base = bg ? COL_WIDTH'(5) : COL_WIDTH'(11);
-                ap_base = cp_base + COL_WIDTH'(2);
-            end
-            ZC_LARGE: begin
-                cp_base = bg ? COL_WIDTH'(10) : COL_WIDTH'(22);
-                ap_base = cp_base + COL_WIDTH'(4);
-            end
-            default: begin
-                cp_base = COL_WIDTH'(6);
-                ap_base = COL_WIDTH'(7);
-            end
-        endcase
-
-        if (c < limit) begin
-            unique case (g)
-                ZC_SMALL:  addr = c >> 2;
-                ZC_MEDIUM: addr = c >> 1;
-                ZC_LARGE:  addr = c;
-                default:   addr = c >> 2;
-            endcase
-        end else if (c < limit + COL_WIDTH'(4)) begin
-            logic [COL_WIDTH-1:0] rel_c;
-            rel_c = c - limit;
-            unique case (g)
-                ZC_SMALL:  addr = cp_base + (rel_c >> 2);
-                ZC_MEDIUM: addr = cp_base + (rel_c >> 1);
-                ZC_LARGE:  addr = cp_base + rel_c;
-                default:   addr = cp_base + (rel_c >> 2);
-            endcase
-        end else begin
-            logic [COL_WIDTH-1:0] rel_c;
-            rel_c = c - limit - COL_WIDTH'(4);
-            unique case (g)
-                ZC_SMALL:  addr = ap_base + (rel_c >> 2);
-                ZC_MEDIUM: addr = ap_base + (rel_c >> 1);
-                ZC_LARGE:  addr = ap_base + rel_c;
-                default:   addr = ap_base + (rel_c >> 2);
-            endcase
+        // Emission side: pop the low word on a handshake
+        eff_out  = out_q;
+        eff_fill = fill_q;
+        if (handshake) begin
+            eff_out  = out_q >> DATA_WIDTH;
+            eff_fill = (fill_q >= FILL_W'(DATA_WIDTH)) ? fill_q - FILL_W'(DATA_WIDTH) : '0;
         end
-        return addr;
-    endfunction
+        out_n  = eff_out;
+        fill_n = eff_fill;
 
-    always_comb begin
-        col_idx_n = col_idx_q;
-        r_addr_n  = r_addr_q;
-        
+        // Append side: slice of the selected bank, thermometer mask on the
+        // column's final partial slice so bank padding never leaks through
+        take  = (col_rem_q >= ZC_WIDTH'(DATA_WIDTH)) ? 6'(DATA_WIDTH) : col_rem_q[5:0];
+        slice = bank_q[bank_sel][DATA_WIDTH-1:0];
+        if (take < 6'(DATA_WIDTH))
+            slice = slice & ~({DATA_WIDTH{1'b1}} << take[4:0]);
+        can_append = ({2'b0, eff_fill} + {3'b0, take}) <= 9'(OUT_LEN);
+
         case (state_q)
-            IDLE: if (codeword_valid_i) begin
-                col_idx_n = '0;
-                r_addr_n  = '0;
+            IDLE: begin
+                col_cnt_n   = '0;
+                out_n       = '0;
+                fill_n      = '0;
+                col_rem_n   = '0;
+                bank_step_n = '0;
+                // ~codeword_done_o: the generator swaps its read bank one
+                // cycle after the done pulse, so codeword_valid_i still
+                // reflects the frame just released during that cycle.
+                if (codeword_valid_i & ~codeword_done_o) state_n = FETCH;
             end
-            STREAM: if (col_depleted && col_idx_q != col_max - 1) begin
-                col_idx_n = col_idx_q + 1;
-                r_addr_n  = get_r_addr(col_idx_n, base_graph_i, zc_group_i);
+            FETCH: state_n = CAPTURE; // generator read latency cycle
+            CAPTURE: begin
+                bank_n       = bank_arr_t'(r_data_i);
+                bank_valid_n = bank_valid_i;
+                col_rem_n    = lifting_size_i;
+                bank_step_n  = '0;
+                state_n      = DRAIN;
             end
-            default: ;
-        endcase
-    end
-
-    //--------------------------------------------------------------------------
-    // Concern 5: Total Bit Tracking & Outbound AXI Stream Mapping
-    //--------------------------------------------------------------------------
-    always_comb begin
-        if (state_q == FLUSH) begin
-            total_bits_left = {3'b0, accum_cnt_q};
-        end else if (state_q == STREAM && col_idx_q == col_max - 1) begin
-            total_bits_left = {3'b0, accum_cnt_q} + effective_shifter_cnt;
-        end else begin
-            total_bits_left = 9'h1FF; // 511 acts as safe out-of-bounds flag
-        end
-    end
-
-    always_comb begin
-        internal_data  = accum_q[DATA_WIDTH-1:0];
-        internal_valid = 1'b0;
-        internal_last  = 1'b0;
-        
-        case (state_q)
-            STREAM: begin
-                internal_valid = (accum_cnt_q >= ACCUM_WIDTH'(DATA_WIDTH));
-                internal_last  = (total_bits_left <= DATA_WIDTH);
+            DRAIN: begin
+                if (can_append) begin
+                    out_n            = eff_out | (OUT_LEN'(slice) << eff_fill[5:0]);
+                    fill_n           = eff_fill + FILL_W'(take);
+                    col_rem_n        = col_rem_q - ZC_WIDTH'(take);
+                    bank_n[bank_sel] = bank_q[bank_sel] >> DATA_WIDTH;
+                    if (col_rem_n == '0) begin
+                        col_cnt_n = col_cnt_q + 1'b1;
+                        state_n   = col_last ? FLUSH : FETCH;
+                    end else if (bank_step_q == 2'(LANE_STEPS - 1)) begin
+                        bank_valid_n[bank_sel] = 1'b0; // bank consumed, encoder moves on
+                        bank_step_n            = '0;
+                    end else begin
+                        bank_step_n = bank_step_q + 2'd1;
+                    end
+                end
             end
             FLUSH: begin
-                internal_valid = (accum_cnt_q > '0);
-                internal_last  = (total_bits_left <= DATA_WIDTH);
-            end 
-            default: ;
+                if (handshake & m_axis_tlast) begin
+                    codeword_done_n = 1'b1;
+                    state_n         = IDLE;
+                end
+            end
+            default: state_n = IDLE;
         endcase
     end
 
-    //--------------------------------------------------------------------------
-    // Concern 6: Clean Clock-Edge Register Synchronous Layer
-    //--------------------------------------------------------------------------
     always_ff @(posedge clk_i or negedge arst_ni) begin
         if (!arst_ni) begin
             state_q         <= IDLE;
-            col_idx_q       <= '0;
-            r_addr_q        <= '0;
-            accum_q         <= '0;
-            accum_cnt_q     <= '0;
-            shifter_q       <= '0;
-            shifter_cnt_q   <= '0;
+            col_cnt_q       <= '0;
+            bank_q          <= '0;
+            bank_valid_q    <= '0;
+            bank_step_q     <= '0;
+            col_rem_q       <= '0;
+            out_q           <= '0;
+            fill_q          <= '0;
             codeword_done_o <= 1'b0;
         end else begin
             state_q         <= state_n;
-            col_idx_q       <= col_idx_n;
-            r_addr_q        <= r_addr_n;
-            accum_q         <= accum_n;
-            accum_cnt_q     <= accum_cnt_n;
-            shifter_q       <= shifter_n;
-            shifter_cnt_q   <= shifter_cnt_n;
+            col_cnt_q       <= col_cnt_n;
+            bank_q          <= bank_n;
+            bank_valid_q    <= bank_valid_n;
+            bank_step_q     <= bank_step_n;
+            col_rem_q       <= col_rem_n;
+            out_q           <= out_n;
+            fill_q          <= fill_n;
             codeword_done_o <= codeword_done_n;
         end
     end
 
-    // Physical Interfacing Struct Configurations
-    axis_packet_t internal_payload;
-    axis_packet_t external_payload;
-
-    assign internal_payload.tdata = internal_data;
-    assign internal_payload.tlast = internal_last;
-
-    assign m_axis_tdata = external_payload.tdata;
-    assign m_axis_tlast = external_payload.tlast;
-
-    // Timing Path Isolation Deployment via Output Register Skid Buffer
-    spill_register #(
-        .T     (axis_packet_t),
-        .Bypass(0)
-    ) u_spill_register (
-        .clk_i  (clk_i),
-        .rst_ni (arst_ni),
-        .valid_i(internal_valid),
-        .ready_o(internal_ready),
-        .data_i (internal_payload),
-        .valid_o(m_axis_tvalid),
-        .ready_i(m_axis_tready),
-        .data_o (external_payload)
-    );
+`ifndef SYNTHESIS
+    // Generator-contract violations that would otherwise stall the drain
+    always_ff @(posedge clk_i) begin
+        if (arst_ni && (state_q == CAPTURE) && (bank_valid_i == '0))
+            $error("output_buffer: no valid bank at column %0d", col_cnt_q);
+        if (arst_ni && (state_q == DRAIN) && (bank_valid_q == '0) && (col_rem_q != '0))
+            $error("output_buffer: banks exhausted with %0d bits left in column %0d",
+                   col_rem_q, col_cnt_q);
+    end
+`endif
 
 endmodule
