@@ -70,6 +70,7 @@ end
   
 logic cw_ready;
 logic cw_last_col;
+logic cw_last_col_q;   // cw_last_col delayed onto the S2 (post-cut) timeline
 
 // Which row within the rowgrp is being processed; drives merge_select_lambda,
 // cpb_en, and the top_level_shifter q-lane selection. Declared early so it is
@@ -215,7 +216,15 @@ always_comb begin
   unique case (state_q)
     IDLE:
       // Commit to the frame and register config; CSR start happens in LOAD.
-      if (inbuff_valid_i & ~inbuff_clear_o & cw_ready)
+      // ~cw_last_col_q: pipeline cut #3 pushes the frame's FINAL additional-
+      // parity hand-off one cycle further into IDLE. On that cycle
+      // inbuff_clear_o has already dropped and the generator has not yet
+      // raised pa_busy_q, so cw_ready would briefly read high and let the next
+      // frame start underneath the drain (PA writes have priority over info
+      // writes in the generator, so the new frame's first columns would be
+      // silently dropped). cw_last_col_q covers exactly that one cycle;
+      // pa_busy_q takes over from the next one.
+      if (inbuff_valid_i & ~inbuff_clear_o & cw_ready & ~cw_last_col_q)
           state_n = LOAD;
       else state_n = IDLE;
     LOAD:
@@ -245,8 +254,11 @@ end
 // Frame-done strobe for the codeword generator. The condition below is true
 // exactly on the final row-group's rowgrp_changed rising edge (the same one
 // that sends the FSM to IDLE); registering it lands the pulse on the next
-// cycle, which is precisely when parity_additional_valid flags the final PA
-// batch. The generator uses it to close and swap its write bank.
+// cycle. Cut #3 delays the final PA batch by one more cycle, so the generator
+// is fed cw_last_col_q (registered once more in cut3_ctrl) to keep the strobe
+// on the same cycle as parity_additional_valid; the undelayed cw_last_col is
+// what holds IDLE for that extra cycle. The generator uses the strobe to close
+// and swap its write bank.
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) cw_last_col <= 1'b0;
   else          cw_last_col <= (rowgrp_changed_q & ~rowgrp_changed_qdly)
@@ -334,15 +346,69 @@ end
 
 logic [3:0][(ZC_MAX >> 2)-1:0] cs_data_in, cs_data_out;
 
+// ---------------------------------------------------------------------------
+// Cut #3: register the cyclic-shifter input (parity calculation | shifter+GF2)
+// ---------------------------------------------------------------------------
+// Before this cut a single combinational chain ran from the core-parity
+// accumulator register, through core_parity_bit_calculator's 384-bit barrel
+// shifter, pc_rearrange, the D/E input mux, the whole top_level_shifter
+// (DBP fwd -> group reordering -> 4x 96-bit barrel -> DBP rev) and into the
+// gf2_sum XOR: two barrel shifters plus two permutation networks in one path.
+// Registering cs_data_in splits it into two comparable stages:
+//   S1: accumulator -> 384b barrel -> pc_rearrange -> D/E mux -> cs_data_in_q
+//   S2: cs_data_in_q -> top_level_shifter -> gf2_sum
+//
+// Everything that must stay bit-aligned with the data crosses the cut with it:
+//   * p (p_norm_qdly) and merge_d_cycle  -- top_level_shifter's per-lane params
+//   * gf2_en_eff and gf2_clear           -- gf2_sum's accumulate / clear
+// Because gf2_sum now completes each row-group one cycle later, every consumer
+// of row_sum moves with it: the lambda capture (cpb_en), the core-parity and
+// additional-parity hand-offs, and the frame-close strobe. Those are delayed
+// by giving them a registered VIEW of the control state (state_qd1,
+// pc_state_cnt_qd1, rowgrp_changed_qdly2) rather than by delaying the FSM or
+// the CSR front end, which keep running on the S1 timeline. The D/E mux
+// selects (cs_pc_sel_eff, parity_core_sel_eff) stay on S1: they feed the mux
+// that is being registered, not the shifter.
+logic [3:0][(ZC_MAX >> 2)-1:0] cs_data_in_q;
+logic [3:0][ZC_WIDTH-1:0]      p_norm_qdly2;
+logic [1:0]                    merge_d_cycle_q1;
+logic [3:0]                    gf2_en_eff_q;
+logic                          rowgrp_changed_qdly2;
+state_t                        state_qd1;
+logic [1:0]                    pc_state_cnt_qd1;
+
+always_ff @(posedge clk_i or negedge arst_ni) begin : cut3_data
+  if (!arst_ni) cs_data_in_q <= '0;
+  else          cs_data_in_q <= cs_data_in;
+end
+
+always_ff @(posedge clk_i or negedge arst_ni) begin : cut3_ctrl
+  if (!arst_ni) begin
+    p_norm_qdly2         <= '0;
+    merge_d_cycle_q1     <= '0;
+    rowgrp_changed_qdly2 <= 1'b0;
+    state_qd1            <= IDLE;
+    pc_state_cnt_qd1     <= '0;
+    cw_last_col_q        <= 1'b0;
+  end else begin
+    p_norm_qdly2         <= p_norm_qdly;
+    merge_d_cycle_q1     <= merge_d_cycle;
+    rowgrp_changed_qdly2 <= rowgrp_changed_qdly;
+    state_qd1            <= state_q;
+    pc_state_cnt_qd1     <= pc_state_cnt_q;
+    cw_last_col_q        <= cw_last_col;
+  end
+end
+
 top_level_shifter #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */),
   .PRE_MOD  (1'b1)  /* Cut #2: p arrives pre-modulo'd (p_norm_qdly) */
  ) top_level_shifter (
-  .data_in      ({>>{cs_data_in}}),
+  .data_in      ({>>{cs_data_in_q}}),   // Cut #3
   .z            (lifting_size_q),
-  .p            (p_norm_qdly),
-  .merge_d_cycle(merge_d_cycle),
+  .p            (p_norm_qdly2),         // Cut #3: p travels with its data
+  .merge_d_cycle(merge_d_cycle_q1),     // Cut #3: lane select travels with it
   .data_out     ({>>{cs_data_out}}),
   .d            (zc_group)
 );
@@ -352,7 +418,11 @@ logic [3:0][(ZC_MAX >> 2)-1:0] row_sum;
 logic [3:0] cpb_en;
 logic gf2_clear, gf2_clear_q;
 
-assign gf2_clear = rowgrp_changed_qdly;
+// Cut #3: the last accumulate of a row-group now lands one cycle later, so the
+// accumulator must also be cleared one cycle later. gf2_clear_q below stays the
+// plain 1-cycle delay of gf2_clear, i.e. the edge detector still sees the same
+// pulse shape, just shifted.
+assign gf2_clear = rowgrp_changed_qdly2;
 
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) gf2_clear_q <= 0;
@@ -385,6 +455,13 @@ always_comb begin
   endcase
 end
 
+// Cut #3: the accumulate enable is registered alongside cs_data_in so each lane
+// still enables on exactly the cycle its own data reaches the adder.
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) gf2_en_eff_q <= '0;
+  else          gf2_en_eff_q <= gf2_en_eff;
+end
+
 gf2_sum #(
   .ZC_PER_CS(ZC_PER_CS /* default 96 */),
   .NUM_CS   (NUM_CS /* default 4 */)
@@ -392,7 +469,7 @@ gf2_sum #(
   .clk     (clk_i),
   .rst_n   (arst_ni),
   .clr     (gf2_clear),
-  .en      (gf2_en_eff),
+  .en      (gf2_en_eff_q),
   .data_in ({>>{cs_data_out}}),
   .data_out({row_sum})
 );
@@ -443,7 +520,9 @@ merge_select_lambda #(
   .NUM_CS   (NUM_CS /* default 4 */)
  ) merge_select_lambda (
   .zc_group (zc_group),
-  .d_cycle (merge_d_cycle),
+  // Cut #3: row_sum completes one cycle later, by which point merge_d_cycle has
+  // already advanced to the next pass; select with the delayed copy.
+  .d_cycle (merge_d_cycle_q1),
   .data_in (row_sum),
   .data_out(lambda)
 );
@@ -463,11 +542,14 @@ assign parity_additional = row_sum;
 always_comb begin
   cpb_en = '0;
 
-  if ((state_q == CALC_LAMBDA) & gf2_clear & ~gf2_clear_q)
+  // Cut #3: gf2_clear, and therefore this capture, is one cycle later than the
+  // CSR row-group edge, so gate on the delayed state view and select the pass
+  // with the delayed merge_d_cycle. Net behaviour is identical, shifted by one.
+  if ((state_qd1 == CALC_LAMBDA) & gf2_clear & ~gf2_clear_q)
     case (zc_group)
       ZC_SMALL:  cpb_en = 4'b1111;
-      ZC_MEDIUM: cpb_en = 4'b0011 << ((merge_d_cycle - 2'd1) << 1);
-      ZC_LARGE:  cpb_en = 4'b0001 << (merge_d_cycle);
+      ZC_MEDIUM: cpb_en = 4'b0011 << ((merge_d_cycle_q1 - 2'd1) << 1);
+      ZC_LARGE:  cpb_en = 4'b0001 << (merge_d_cycle_q1);
       default:   cpb_en = '0;
     endcase
 end
@@ -592,7 +674,9 @@ logic info_valid;
 // sub-bank k, i.e. codeword column KB + n*cols_per_cycle + slot. parity_core
 // lane mapping (core_parity_bit_calculator): p_c1=[3], p_c2=[0], p_c3=[1],
 // p_c4=[2]; column KB+c carries p_c(c+1). All values are LSB-packed.
-// pc_state_cnt_q counts the CALC_PC cycles 0..(1/2/4)-1.
+// pc_state_cnt_qd1 counts the CALC_PC cycles 0..(1/2/4)-1 on the delayed (S2)
+// timeline: cut #3 makes parity_core valid one cycle after state_q enters
+// CALC_PC, so the packing and its valid must both use the delayed view.
 always_comb begin
   case (zc_group)
     // One cycle: lanes 0..3 = columns KB..KB+3 = p_c1..p_c4.
@@ -606,17 +690,17 @@ always_comb begin
     // Lane pair {0,1} = even column (lower half), {2,3} = odd column.
     ZC_MEDIUM: begin
       {parity_core_packed[1], parity_core_packed[0]} =
-        (pc_state_cnt_q[0] == 1'b0) ? parity_core[3][(ZC_MAX >> 1)-1:0]   // p_c1
-                                    : parity_core[1][(ZC_MAX >> 1)-1:0];  // p_c3
+        (pc_state_cnt_qd1[0] == 1'b0) ? parity_core[3][(ZC_MAX >> 1)-1:0]   // p_c1
+                                      : parity_core[1][(ZC_MAX >> 1)-1:0];  // p_c3
       {parity_core_packed[3], parity_core_packed[2]} =
-        (pc_state_cnt_q[0] == 1'b0) ? parity_core[0][(ZC_MAX >> 1)-1:0]   // p_c2
-                                    : parity_core[2][(ZC_MAX >> 1)-1:0];  // p_c4
+        (pc_state_cnt_qd1[0] == 1'b0) ? parity_core[0][(ZC_MAX >> 1)-1:0]   // p_c2
+                                      : parity_core[2][(ZC_MAX >> 1)-1:0];  // p_c4
     end
     // Four cycles of one column: cycle n = p_c(n+1) = parity_core[n-1 mod 4];
     // lane k holds bits [96k +: 96] of the Zc-bit value.
     ZC_LARGE: {parity_core_packed[3], parity_core_packed[2],
                parity_core_packed[1], parity_core_packed[0]} =
-                 parity_core[pc_state_cnt_q - 2'd1];
+                 parity_core[pc_state_cnt_qd1 - 2'd1];
     default: parity_core_packed = '0;
   endcase
 end
@@ -637,19 +721,26 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
   else          info_valid <= ((state_q == CALC_LAMBDA) | (state_q == LOAD))
                             & csr_valid_q & (col_curr_q < kb_cols);
 end
-assign parity_core_valid = (state_q == CALC_PC);
+// Cut #3: parity_core settles one cycle after state_q reaches CALC_PC (cpb_en
+// is on the delayed timeline), so flag it from the delayed state view.
+assign parity_core_valid = (state_qd1 == CALC_PC);
 // The FSM leaves CALC_PA->IDLE on the rising edge of rowgrp_changed_q, but the
 // PA for that final row-group only becomes valid one cycle later, when
 // rowgrp_changed_qdly pulses -- by then state_q is already IDLE. Include IDLE
 // so the last batch (e.g. the 2-row remainder when the BG height isn't a
 // multiple of 4) is still flagged. rowgrp_changed_qdly is 0 during steady
 // IDLE, so this only fires on that one trailing cycle.
-assign parity_additional_valid = ((state_q == CALC_PA) | (state_q == IDLE)) & rowgrp_changed_qdly;
+// Cut #3: row_sum for a row-group is complete one cycle later, so both the
+// strobe and its state gate use the delayed views. Gating on state_qd1 rather
+// than state_q keeps the qualification bit-identical to the pre-cut design
+// (only lambda-phase row-groups are excluded), just shifted by one cycle.
+assign parity_additional_valid = ((state_qd1 == CALC_PA) | (state_qd1 == IDLE)) & rowgrp_changed_qdly2;
 
 // Per-LANE row index for the additional-parity hand-off. actual_row_qdly is
 // per-ROW-POSITION (CSR indexing); the generator needs the row each physical
 // lane is a sub-lane of this pass. Same fold remap as gf2_en_eff.
 logic [3:0][COL_WIDTH-1:0] parity_additional_idx;
+logic [3:0][COL_WIDTH-1:0] parity_additional_idx_q;   // Cut #3
 always_comb begin
   case (zc_group)
     ZC_MEDIUM: begin
@@ -669,6 +760,14 @@ always_comb begin
   endcase
 end
 
+// Cut #3: the hand-off happens one cycle later, by which point actual_row_qdly
+// and merge_d_cycle may already describe the NEXT pass. Register the resolved
+// per-lane indices so the generator still sees the rows it is being handed.
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) parity_additional_idx_q <= '0;
+  else          parity_additional_idx_q <= parity_additional_idx;
+end
+
 // Which lanes of a PA hand-off carry REAL rows. Only ZC_SMALL's final
 // (partial) row-group has stale duplicate row labels in the upper positions
 // (BG height % 4 != 0); writing those lanes would clobber real rows with the
@@ -677,6 +776,7 @@ end
 // edge, while rows_left still reflects the group just finished, so it is
 // stable during the hand-off cycle that follows.
 logic [3:0] pa_lane_mask_q;
+logic [3:0] pa_lane_mask_qd1;   // Cut #3: mask travels with the delayed strobe
 always_ff @(posedge clk_i or negedge arst_ni) begin
   if (!arst_ni) pa_lane_mask_q <= 4'hF;
   else if (rowgrp_changed_q & ~rowgrp_changed_qdly) begin
@@ -691,6 +791,11 @@ always_ff @(posedge clk_i or negedge arst_ni) begin
   end
 end
 
+always_ff @(posedge clk_i or negedge arst_ni) begin
+  if (!arst_ni) pa_lane_mask_qd1 <= 4'hF;
+  else          pa_lane_mask_qd1 <= pa_lane_mask_q;
+end
+
 codeword_generator codeword_generator (
   .clk_i                (clk_i),
   .arst_ni              (arst_ni),
@@ -701,12 +806,12 @@ codeword_generator codeword_generator (
   .core_parity_valid_i  (parity_core_valid),
   .core_parity_data_i   (parity_core_packed),
   .add_parity_valid_i   (parity_additional_valid),
-  .add_parity_idx_i     (parity_additional_idx),
-  .add_parity_mask_i    (pa_lane_mask_q),
+  .add_parity_idx_i     (parity_additional_idx_q),
+  .add_parity_mask_i    (pa_lane_mask_qd1),
   .add_parity_data_i    (parity_additional),
   .base_graph_i         (base_graph_q),
   .lifting_size_i       (lifting_size_q),
-  .input_last_subblock_i(cw_last_col),
+  .input_last_subblock_i(cw_last_col_q),
   .upstream_ready_o     (cw_ready),
   .codeword_valid_o     (codeword_valid_o),
   .r_addr_i             (r_addr_i),

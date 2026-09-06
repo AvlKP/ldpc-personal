@@ -66,6 +66,11 @@ class LdpcShifterMonitor(uvm_monitor):
         dut = self.bfm.dut
         core = dut.ldpc_encoder_core
         metadata_queue = deque()
+        # Cut #3 registered cs_data_in, so the shifter's OUTPUT side (cs_data_out
+        # and parameter_calculation's p_norm, now fed from p_norm_qdly2) settles
+        # one cycle after the S1 metadata that describes it. Stage the S1 view
+        # here and read the S2 view on the next cycle.
+        pending = None
         frame_id = -1
         prev_idle = 1
         while True:
@@ -75,6 +80,13 @@ class LdpcShifterMonitor(uvm_monitor):
             if prev_idle and not idle:
                 frame_id += 1
             prev_idle = idle
+
+            # Emit the previous cycle's entry now that its S2 side has settled.
+            if pending is not None:
+                pending['out'] = safe_int(core.cs_data_out)
+                pending['shift'] = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
+                self.ap.write(pending)
+                pending = None
 
             # Latch metadata when CSR valid is high (start of pipeline)
             if safe_int(core.csr_valid_q) == 1:
@@ -92,8 +104,6 @@ class LdpcShifterMonitor(uvm_monitor):
             if safe_int(core.csr_valid_qdly) == 1:
                 meta = metadata_queue.popleft()
                 cs_in = safe_int(core.cs_data_in)
-                cs_out = safe_int(core.cs_data_out)
-                shift_val = safe_int(core.top_level_shifter.param_calc_inst.p_norm)
                 # Position-domain context for this output cycle. A CSR entry
                 # holds 4 base-graph-row POSITIONS; the folded modes process a
                 # subset per cycle (merge_d_cycle says which), gf2_en_qdly is
@@ -103,11 +113,12 @@ class LdpcShifterMonitor(uvm_monitor):
                 d_cycle = safe_int(core.merge_d_cycle)
                 en_pos = safe_int(core.gf2_en_qdly)
                 col_idx_packed = safe_int(core.col_idx_qdly)
-                self.ap.write({
+                # 'out'/'shift' are filled in on the next cycle (see above).
+                pending = {
                     'type': 'shifter',
                     'in': cs_in,
-                    'out': cs_out,
-                    'shift': shift_val,
+                    'out': 0,
+                    'shift': 0,
                     'col': meta['col'],
                     'rows': meta['rows'],
                     'pc_sel': meta['pc_sel'],
@@ -115,7 +126,7 @@ class LdpcShifterMonitor(uvm_monitor):
                     'en_pos': en_pos,
                     'col_idx': [(col_idx_packed >> (i * 7)) & 0x7F for i in range(4)],
                     'frame_id': meta['frame_id']
-                })
+                }
 
 class LdpcGf2Monitor(uvm_monitor):
     """Monitors the accumulated GF(2) sums."""
@@ -185,7 +196,11 @@ class LdpcLambdaMonitor(uvm_monitor):
             if prev_idle and not idle:
                 frame_id += 1
             prev_idle = idle
-            in_lambda = safe_int(core.state_q) == CoreState.CALC_LAMBDA
+            # Cut #3: cpb_en fires one cycle after the CSR row-group edge and is
+            # gated on state_qd1, by which point state_q may already be CALC_PC.
+            # Track the same delayed view the RTL uses or the last row-group's
+            # lambda capture is missed.
+            in_lambda = safe_int(getattr(core, "state_qd1")) == CoreState.CALC_LAMBDA
 
             # Fresh frame: clear the accumulator on entry to CALC_LAMBDA.
             if in_lambda and not prev_in_lambda:
@@ -232,6 +247,9 @@ class LdpcParityMonitor(uvm_monitor):
         prev_core_valid = False
         prev_add_valid = False
         core_lanes = [0, 0, 0, 0]
+        # Cut #3: PA row labels lag the strobe by one cycle (see below).
+        prev_ar = 0
+        prev_mdc = 0
         frame_id = -1
         prev_idle = 1
         while True:
@@ -256,14 +274,20 @@ class LdpcParityMonitor(uvm_monitor):
             # sub-step (MEDIUM/LARGE process a row-group over several sub-steps).
             if add_valid and not prev_add_valid:
                 pa = safe_int(getattr(core, "parity_additional"), 0)
-                ar = safe_int(getattr(core, "actual_row_qdly"), 0)
-                mdc = safe_int(getattr(core, "merge_d_cycle"), 0)
+                # Cut #3: the core hands over parity_additional_idx_q, i.e. the
+                # row labels RESOLVED ON THE PREVIOUS CYCLE. actual_row_qdly and
+                # merge_d_cycle have already advanced to the next pass by now, so
+                # use the values sampled one cycle earlier to reproduce the
+                # per-lane mapping the generator actually sees.
+                ar, mdc = prev_ar, prev_mdc
                 lanes = [(pa >> (k * 96)) & ((1 << 96) - 1) for k in range(4)]
                 rows = [(ar >> (k * 6)) & 0x3F for k in range(4)]
                 self.ap.write({'type': 'parity_add', 'lanes': lanes, 'rows': rows, 'd_cycle': mdc, 'frame_id': frame_id})
 
             prev_core_valid = core_valid
             prev_add_valid = add_valid
+            prev_ar = safe_int(getattr(core, "actual_row_qdly"), 0)
+            prev_mdc = safe_int(getattr(core, "merge_d_cycle"), 0)
 
 class LdpcOutputMonitor(uvm_monitor):
     """Captures the AXIS output per frame, plus two white-box views collected
@@ -304,6 +328,10 @@ class LdpcOutputMonitor(uvm_monitor):
         core_lanes = [0, 0, 0, 0]
         prev_ob_state = None
         mask96 = (1 << 96) - 1
+        # Cut #3: see LdpcParityMonitor -- the PA row labels handed to the
+        # codeword generator are the ones resolved one cycle before the strobe.
+        prev_ar = 0
+        prev_mdc = 0
 
         while True:
             await RisingEdge(dut.clk_i)
@@ -339,8 +367,7 @@ class LdpcOutputMonitor(uvm_monitor):
                 rows_acc = self.parity_rows_by_frame.setdefault(enc_frame, {})
                 self.pa_events_by_frame[enc_frame] = self.pa_events_by_frame.get(enc_frame, 0) + 1
                 pa = safe_int(getattr(core, "parity_additional", None), 0)
-                ar = safe_int(getattr(core, "actual_row_qdly", None), 0)
-                mdc = safe_int(getattr(core, "merge_d_cycle", None), 0)
+                ar, mdc = prev_ar, prev_mdc
                 lanes = [(pa >> (k * 96)) & mask96 for k in range(4)]
                 rows = [(ar >> (k * 6)) & 0x3F for k in range(4)]
                 # Reassemble rows by zc group, same lane->row mapping as the
@@ -378,6 +405,10 @@ class LdpcOutputMonitor(uvm_monitor):
                         "time_ns": cocotb.utils.get_sim_time('ns'),
                     })
             prev_ob_state = ob_state
+
+            # Cut #3: keep last cycle's PA row labels for the next strobe.
+            prev_ar = safe_int(getattr(core, "actual_row_qdly", None), 0)
+            prev_mdc = safe_int(getattr(core, "merge_d_cycle", None), 0)
 
             # Readout-frame boundary: codeword_done is a 1-cycle pulse fired
             # after the frame's last RAM fetch, before its last AXIS beat.
